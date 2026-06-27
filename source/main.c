@@ -1,0 +1,7338 @@
+#include <3ds.h>
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58J_RETAIL_UX_AND_IO                                                   */
+/* Version: MIVF Phase 5G Retail UX HFIX58J                                   */
+/* ------------------------------------------------------------------------- */
+
+/* HFIX58J-R1 FORWARD PROTOTYPES */
+static void hfix58_rect565(u8 *fb, int x, int y, int w, int h, int r, int g, int b);
+static void hfix58_draw_text_shadow(u8 *fb, int x, int y, const char *text, int scale, int r, int g, int b);
+static const char g_hfix58j_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J";
+
+#include <time.h>
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58I_R1_PACKET_FIELD_FIX                                                */
+/* Version: MIVF Phase 5G Retail UX HFIX58J-R1                               */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58i_r1_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J-R1";
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58I_IO_OPTIMIZATION                                                    */
+/* Version: MIVF Phase 5G Retail UX HFIX58J                                  */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58i_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J";
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58H_LATENCY_WAKE_POLISH                                                */
+/* Version: MIVF Phase 5G Retail UX HFIX58J                              */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58h_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J";
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58F_R2_ROBUST_COMPILE_REPAIR                                           */
+/* Version: MIVF Phase 5G Retail UX HFIX58J-R2                               */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58f_r2_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J-R2";
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58F_SAFE_KEYFRAME_SEEK                                                 */
+/* Version: MIVF Phase 5G Retail UX HFIX58J                                  */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58f_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J";
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58E_PERF_OPTIMIZATION                                                  */
+/* Version: MIVF Phase 5G Retail UX HFIX58J                                */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58e_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J";
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58D_FLUENT_UI_ANIMATION                                                */
+/* Version: MIVF Phase 5G Retail UX HFIX58J                                   */
+/* ------------------------------------------------------------------------- */
+static const char g_hfix58d_version_tag[] __attribute__((used)) =
+    "MIVF Phase 5G Retail UX HFIX58J";
+
+#include <dirent.h>
+#include <ctype.h>
+#include <3ds/services/y2r.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdarg.h>
+
+#include "mivf_stream.h"
+
+#define MIVF_RUNTIME_TELEMETRY 0
+#define MIVF_PATH g_hfix58_selected_media
+
+#define MIVF_HEADER_SIZE        64
+#define MIVF_STREAM_HEADER_SIZE 64
+
+#define TOP_W 400
+#define TOP_H 240
+
+#define MIVF_SCALE_FULLSCREEN 0
+
+#define AUDIO_BUFS 48
+#define AUDIO_MAX_PACKET 8192
+
+
+#define MIVF_LOG_PATH "sdmc:/mivf_phase5a_log.txt"
+
+static FILE *g_mivf_log = NULL;
+
+static void mivf_log_open(void) {
+    if (!g_mivf_log) {
+        g_mivf_log = fopen(MIVF_LOG_PATH, "w");
+    }
+}
+
+static void mivf_log_close(void) {
+    if (g_mivf_log) {
+        fflush(g_mivf_log);
+        fclose(g_mivf_log);
+        g_mivf_log = NULL;
+    }
+}
+
+static int tee_printf(const char *fmt, ...) {
+    va_list ap;
+
+    va_start(ap, fmt);
+    int r = vprintf(fmt, ap);
+    va_end(ap);
+
+    if (g_mivf_log) {
+        va_start(ap, fmt);
+        vfprintf(g_mivf_log, fmt, ap);
+        va_end(ap);
+        fflush(g_mivf_log);
+    }
+
+    return r;
+}
+
+#define printf tee_printf
+
+typedef struct {
+    u32 streams;
+    u64 first;
+} Header;
+
+typedef struct {
+    u8 id;
+    u8 type;
+    u16 hsize;
+
+    char codec[5];
+
+    // For video:
+    //   w, h, fpsn, fpsd
+    //
+    // For audio PC16:
+    //   w     = sample rate
+    //   h     = channels
+    //   fpsn  = samples per video frame
+    //   fpsd  = usually 1/reserved
+    u16 w;
+    u16 h;
+    u16 fpsn;
+    u16 fpsd;
+} Stream;
+
+typedef struct {
+    u8 sid;
+    u8 flags;
+    u16 hsize;
+    u32 psize;
+    u32 frame;
+} Packet;
+
+typedef struct {
+    bool ready;
+
+    u8 sid;
+    u32 rate;
+    u8 channels;
+
+    u32 samples_per_frame;
+    u32 bytes_per_packet;
+
+    u8 *buf[AUDIO_BUFS];
+    ndspWaveBuf wb[AUDIO_BUFS];
+
+    int next;
+} AudioState;
+
+static AudioState audio;
+
+/* HFIX33 display-only deblocking state. */
+static int g_m2y1_display_qp = 28;
+static bool g_m2y1_deblock_this_frame = false;
+
+
+static u8 file_iobuf[1024 * 1024];
+
+static FILE *g_mivf_diag = NULL;
+
+static inline u64 ticks_to_us(u64 ticks) {
+    return (ticks * 1000000ULL) / (u64)SYSCLOCK_ARM11;
+}
+
+static void mivf_diag_open(void) {
+    if (!g_mivf_diag) {
+        g_mivf_diag = fopen("sdmc:/mivf_phase5a_diag.csv", "w");
+        if (g_mivf_diag) {
+            fprintf(g_mivf_diag,
+                "frame,page_no,page_payload,page_packets,ring_kb,page_wait_us,parse_us,blit_us,total_us,video_pkts,audio_pkts,last_audio_bytes,last_audio_samples,audio_submit,audio_drop\n");
+            fflush(g_mivf_diag);
+        }
+    }
+}
+
+static void mivf_diag_close(void) {
+    if (g_mivf_diag) {
+        fflush(g_mivf_diag);
+        fclose(g_mivf_diag);
+        g_mivf_diag = NULL;
+    }
+}
+
+static void mivf_diag_frame(
+    u32 frame,
+    u32 page_no,
+    u32 page_payload,
+    u16 page_packets,
+    u32 ring_kb,
+    u64 page_wait_us,
+    u64 parse_us,
+    u64 blit_us,
+    u64 total_us,
+    u32 video_pkts,
+    u32 audio_pkts,
+    u32 last_audio_bytes,
+    u32 last_audio_samples,
+    u32 audio_submit,
+    u32 audio_drop
+) {
+    if (!g_mivf_diag) {
+        return;
+    }
+
+    fprintf(g_mivf_diag,
+        "%lu,%lu,%lu,%u,%lu,%llu,%llu,%llu,%llu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        (unsigned long)frame,
+        (unsigned long)page_no,
+        (unsigned long)page_payload,
+        page_packets,
+        (unsigned long)ring_kb,
+        (unsigned long long)page_wait_us,
+        (unsigned long long)parse_us,
+        (unsigned long long)blit_us,
+        (unsigned long long)total_us,
+        (unsigned long)video_pkts,
+        (unsigned long)audio_pkts,
+        (unsigned long)last_audio_bytes,
+        (unsigned long)last_audio_samples,
+        (unsigned long)audio_submit,
+        (unsigned long)audio_drop);
+
+    fflush(g_mivf_diag);
+}
+
+static u32 g_audio_submit = 0;
+static u32 g_audio_drop = 0;
+static u32 g_last_audio_bytes = 0;
+static u32 g_last_audio_samples = 0;
+
+
+static u32 g_mivf_stream_stride = MIVF_STREAM_HEADER_SIZE;
+
+static inline u16 le16(const u8 *p) {
+    return (u16)p[0] | ((u16)p[1] << 8);
+}
+
+static inline u32 le32(const u8 *p) {
+    return (u32)p[0] |
+           ((u32)p[1] << 8) |
+           ((u32)p[2] << 16) |
+           ((u32)p[3] << 24);
+}
+
+static inline u64 le64(const u8 *p) {
+    return (u64)le32(p) | ((u64)le32(p + 4) << 32);
+}
+
+static int rd(FILE *f, void *p, size_t n) {
+    return fread(p, 1, n, f) == n ? 0 : -1;
+}
+
+/*
+    MIVF header parsing.
+
+    The generated files used so far have a 64-byte global header,
+    followed by fixed 64-byte stream headers, then page data.
+
+    This parser is intentionally slightly defensive because earlier
+    tools evolved over multiple phases.
+*/
+static int read_header(FILE *f, Header *h) {
+    u8 probe[8192];
+
+    memset(h, 0, sizeof(*h));
+    g_mivf_stream_stride = MIVF_STREAM_HEADER_SIZE;
+
+    if (fseek(f, 0, SEEK_SET)) {
+        return -1;
+    }
+
+    size_t got = fread(probe, 1, sizeof(probe), f);
+
+    if (got < MIVF_HEADER_SIZE) {
+        return -1;
+    }
+
+    if (probe[0] != 'M' || probe[1] != 'I' || probe[2] != 'V' || probe[3] != 'F') {
+        return -2;
+    }
+
+    h->first = 0;
+    h->streams = 0;
+
+    printf("header scan HFIX6: got=%lu pagehdr=%u\n",
+        (unsigned long)got,
+        (unsigned)MIVF_PAGE_HEADER_SIZE);
+
+    /*
+        Find first real page header. Page header is 32 bytes for this file family.
+    */
+    for (u32 off = MIVF_HEADER_SIZE; off + MIVF_PAGE_HEADER_SIZE + 16 <= got; off += 4) {
+        if (probe[off + 0] != 'M' || probe[off + 1] != 'P') {
+            continue;
+        }
+
+        u32 payload = le32(probe + off + 0x10);
+        u16 packets = le16(probe + off + 0x14);
+
+        if (payload == 0 || payload > (512 * 1024)) {
+            continue;
+        }
+
+        if (packets == 0 || packets > 128) {
+            continue;
+        }
+
+        u32 packet_off = off + MIVF_PAGE_HEADER_SIZE;
+
+        u16 pkt_hsize = le16(probe + packet_off + 2);
+        u32 pkt_psize = le32(probe + packet_off + 8);
+
+        if (pkt_hsize != 16) {
+            printf("MP reject off=%lu payload=%lu packets=%u pkt_hsize=%u\n",
+                (unsigned long)off,
+                (unsigned long)payload,
+                packets,
+                pkt_hsize);
+            continue;
+        }
+
+        if ((u64)pkt_hsize + (u64)pkt_psize > (u64)payload) {
+            printf("MP reject off=%lu payload=%lu packets=%u pkt_psize=%lu\n",
+                (unsigned long)off,
+                (unsigned long)payload,
+                packets,
+                (unsigned long)pkt_psize);
+            continue;
+        }
+
+        printf("MP accept off=%lu payload=%lu packets=%u pkt_psize=%lu\n",
+            (unsigned long)off,
+            (unsigned long)payload,
+            packets,
+            (unsigned long)pkt_psize);
+
+        h->first = off;
+        break;
+    }
+
+    if (h->first == 0) {
+        printf("header scan: no valid MP page found\n");
+        return -3;
+    }
+
+    /*
+        Infer stream count and stride.
+
+        HFIX5 allowed layouts with garbage streams, so count=4/stride=24
+        beat count=2/stride=48 by accident. HFIX6 rejects candidate layouts
+        unless EVERY inferred stream has a valid type and codec.
+    */
+    u32 stream_area = (u32)h->first - MIVF_HEADER_SIZE;
+    u32 best_count = 0;
+    u32 best_stride = 0;
+    u32 best_score = 0;
+
+    for (u32 count = 1; count <= 16; count++) {
+        if (stream_area % count) {
+            continue;
+        }
+
+        u32 stride = stream_area / count;
+
+        if (stride < 24 || stride > 4096) {
+            continue;
+        }
+
+        u32 score = 0;
+        bool seen_video = false;
+        bool seen_audio = false;
+        bool candidate_valid = true;
+
+        for (u32 i = 0; i < count; i++) {
+            u32 pos = MIVF_HEADER_SIZE + i * stride;
+
+            if (pos + 24 > h->first) {
+                candidate_valid = false;
+                break;
+            }
+
+            u8 sid = probe[pos + 0];
+            u8 type = probe[pos + 1];
+
+            char c0 = (char)probe[pos + 4];
+            char c1 = (char)probe[pos + 5];
+            char c2 = (char)probe[pos + 6];
+            char c3 = (char)probe[pos + 7];
+
+            bool codec_printable =
+                c0 >= 32 && c0 <= 126 &&
+                c1 >= 32 && c1 <= 126 &&
+                c2 >= 32 && c2 <= 126 &&
+                c3 >= 32 && c3 <= 126;
+
+            bool codec_known =
+                (c0 == 'M' && c1 == 'I' && c2 == 'V') ||
+                (c0 == 'M' && c1 == '2' && c2 == 'Y' && c3 == '0') ||
+                (c0 == 'M' && c1 == '2' && c2 == 'Y' && c3 == '1') ||
+                (c0 == 'R' && c1 == 'A' && c2 == 'W' && c3 == 'V') ||
+                (c0 == 'P' && c1 == 'C' && c2 == '1' && c3 == '6') ||
+                (c0 == 'I' && c1 == 'A' && c2 == '4' && c3 == 'M');
+
+            if (!codec_printable || !codec_known) {
+                candidate_valid = false;
+                break;
+            }
+
+            if (type == 1) {
+                seen_video = true;
+                score += 100;
+            } else if (type == 2) {
+                seen_audio = true;
+                score += 100;
+            } else {
+                candidate_valid = false;
+                break;
+            }
+
+            if (sid < 16) {
+                score += 5;
+            }
+
+            if (codec_known) {
+                score += 25;
+            }
+        }
+
+        if (!candidate_valid) {
+            printf("stream infer reject: count=%lu stride=%lu\n",
+                (unsigned long)count,
+                (unsigned long)stride);
+            continue;
+        }
+
+        if (seen_video) {
+            score += 200;
+        }
+
+        if (seen_audio) {
+            score += 250;
+        }
+
+        /*
+            Prefer fewer valid streams if score is close. This avoids
+            splitting metadata into fake streams.
+        */
+        score += (32 - count);
+
+        printf("stream infer candidate: count=%lu stride=%lu score=%lu video=%d audio=%d\n",
+            (unsigned long)count,
+            (unsigned long)stride,
+            (unsigned long)score,
+            seen_video ? 1 : 0,
+            seen_audio ? 1 : 0);
+
+        if (score > best_score) {
+            best_score = score;
+            best_count = count;
+            best_stride = stride;
+        }
+    }
+
+    if (best_count == 0 || best_stride == 0) {
+        printf("header scan: could not infer stream layout first=%lu area=%lu\n",
+            (unsigned long)h->first,
+            (unsigned long)stream_area);
+        return -4;
+    }
+
+    h->streams = best_count;
+    g_mivf_stream_stride = best_stride;
+
+    printf("header: streams=%lu stride=%lu first=%lu\n",
+        (unsigned long)h->streams,
+        (unsigned long)g_mivf_stream_stride,
+        (unsigned long)h->first);
+
+    if (fseek(f, MIVF_HEADER_SIZE, SEEK_SET)) {
+        return -5;
+    }
+
+    return 0;
+}
+
+static int read_stream(FILE *f, Stream *s) {
+    u8 b[MIVF_STREAM_HEADER_SIZE];
+
+    memset(s, 0, sizeof(*s));
+    memset(b, 0, sizeof(b));
+
+    long start_pos = ftell(f);
+
+    u32 stride = g_mivf_stream_stride;
+
+    if (stride < 24) {
+        return -1;
+    }
+
+    u32 to_read = stride;
+
+    if (to_read > MIVF_STREAM_HEADER_SIZE) {
+        to_read = MIVF_STREAM_HEADER_SIZE;
+    }
+
+    if (rd(f, b, to_read)) {
+        return -2;
+    }
+
+    if (stride > to_read) {
+        if (fseek(f, (long)(stride - to_read), SEEK_CUR)) {
+            return -3;
+        }
+    }
+
+    s->id = b[0];
+    s->type = b[1];
+    s->hsize = (u16)stride;
+
+    memcpy(s->codec, b + 4, 4);
+    s->codec[4] = 0;
+
+    /*
+        Video streams:
+            0x10 width
+            0x12 height
+            0x14 fps numerator
+            0x16 fps denominator
+
+        PC16 audio streams in current files:
+            0x10 channels
+            0x14 sample rate
+            0x2A samples per video frame, observed 533 for 16000/30
+
+        We map into Stream as:
+            w    = sample rate
+            h    = channels
+            fpsn = samples per video frame
+            fpsd = 1
+    */
+    if (!strcmp(s->codec, "PC16")) {
+        u16 channels = le16(b + 0x10);
+        u16 rate = le16(b + 0x14);
+        u16 samples_per_frame = 0;
+
+        if (to_read >= 0x2C) {
+            samples_per_frame = le16(b + 0x2A);
+        }
+
+        if (channels == 0 || channels > 2) {
+            channels = 1;
+        }
+
+        if (rate == 0) {
+            rate = 16000;
+        }
+
+        if (samples_per_frame == 0) {
+            samples_per_frame = rate / 30;
+        }
+
+        s->w = rate;
+        s->h = channels;
+        s->fpsn = samples_per_frame;
+        s->fpsd = 1;
+    } else {
+        s->w = le16(b + 0x10);
+        s->h = le16(b + 0x12);
+        s->fpsn = le16(b + 0x14);
+        s->fpsd = le16(b + 0x16);
+    }
+
+    printf("stream@%ld: id=%u type=%u stride=%u codec=%s w=%u h=%u fps=%u/%u\n",
+        start_pos,
+        s->id,
+        s->type,
+        stride,
+        s->codec,
+        s->w,
+        s->h,
+        s->fpsn,
+        s->fpsd ? s->fpsd : 1);
+
+    return 0;
+}
+
+static int read_packet(const u8 *b, size_t n, Packet *p) {
+    if (n < 16) {
+        return -1;
+    }
+
+    p->sid   = b[0];
+    p->flags = b[1];
+    p->hsize = le16(b + 2);
+    p->psize = le32(b + 8);
+    p->frame = le32(b + 12);
+
+    if (p->hsize != 16) {
+        return -2;
+    }
+
+    if ((u64)p->hsize + (u64)p->psize > (u64)n) {
+        return -3;
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Video decode helpers                                                       */
+/* ------------------------------------------------------------------------- */
+
+/* HFIX13: disable unsafe motion-vector reconstruction for artifact test */
+#define MIVF_SAFE_INTER_PRED 0
+
+enum {
+    M_SKIP     = 0,
+    M_RAW      = 1,
+    M_SOLID    = 2,
+    M_TWO      = 3,
+    M_AVGDELTA = 4,
+    M_MVCOPY   = 5,
+    M_MVDELTA  = 6,
+
+    /*
+        HFIX16 / M1P1 extension:
+        M_RUN_SKIP, run_minus_1
+        run length = run_minus_1 + 1
+        range = 1..256 blocks
+    */
+    M_RUN_SKIP = 7
+};
+
+static inline u16 rgb565_read(const u8 *p) {
+    return (u16)p[0] | ((u16)p[1] << 8);
+}
+
+static inline void rgb565_write(u8 *p, u16 c) {
+    p[0] = c & 255;
+    p[1] = c >> 8;
+}
+
+static inline int clampi(int x, int lo, int hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+static inline u16 rgb565_delta(u16 c, int dr, int dg, int db) {
+    int r = (c >> 11) & 31;
+    int g = (c >> 5) & 63;
+    int b = c & 31;
+
+    r = clampi(r + dr, 0, 31);
+    g = clampi(g + dg, 0, 63);
+    b = clampi(b + db, 0, 31);
+
+    return (u16)((r << 11) | (g << 5) | b);
+}
+
+static void copyblk(u8 *out, const u8 *prev, int w, int bx, int by) {
+    for (int y = 0; y < 8; y++) {
+        memcpy(
+            out  + (((by * 8 + y) * w + bx * 8) * 2),
+            prev + (((by * 8 + y) * w + bx * 8) * 2),
+            16
+        );
+    }
+}
+
+static void copy_skip_run(
+    u8 *out,
+    const u8 *prev,
+    int w,
+    int bxcount,
+    int *pbx,
+    int *pby,
+    u32 *pbi,
+    u32 run
+) {
+    int bx = *pbx;
+    int by = *pby;
+    u32 bi = *pbi;
+
+    while (run > 0) {
+        /*
+            Copy as many consecutive 8x8 blocks as possible on the current
+            block row.
+
+            Each block row:
+                8 pixels/block * 2 bytes/pixel = 16 bytes per block
+        */
+        u32 row_left = (u32)(bxcount - bx);
+        u32 chunk = run < row_left ? run : row_left;
+        u32 bytes = chunk * 16;
+
+        for (int y = 0; y < 8; y++) {
+            u8 *dst = out + (((by * 8 + y) * w + bx * 8) * 2);
+            const u8 *src = prev + (((by * 8 + y) * w + bx * 8) * 2);
+
+            memcpy(dst, src, bytes);
+        }
+
+        bx += (int)chunk;
+        bi += chunk;
+        run -= chunk;
+
+        if (bx >= bxcount) {
+            bx = 0;
+            by++;
+        }
+    }
+
+    *pbx = bx;
+    *pby = by;
+    *pbi = bi;
+}
+
+static void copymv(u8 *out, const u8 *prev, int w, int h,
+                   int bx, int by, int dx, int dy) {
+    int sx0 = bx * 8 + dx;
+    int sy0 = by * 8 + dy;
+
+    for (int y = 0; y < 8; y++) {
+        int sy = sy0 + y;
+        int dy_abs = by * 8 + y;
+
+        if (sy < 0) sy = 0;
+        if (sy >= h) sy = h - 1;
+
+        if (dy_abs < 0 || dy_abs >= h) {
+            continue;
+        }
+
+        for (int x = 0; x < 8; x++) {
+            int sx = sx0 + x;
+            int dx_abs = bx * 8 + x;
+
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+
+            if (dx_abs < 0 || dx_abs >= w) {
+                continue;
+            }
+
+            const u8 *src = prev + ((sy * w + sx) * 2);
+            u8 *dst = out + ((dy_abs * w + dx_abs) * 2);
+
+            dst[0] = src[0];
+            dst[1] = src[1];
+        }
+    }
+}
+
+static void delta_same(u8 *out, const u8 *prev, int w, int bx, int by, int dr, int dg, int db) {
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            u8 *dst = out + (((by * 8 + y) * w + bx * 8 + x) * 2);
+            const u8 *src = prev + (((by * 8 + y) * w + bx * 8 + x) * 2);
+
+            u16 c = rgb565_read(src);
+            c = rgb565_delta(c, dr, dg, db);
+            rgb565_write(dst, c);
+        }
+    }
+}
+
+static void delta_mv(u8 *out, const u8 *prev, int w, int h,
+                     int bx, int by, int dx, int dy, int dr, int dg, int db) {
+    int sx0 = bx * 8 + dx;
+    int sy0 = by * 8 + dy;
+
+    for (int y = 0; y < 8; y++) {
+        int sy = sy0 + y;
+        int dy_abs = by * 8 + y;
+
+        if (sy < 0) sy = 0;
+        if (sy >= h) sy = h - 1;
+
+        if (dy_abs < 0 || dy_abs >= h) {
+            continue;
+        }
+
+        for (int x = 0; x < 8; x++) {
+            int sx = sx0 + x;
+            int dx_abs = bx * 8 + x;
+
+            if (sx < 0) sx = 0;
+            if (sx >= w) sx = w - 1;
+
+            if (dx_abs < 0 || dx_abs >= w) {
+                continue;
+            }
+
+            const u8 *src = prev + ((sy * w + sx) * 2);
+            u8 *dst = out + ((dy_abs * w + dx_abs) * 2);
+
+            u16 c = rgb565_read(src);
+            c = rgb565_delta(c, dr, dg, db);
+            rgb565_write(dst, c);
+        }
+    }
+}
+
+static int dec_m1p0(const u8 *p, size_t n, u8 *out, const u8 *prev,
+                    bool have_prev, int ew, int eh) {
+    if (n < 20 || memcmp(p, "M1P0", 4)) {
+        return -1;
+    }
+
+    int w = le16(p + 4);
+    int h = le16(p + 6);
+    u32 bc = le32(p + 16);
+
+    if (w != ew || h != eh || (w & 7) || (h & 7)) {
+        return -2;
+    }
+
+    int bxcount = w / 8;
+    int bycount = h / 8;
+
+    if (bc != (u32)(bxcount * bycount)) {
+        return -3;
+    }
+
+    size_t off = 20;
+
+    for (int by = 0; by < bycount; by++) {
+        for (int bx = 0; bx < bxcount; bx++) {
+            if (off >= n) {
+                return -4;
+            }
+
+            u8 m = p[off++];
+
+            if (m == M_SKIP) {
+                if (!have_prev) return -5;
+                copyblk(out, prev, w, bx, by);
+            } else if (m == M_RAW) {
+                if (off + 128 > n) return -6;
+
+                /*
+                    HFIX15:
+                    Fast RAW block copy. Avoid thousands of tiny memcpy calls
+                    per second in all-intra/keyint=1 diagnostic files.
+                */
+                for (int y = 0; y < 8; y++) {
+                    u32 *dst32 = (u32*)(out + (((by * 8 + y) * w + bx * 8) * 2));
+                    const u32 *src32 = (const u32*)(p + off + y * 16);
+
+                    dst32[0] = src32[0];
+                    dst32[1] = src32[1];
+                    dst32[2] = src32[2];
+                    dst32[3] = src32[3];
+                }
+
+                off += 128;
+            } else if (m == M_TWO) {
+                if (off + 12 > n) return -7;
+
+                u16 c0 = le16(p + off);
+                u16 c1 = le16(p + off + 2);
+                const u8 *bits = p + off + 4;
+
+                off += 12;
+
+                for (int i = 0; i < 64; i++) {
+                    u16 c = ((bits[i >> 3] >> (i & 7)) & 1) ? c1 : c0;
+                    int x = i & 7;
+                    int y = i >> 3;
+
+                    u8 *d = out + (((by * 8 + y) * w + bx * 8 + x) * 2);
+                    d[0] = c & 255;
+                    d[1] = c >> 8;
+                }
+            } else if (m == M_SOLID) {
+                if (off + 2 > n) return -8;
+
+                u16 c = le16(p + off);
+                off += 2;
+
+                for (int y = 0; y < 8; y++) {
+                    u8 *d = out + (((by * 8 + y) * w + bx * 8) * 2);
+
+                    for (int x = 0; x < 8; x++) {
+                        d[x * 2 + 0] = c & 255;
+                        d[x * 2 + 1] = c >> 8;
+                    }
+                }
+            } else if (m == M_AVGDELTA) {
+                if (!have_prev || off + 3 > n) return -9;
+
+                int8_t dr = (int8_t)p[off + 0];
+                int8_t dg = (int8_t)p[off + 1];
+                int8_t db = (int8_t)p[off + 2];
+
+                off += 3;
+
+                delta_same(out, prev, w, bx, by, dr, dg, db);
+            } else if (m == M_MVCOPY) {
+                if (!have_prev || off + 2 > n) return -10;
+
+                int8_t dx = (int8_t)p[off + 0];
+                int8_t dy = (int8_t)p[off + 1];
+
+                off += 2;
+
+                copymv(out, prev, w, h, bx, by, dx, dy);
+            } else if (m == M_MVDELTA) {
+                if (!have_prev || off + 5 > n) return -11;
+
+                int8_t dx = (int8_t)p[off + 0];
+                int8_t dy = (int8_t)p[off + 1];
+                int8_t dr = (int8_t)p[off + 2];
+                int8_t dg = (int8_t)p[off + 3];
+                int8_t db = (int8_t)p[off + 4];
+
+                off += 5;
+
+                delta_mv(out, prev, w, h, bx, by, dx, dy, dr, dg, db);
+            } else {
+                return -12;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int dec_m1p1(const u8 *p, size_t n, u8 *out, const u8 *prev,
+                    bool have_prev, int ew, int eh) {
+    if (n < 20 || memcmp(p, "M1P1", 4)) {
+        return -1;
+    }
+
+    int w = le16(p + 4);
+    int h = le16(p + 6);
+    u32 bc = le32(p + 16);
+
+    if (w != ew || h != eh || (w & 7) || (h & 7)) {
+        return -2;
+    }
+
+    int bxcount = w / 8;
+    int bycount = h / 8;
+
+    if (bc != (u32)(bxcount * bycount)) {
+        return -3;
+    }
+
+    size_t off = 20;
+
+    /*
+        ARM11-friendly linear block tracking.
+        Avoid per-block division/modulo.
+    */
+    u32 bi = 0;
+    int bx = 0;
+    int by = 0;
+
+    while (bi < bc) {
+        if (off >= n) {
+            return -4;
+        }
+
+        u8 m = p[off++];
+
+        if (m == M_RUN_SKIP) {
+            if (!have_prev) {
+                return -5;
+            }
+
+            if (off >= n) {
+                return -6;
+            }
+
+            u32 run = (u32)p[off++] + 1;
+
+            if (bi + run > bc) {
+                return -7;
+            }
+
+            copy_skip_run(out, prev, w, bxcount, &bx, &by, &bi, run);
+            continue;
+        }
+
+        /*
+            Single-block modes. These intentionally mirror dec_m1p0(),
+            but advance bx/by/bi linearly instead of nested loops.
+        */
+        if (m == M_SKIP) {
+            if (!have_prev) return -8;
+            copyblk(out, prev, w, bx, by);
+
+        } else if (m == M_RAW) {
+            if (off + 128 > n) return -9;
+
+            /*
+                HFIX15 fast RAW block copy.
+            */
+            for (int y = 0; y < 8; y++) {
+                u32 *dst32 = (u32*)(out + (((by * 8 + y) * w + bx * 8) * 2));
+                const u32 *src32 = (const u32*)(p + off + y * 16);
+
+                dst32[0] = src32[0];
+                dst32[1] = src32[1];
+                dst32[2] = src32[2];
+                dst32[3] = src32[3];
+            }
+
+            off += 128;
+
+        } else if (m == M_TWO) {
+            if (off + 12 > n) return -10;
+
+            u16 c0 = le16(p + off);
+            u16 c1 = le16(p + off + 2);
+            const u8 *bits = p + off + 4;
+
+            off += 12;
+
+            for (int i = 0; i < 64; i++) {
+                u16 c = ((bits[i >> 3] >> (i & 7)) & 1) ? c1 : c0;
+                int x = i & 7;
+                int y = i >> 3;
+
+                u8 *d = out + (((by * 8 + y) * w + bx * 8 + x) * 2);
+                d[0] = c & 255;
+                d[1] = c >> 8;
+            }
+
+        } else if (m == M_SOLID) {
+            if (off + 2 > n) return -11;
+
+            u16 c = le16(p + off);
+            off += 2;
+
+            for (int y = 0; y < 8; y++) {
+                u8 *d = out + (((by * 8 + y) * w + bx * 8) * 2);
+
+                for (int x = 0; x < 8; x++) {
+                    d[x * 2 + 0] = c & 255;
+                    d[x * 2 + 1] = c >> 8;
+                }
+            }
+
+        } else if (m == M_AVGDELTA) {
+            if (!have_prev || off + 3 > n) return -12;
+
+            int8_t dr = (int8_t)p[off + 0];
+            int8_t dg = (int8_t)p[off + 1];
+            int8_t db = (int8_t)p[off + 2];
+
+            off += 3;
+
+            delta_same(out, prev, w, bx, by, dr, dg, db);
+
+        } else if (m == M_MVCOPY) {
+            if (!have_prev || off + 2 > n) return -13;
+
+            int8_t dx = (int8_t)p[off + 0];
+            int8_t dy = (int8_t)p[off + 1];
+
+            off += 2;
+
+#if defined(MIVF_SAFE_INTER_PRED) && MIVF_SAFE_INTER_PRED
+            (void)dx;
+            (void)dy;
+            copyblk(out, prev, w, bx, by);
+#else
+            copymv(out, prev, w, h, bx, by, dx, dy);
+#endif
+
+        } else if (m == M_MVDELTA) {
+            if (!have_prev || off + 5 > n) return -14;
+
+            int8_t dx = (int8_t)p[off + 0];
+            int8_t dy = (int8_t)p[off + 1];
+            int8_t dr = (int8_t)p[off + 2];
+            int8_t dg = (int8_t)p[off + 3];
+            int8_t db = (int8_t)p[off + 4];
+
+            off += 5;
+
+#if defined(MIVF_SAFE_INTER_PRED) && MIVF_SAFE_INTER_PRED
+            (void)dx;
+            (void)dy;
+            delta_same(out, prev, w, bx, by, dr, dg, db);
+#else
+            delta_mv(out, prev, w, h, bx, by, dx, dy, dr, dg, db);
+#endif
+
+        } else {
+            return -15;
+        }
+
+        bx++;
+
+        if (bx >= bxcount) {
+            bx = 0;
+            by++;
+        }
+
+        bi++;
+    }
+
+    return 0;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* M2Y0 raw YUV420 chassis                                                    */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    u16 w;
+    u16 h;
+
+    u32 y_size;
+    u32 c_size;
+    u32 total_size;
+
+    u8 *base;
+    u8 *y;
+    u8 *cb;
+    u8 *cr;
+} M2Y0Frame;
+
+static bool m2y0_frame_alloc(M2Y0Frame *f, u16 w, u16 h) {
+    memset(f, 0, sizeof(*f));
+
+    if ((w & 1) || (h & 1)) {
+        return false;
+    }
+
+    f->w = w;
+    f->h = h;
+
+    f->y_size = (u32)w * (u32)h;
+    f->c_size = ((u32)w / 2) * ((u32)h / 2);
+    f->total_size = f->y_size + f->c_size + f->c_size;
+
+    f->base = (u8*)linearAlloc(f->total_size);
+
+    if (!f->base) {
+        return false;
+    }
+
+    f->y  = f->base;
+    f->cb = f->y  + f->y_size;
+    f->cr = f->cb + f->c_size;
+
+    memset(f->y, 0, f->y_size);
+    memset(f->cb, 128, f->c_size);
+    memset(f->cr, 128, f->c_size);
+
+    return true;
+}
+
+static void m2y0_frame_free(M2Y0Frame *f) {
+    if (f->base) {
+        linearFree(f->base);
+    }
+
+    memset(f, 0, sizeof(*f));
+}
+
+static inline u8 clamp_u8_fast(int x) {
+    if (x < 0) return 0;
+    if (x > 255) return 255;
+    return (u8)x;
+}
+
+static inline u16 rgb888_to_rgb565_fast(int r, int g, int b) {
+    r = clamp_u8_fast(r);
+    g = clamp_u8_fast(g);
+    b = clamp_u8_fast(b);
+
+    return (u16)(((r >> 3) << 11) |
+                 ((g >> 2) << 5)  |
+                 (b >> 3));
+}
+
+static inline u16 yuv_to_rgb565_pixel(u8 yy, u8 uu, u8 vv) {
+    int c = (int)yy - 16;
+    int d = (int)uu - 128;
+    int e = (int)vv - 128;
+
+    if (c < 0) {
+        c = 0;
+    }
+
+    int r = (298 * c + 409 * e + 128) >> 8;
+    int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+    int b = (298 * c + 516 * d + 128) >> 8;
+
+    return rgb888_to_rgb565_fast(r, g, b);
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX33 display-only luma deblocking filter                                */
+/* ------------------------------------------------------------------------- */
+
+static u8 *g_m2y1_display_y = NULL;
+static size_t g_m2y1_display_y_cap = 0;
+
+static inline u8 hfix33_clamp_u8_int(int v) {
+    if (v < 0) {
+        return 0;
+    }
+
+    if (v > 255) {
+        return 255;
+    }
+
+    return (u8)v;
+}
+
+
+/* HFIX35 clamp helper for advanced deblocking. */
+static inline u8 hfix35_clamp_u8(int v) {
+    if (v < 0) {
+        return 0;
+    }
+
+    if (v > 255) {
+        return 255;
+    }
+
+    return (u8)v;
+}
+
+
+/* HFIX36A Lossless Packed Motion Vector Modes */
+#define M2Y1_MVCOPYP       14
+#define M2Y1_MVQRESP       15
+#define M2Y1_MVTRANSFORMP  16
+#define M2Y1_MVQRESZP      17
+#define M2Y1_MVTRANSFORMZP 18
+#define M2Y1_GMVCOPY       19
+#define M2Y1_SET_BASE_DQP 20
+
+static inline void m2y1_unpack_mv4(u8 b, int *mx, int *my) {
+    *mx = (int)(b & 15) - 8;
+    *my = (int)(b >> 4) - 8;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX53B_SMART_LUMA_DEBLOCK                                                 */
+/*                                                                           */
+/* Display-only luma boundary filter.                                         */
+/*                                                                           */
+/* This function is intentionally signature-compatible with the previous      */
+/* hfix53b_m2y1_deblock_plane_luma(src_plane, w, h, qp) call site. It only operates   */
+/* on the temporary display Y copy created by m2y1_get_display_y_copy().       */
+/* It must never be called on closed-loop reference planes.                    */
+/* ------------------------------------------------------------------------- */
+static void hfix53b_m2y1_deblock_plane_luma(u8 *src_plane, int w, int h, int qp) {
+    if (!src_plane || w < 16 || h < 16) {
+        return;
+    }
+
+    /*
+        QP-scaled thresholds.
+
+        alpha controls whether the boundary jump is small enough to smooth.
+        beta rejects true high-detail edges around line art / character edges.
+    */
+    int alpha = 8 + (qp >> 2);
+    int beta  = 4 + (qp >> 3);
+
+    if (alpha < 8) {
+        alpha = 8;
+    }
+
+    if (alpha > 24) {
+        alpha = 24;
+    }
+
+    if (beta < 3) {
+        beta = 3;
+    }
+
+    if (beta > 10) {
+        beta = 10;
+    }
+
+    /*
+        Pass 1: vertical 8x8 block boundaries.
+
+        Boundary model:
+            p1 p0 | q0 q1
+
+        Smooth only modest artificial steps and reject real high-contrast
+        detail by comparing local gradients on both sides.
+    */
+    for (int y = 0; y < h; y++) {
+        u8 *row = src_plane + y * w;
+
+        /*
+            x = 8,16,24...
+            Stop before w so q1 is safe.
+        */
+        for (int x = 8; x < w - 1; x += 8) {
+            int p1 = row[x - 2];
+            int p0 = row[x - 1];
+            int q0 = row[x + 0];
+            int q1 = row[x + 1];
+
+            int edge = q0 - p0;
+            if (edge < 0) {
+                edge = -edge;
+            }
+
+            int gp = p0 - p1;
+            if (gp < 0) {
+                gp = -gp;
+            }
+
+            int gq = q1 - q0;
+            if (gq < 0) {
+                gq = -gq;
+            }
+
+            if (edge > 0 && edge < alpha && gp < beta && gq < beta) {
+                int np0 = (p1 + (p0 << 1) + q0 + 2) >> 2;
+                int nq0 = (p0 + (q0 << 1) + q1 + 2) >> 2;
+
+                row[x - 1] = (u8)np0;
+                row[x + 0] = (u8)nq0;
+            }
+        }
+    }
+
+    /*
+        Pass 2: horizontal 8x8 block boundaries.
+
+        Boundary model:
+            p1
+            p0
+            --
+            q0
+            q1
+    */
+    for (int y = 8; y < h - 1; y += 8) {
+        u8 *row_p1 = src_plane + (y - 2) * w;
+        u8 *row_p0 = src_plane + (y - 1) * w;
+        u8 *row_q0 = src_plane + (y + 0) * w;
+        u8 *row_q1 = src_plane + (y + 1) * w;
+
+        for (int x = 0; x < w; x++) {
+            int p1 = row_p1[x];
+            int p0 = row_p0[x];
+            int q0 = row_q0[x];
+            int q1 = row_q1[x];
+
+            int edge = q0 - p0;
+            if (edge < 0) {
+                edge = -edge;
+            }
+
+            int gp = p0 - p1;
+            if (gp < 0) {
+                gp = -gp;
+            }
+
+            int gq = q1 - q0;
+            if (gq < 0) {
+                gq = -gq;
+            }
+
+            if (edge > 0 && edge < alpha && gp < beta && gq < beta) {
+                int np0 = (p1 + (p0 << 1) + q0 + 2) >> 2;
+                int nq0 = (p0 + (q0 << 1) + q1 + 2) >> 2;
+
+                row_p0[x] = (u8)np0;
+                row_q0[x] = (u8)nq0;
+            }
+        }
+    }
+}
+
+static void m2y1_deblock_plane_luma(u8 *src_plane, int w, int h, int qp) {
+    /*
+        HFIX35:
+        Advanced display-only multi-tap deblocking.
+
+        This function is called only on the temporary display Y copy created
+        by m2y1_get_display_y_copy(). It must never operate on the closed-loop
+        decoder reference plane.
+    */
+    if (!src_plane || w < 16 || h < 16) {
+        return;
+    }
+
+    int alpha = (qp / 2) + 2;
+
+    if (alpha < 4) {
+        alpha = 4;
+    }
+
+    if (alpha > 32) {
+        alpha = 32;
+    }
+
+    int beta = (qp / 4) + 1;
+
+    if (beta < 2) {
+        beta = 2;
+    }
+
+    if (beta > 16) {
+        beta = 16;
+    }
+
+    /*
+        Pass 1:
+        Vertical block boundaries at x = 8, 16, 24...
+        Context:
+            p2 p1 p0 | q0 q1 q2
+    */
+    for (int y = 0; y < h; y++) {
+        int y_offset = y * w;
+
+        for (int bx = 1; bx < (w / 8); bx++) {
+            int edge = y_offset + bx * 8;
+
+            /*
+                Since bx starts at 1 and block size is 8:
+                    edge >= 8
+                    p2_idx = edge - 3 is safe.
+                Since bx < w/8:
+                    edge <= w - 8
+                    q2_idx = edge + 2 is safe.
+            */
+            int p0_idx = edge - 1;
+            int p1_idx = edge - 2;
+            int p2_idx = edge - 3;
+            int q0_idx = edge;
+            int q1_idx = edge + 1;
+            int q2_idx = edge + 2;
+
+            int p0 = src_plane[p0_idx];
+            int p1 = src_plane[p1_idx];
+            int p2 = src_plane[p2_idx];
+            int q0 = src_plane[q0_idx];
+            int q1 = src_plane[q1_idx];
+            int q2 = src_plane[q2_idx];
+
+            int d0 = p0 - q0;
+            int ad0 = d0 < 0 ? -d0 : d0;
+
+            if (ad0 > 0 && ad0 < alpha) {
+                int ap = p1 - p0;
+                int aq = q1 - q0;
+
+                if (ap < 0) {
+                    ap = -ap;
+                }
+
+                if (aq < 0) {
+                    aq = -aq;
+                }
+
+                if (ap < beta && aq < beta) {
+                    /*
+                        Strong filter:
+                        Smooth p1,p0,q0,q1 across flat-region seams.
+                    */
+                    src_plane[p0_idx] = hfix35_clamp_u8(
+                        (p2 + (p1 << 1) + (p0 << 1) + (q0 << 1) + q1 + 4) >> 3
+                    );
+
+                    src_plane[q0_idx] = hfix35_clamp_u8(
+                        (p1 + (p0 << 1) + (q0 << 1) + (q1 << 1) + q2 + 4) >> 3
+                    );
+
+                    src_plane[p1_idx] = hfix35_clamp_u8(
+                        (p2 + p1 + p0 + q0 + 2) >> 2
+                    );
+
+                    src_plane[q1_idx] = hfix35_clamp_u8(
+                        (p0 + q0 + q1 + q2 + 2) >> 2
+                    );
+                } else {
+                    /*
+                        Weak filter:
+                        Preserve texture/detail while reducing boundary ridge.
+                    */
+                    int delta = (3 * d0) >> 3;
+
+                    if (delta > 8) {
+                        delta = 8;
+                    }
+
+                    if (delta < -8) {
+                        delta = -8;
+                    }
+
+                    src_plane[p0_idx] = hfix35_clamp_u8(p0 - delta);
+                    src_plane[q0_idx] = hfix35_clamp_u8(q0 + delta);
+                }
+            }
+        }
+    }
+
+    /*
+        Pass 2:
+        Horizontal block boundaries at y = 8, 16, 24...
+        Context:
+            p2
+            p1
+            p0
+            --
+            q0
+            q1
+            q2
+    */
+    for (int by = 1; by < (h / 8); by++) {
+        int edge_row_offset = by * 8 * w;
+
+        for (int x = 0; x < w; x++) {
+            int edge = edge_row_offset + x;
+
+            /*
+                Since by starts at 1:
+                    p2_idx = edge - 3*w is safe.
+                Since by < h/8:
+                    q2_idx = edge + 2*w is safe.
+            */
+            int p0_idx = edge - w;
+            int p1_idx = edge - (w * 2);
+            int p2_idx = edge - (w * 3);
+            int q0_idx = edge;
+            int q1_idx = edge + w;
+            int q2_idx = edge + (w * 2);
+
+            int p0 = src_plane[p0_idx];
+            int p1 = src_plane[p1_idx];
+            int p2 = src_plane[p2_idx];
+            int q0 = src_plane[q0_idx];
+            int q1 = src_plane[q1_idx];
+            int q2 = src_plane[q2_idx];
+
+            int d0 = p0 - q0;
+            int ad0 = d0 < 0 ? -d0 : d0;
+
+            if (ad0 > 0 && ad0 < alpha) {
+                int ap = p1 - p0;
+                int aq = q1 - q0;
+
+                if (ap < 0) {
+                    ap = -ap;
+                }
+
+                if (aq < 0) {
+                    aq = -aq;
+                }
+
+                if (ap < beta && aq < beta) {
+                    /*
+                        Strong filter.
+                    */
+                    src_plane[p0_idx] = hfix35_clamp_u8(
+                        (p2 + (p1 << 1) + (p0 << 1) + (q0 << 1) + q1 + 4) >> 3
+                    );
+
+                    src_plane[q0_idx] = hfix35_clamp_u8(
+                        (p1 + (p0 << 1) + (q0 << 1) + (q1 << 1) + q2 + 4) >> 3
+                    );
+
+                    src_plane[p1_idx] = hfix35_clamp_u8(
+                        (p2 + p1 + p0 + q0 + 2) >> 2
+                    );
+
+                    src_plane[q1_idx] = hfix35_clamp_u8(
+                        (p0 + q0 + q1 + q2 + 2) >> 2
+                    );
+                } else {
+                    /*
+                        Weak filter.
+                    */
+                    int delta = (3 * d0) >> 3;
+
+                    if (delta > 8) {
+                        delta = 8;
+                    }
+
+                    if (delta < -8) {
+                        delta = -8;
+                    }
+
+                    src_plane[p0_idx] = hfix35_clamp_u8(p0 - delta);
+                    src_plane[q0_idx] = hfix35_clamp_u8(q0 + delta);
+                }
+            }
+        }
+    }
+}
+
+static u8 *m2y1_get_display_y_copy(const u8 *src_y, int w, int h, int qp) {
+    if (!src_y || w <= 0 || h <= 0) {
+        return NULL;
+    }
+
+    size_t need = (size_t)w * (size_t)h;
+
+    if (g_m2y1_display_y_cap < need) {
+        if (g_m2y1_display_y) {
+            linearFree(g_m2y1_display_y);
+            g_m2y1_display_y = NULL;
+            g_m2y1_display_y_cap = 0;
+        }
+
+        g_m2y1_display_y = (u8*)linearAlloc(need);
+
+        if (!g_m2y1_display_y) {
+            return NULL;
+        }
+
+        g_m2y1_display_y_cap = need;
+    }
+
+    memcpy(g_m2y1_display_y, src_y, need);
+
+    /*
+        Critical:
+        This modifies only the display copy, never the closed-loop reference.
+    */
+    hfix53b_m2y1_deblock_plane_luma(g_m2y1_display_y, w, h, qp);
+
+    return g_m2y1_display_y;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX51B_DIRECT_VRAM: Direct YUV420 -> rotated top RGB565 framebuffer        */
+/* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* HFIX51C: throttled bottom UI + unified presentation finish                  */
+/* ------------------------------------------------------------------------- */
+#define HFIX51C_DIRECT_UI 1
+
+typedef enum {
+    STATE_STOPPED,
+    STATE_PLAYING,
+    STATE_PAUSED,
+    STATE_FAST_FORWARD,
+    STATE_REWIND
+} MediaPlaybackState;
+
+typedef struct {
+    MediaPlaybackState state;
+    u32 current_frame_idx;
+    u32 total_frames;
+    int dummy_seek_state; /* -1 = rewind highlight, 1 = fwd highlight, 0 = idle */
+    bool ui_visible;
+} MediaPlaybackController;
+
+static MediaPlaybackController g_media_ctl = {
+    STATE_PLAYING,
+    0,
+    1866,
+    0,
+    true
+};
+
+static void hfix51c_draw_rect_bgr8(
+    u8 *fb,
+    int x0,
+    int y0,
+    int rw,
+    int rh,
+    u8 r,
+    u8 g,
+    u8 b
+) {
+    if (!fb) {
+        return;
+    }
+
+    for (int x = x0; x < x0 + rw; x++) {
+        if (x < 0 || x >= 320) {
+            continue;
+        }
+
+        for (int y = y0; y < y0 + rh; y++) {
+            if (y < 0 || y >= 240) {
+                continue;
+            }
+
+            int idx = (x * 240) + (240 - 1 - y);
+
+            fb[idx * 3 + 0] = b;
+            fb[idx * 3 + 1] = g;
+            fb[idx * 3 + 2] = r;
+        }
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX51C_P1_RGB565_BOTTOM_UI                                                */
+/*                                                                           */
+/* The bottom framebuffer is rendered as RGB565/u16. The previous BGR8-style  */
+/* byte writes caused repeated/tiled UI artifacts and extra memory traffic.    */
+/* ------------------------------------------------------------------------- */
+static inline u16 hfix51c_ui_rgb565(int r, int g, int b) {
+    return rgb888_to_rgb565_fast(r, g, b);
+}
+
+static inline void hfix51c_bottom_px565(u8 *fb8, int x, int y, u16 c) {
+    if (!fb8) {
+        return;
+    }
+
+    if (x < 0 || x >= 320 || y < 0 || y >= 240) {
+        return;
+    }
+
+    u16 *fb = (u16*)fb8;
+
+    /*
+        3DS framebuffer is rotated.
+    */
+    fb[x * 240 + (239 - y)] = c;
+}
+
+static void hfix51c_draw_rect565(
+    u8 *fb8,
+    int x0,
+    int y0,
+    int rw,
+    int rh,
+    int r,
+    int g,
+    int b
+) {
+    if (!fb8) {
+        return;
+    }
+
+    u16 c = hfix51c_ui_rgb565(r, g, b);
+
+    int x1 = x0 + rw;
+    int y1 = y0 + rh;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 320) x1 = 320;
+    if (y1 > 240) y1 = 240;
+
+    for (int x = x0; x < x1; x++) {
+        u16 *col = ((u16*)fb8) + x * 240;
+
+        for (int y = y0; y < y1; y++) {
+            col[239 - y] = c;
+        }
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX57A_TOUCH_TRANSPORT_POLISH                                             */
+/*                                                                           */
+/* Larger touchscreen hit targets plus a 3DS-style dark transport dock.       */
+/* Center touch toggles real pause/play through existing KEY_A path.          */
+/* Left/right touch activate existing scan/highlight controls until indexed   */
+/* keyframe seeking is implemented.                                           */
+/* ------------------------------------------------------------------------- */
+
+typedef enum {
+    HFIX57_TOUCH_NONE = 0,
+    HFIX57_TOUCH_REWIND = 1,
+    HFIX57_TOUCH_PLAY = 2,
+    HFIX57_TOUCH_FORWARD = 3
+} Hfix57TouchButton;
+
+static Hfix57TouchButton g_hfix57_touch_button = HFIX57_TOUCH_NONE;
+
+/*
+    Visual button rectangles.
+*/
+#define HFIX57_DOCK_X 18
+#define HFIX57_DOCK_Y 132
+#define HFIX57_DOCK_W 284
+#define HFIX57_DOCK_H 78
+
+#define HFIX57_BTN_W 70
+#define HFIX57_BTN_H 54
+#define HFIX57_BTN_Y 144
+#define HFIX57_LEFT_X 34
+#define HFIX57_PLAY_X 125
+#define HFIX57_RIGHT_X 216
+
+static bool hfix57_point_in_rect(int px, int py, int x, int y, int w, int h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+static Hfix57TouchButton hfix57_hit_transport(int px, int py) {
+    if (hfix57_point_in_rect(px, py, HFIX57_LEFT_X, HFIX57_BTN_Y, HFIX57_BTN_W, HFIX57_BTN_H)) {
+        return HFIX57_TOUCH_REWIND;
+    }
+
+    if (hfix57_point_in_rect(px, py, HFIX57_PLAY_X, HFIX57_BTN_Y, HFIX57_BTN_W, HFIX57_BTN_H)) {
+        return HFIX57_TOUCH_PLAY;
+    }
+
+    if (hfix57_point_in_rect(px, py, HFIX57_RIGHT_X, HFIX57_BTN_Y, HFIX57_BTN_W, HFIX57_BTN_H)) {
+        return HFIX57_TOUCH_FORWARD;
+    }
+
+    return HFIX57_TOUCH_NONE;
+}
+
+/*
+    Convert touch presses into the same logical input flags the keyboard path
+    already understands. This keeps pause/audio gating centralized in the
+    existing KEY_A handler.
+*/
+static u32 hfix57_touch_transport_to_keys(u32 keys_down, u32 keys_held) {
+    if (!(keys_held & KEY_TOUCH)) {
+        if (g_hfix57_touch_button != HFIX57_TOUCH_NONE) {
+            g_hfix57_touch_button = HFIX57_TOUCH_NONE;
+            g_media_ctl.dummy_seek_state = 0;
+        }
+
+        return 0;
+    }
+
+    touchPosition touch;
+    hidTouchRead(&touch);
+
+    Hfix57TouchButton hit = hfix57_hit_transport((int)touch.px, (int)touch.py);
+    g_hfix57_touch_button = hit;
+
+    if (hit == HFIX57_TOUCH_REWIND) {
+        return KEY_LEFT;
+    }
+
+    if (hit == HFIX57_TOUCH_FORWARD) {
+        return KEY_RIGHT;
+    }
+
+    if (hit == HFIX57_TOUCH_PLAY) {
+        if (keys_down & KEY_TOUCH) {
+            return KEY_A;
+        }
+
+        return 0;
+    }
+
+    return 0;
+}
+
+static void hfix57_draw_button_frame(
+    u8 *fb,
+    int x,
+    int y,
+    int w,
+    int h,
+    int r,
+    int g,
+    int b,
+    bool pressed
+) {
+    int dr = pressed ? r / 2 : r;
+    int dg = pressed ? g / 2 : g;
+    int db = pressed ? b / 2 : b;
+
+    /*
+        Faux rounded/beveled rectangle using layered rects.
+    */
+    hfix51c_draw_rect565(fb, x + 4, y + 0, w - 8, h,     12, 16, 28);
+    hfix51c_draw_rect565(fb, x + 0, y + 4, w,     h - 8, 12, 16, 28);
+
+    hfix51c_draw_rect565(fb, x + 5, y + 3, w - 10, h - 6, dr, dg, db);
+    hfix51c_draw_rect565(fb, x + 3, y + 6, w - 6,  h - 12, dr, dg, db);
+
+    /*
+        Highlight and shadow rails.
+    */
+    hfix51c_draw_rect565(fb, x + 7, y + 5, w - 14, 2, 120, 170, 230);
+    hfix51c_draw_rect565(fb, x + 7, y + h - 7, w - 14, 2, 5, 8, 16);
+
+    if (pressed) {
+        hfix51c_draw_rect565(fb, x + 5, y + 3, w - 10, h - 6, 45, 85, 140);
+        hfix51c_draw_rect565(fb, x + 8, y + 6, w - 16, 2, 120, 190, 255);
+    }
+}
+
+static void hfix57_draw_left_tri(u8 *fb, int tip_x, int cy, int half_h, u16 white) {
+    for (int dx = 0; dx < half_h; dx++) {
+        int x = tip_x + dx;
+
+        for (int y = cy - dx; y <= cy + dx; y++) {
+            hfix51c_bottom_px565(fb, x, y, white);
+        }
+    }
+}
+
+static void hfix57_draw_right_tri(u8 *fb, int tip_x, int cy, int half_h, u16 white) {
+    for (int dx = 0; dx < half_h; dx++) {
+        int x = tip_x - dx;
+
+        for (int y = cy - dx; y <= cy + dx; y++) {
+            hfix51c_bottom_px565(fb, x, y, white);
+        }
+    }
+}
+
+static void hfix57_draw_transport_dock(u8 *fb) {
+    if (!fb) {
+        return;
+    }
+
+    /*
+        Dark universal 3DS-style dock.
+    */
+    hfix51c_draw_rect565(fb, HFIX57_DOCK_X + 6, HFIX57_DOCK_Y, HFIX57_DOCK_W - 12, HFIX57_DOCK_H, 4, 8, 18);
+    hfix51c_draw_rect565(fb, HFIX57_DOCK_X, HFIX57_DOCK_Y + 6, HFIX57_DOCK_W, HFIX57_DOCK_H - 12, 4, 8, 18);
+    hfix51c_draw_rect565(fb, HFIX57_DOCK_X + 3, HFIX57_DOCK_Y + 3, HFIX57_DOCK_W - 6, HFIX57_DOCK_H - 6, 14, 20, 38);
+    hfix51c_draw_rect565(fb, HFIX57_DOCK_X + 8, HFIX57_DOCK_Y + 7, HFIX57_DOCK_W - 16, 2, 72, 116, 190);
+    hfix51c_draw_rect565(fb, HFIX57_DOCK_X + 8, HFIX57_DOCK_Y + HFIX57_DOCK_H - 9, HFIX57_DOCK_W - 16, 2, 2, 4, 8);
+
+    /*
+        Small touch hint rails.
+    */
+    hfix51c_draw_rect565(fb, 54, 204, 36, 3, 45, 80, 130);
+    hfix51c_draw_rect565(fb, 142, 204, 36, 3, 45, 130, 80);
+    hfix51c_draw_rect565(fb, 230, 204, 36, 3, 45, 80, 130);
+
+    bool left_pressed =
+        (g_media_ctl.dummy_seek_state == -1) ||
+        (g_hfix57_touch_button == HFIX57_TOUCH_REWIND);
+
+    bool right_pressed =
+        (g_media_ctl.dummy_seek_state == 1) ||
+        (g_hfix57_touch_button == HFIX57_TOUCH_FORWARD);
+
+    bool play_pressed =
+        (g_hfix57_touch_button == HFIX57_TOUCH_PLAY);
+
+    /*
+        Button colors.
+    */
+    hfix57_draw_button_frame(
+        fb,
+        HFIX57_LEFT_X,
+        HFIX57_BTN_Y,
+        HFIX57_BTN_W,
+        HFIX57_BTN_H,
+        left_pressed ? 20 : 44,
+        left_pressed ? 100 : 54,
+        left_pressed ? 190 : 76,
+        left_pressed
+    );
+
+    if (g_media_ctl.state == STATE_PLAYING) {
+        hfix57_draw_button_frame(
+            fb,
+            HFIX57_PLAY_X,
+            HFIX57_BTN_Y,
+            HFIX57_BTN_W,
+            HFIX57_BTN_H,
+            play_pressed ? 30 : 40,
+            play_pressed ? 130 : 180,
+            play_pressed ? 50 : 70,
+            play_pressed
+        );
+    } else {
+        hfix57_draw_button_frame(
+            fb,
+            HFIX57_PLAY_X,
+            HFIX57_BTN_Y,
+            HFIX57_BTN_W,
+            HFIX57_BTN_H,
+            play_pressed ? 150 : 235,
+            play_pressed ? 90 : 140,
+            play_pressed ? 0 : 20,
+            play_pressed
+        );
+    }
+
+    hfix57_draw_button_frame(
+        fb,
+        HFIX57_RIGHT_X,
+        HFIX57_BTN_Y,
+        HFIX57_BTN_W,
+        HFIX57_BTN_H,
+        right_pressed ? 20 : 44,
+        right_pressed ? 100 : 54,
+        right_pressed ? 190 : 76,
+        right_pressed
+    );
+
+    u16 white = hfix51c_ui_rgb565(245, 245, 245);
+
+    /*
+        Rewind << glyph.
+    */
+    int lcy = HFIX57_BTN_Y + 27;
+    hfix57_draw_left_tri(fb, HFIX57_LEFT_X + 25, lcy, 15, white);
+    hfix57_draw_left_tri(fb, HFIX57_LEFT_X + 44, lcy, 15, white);
+
+    /*
+        Center play/pause glyph.
+        While playing, show pause bars.
+        While paused, show play triangle.
+    */
+    int pcx = HFIX57_PLAY_X;
+    int pcy = HFIX57_BTN_Y + 27;
+
+    if (g_media_ctl.state == STATE_PLAYING) {
+        hfix51c_draw_rect565(fb, pcx + 24, HFIX57_BTN_Y + 15, 7, 25, 245, 245, 245);
+        hfix51c_draw_rect565(fb, pcx + 40, HFIX57_BTN_Y + 15, 7, 25, 245, 245, 245);
+    } else {
+        for (int dx = 0; dx < 22; dx++) {
+            int x = pcx + 26 + dx;
+
+            for (int y = pcy - dx; y <= pcy + dx; y++) {
+                hfix51c_bottom_px565(fb, x, y, white);
+            }
+        }
+    }
+
+    /*
+        Fast-forward >> glyph.
+    */
+    int rcy = HFIX57_BTN_Y + 27;
+    hfix57_draw_right_tri(fb, HFIX57_RIGHT_X + 45, rcy, 15, white);
+    hfix57_draw_right_tri(fb, HFIX57_RIGHT_X + 26, rcy, 15, white);
+}
+
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58A_R5_FORWARD_DECLS                                                   */
+/* Forward declarations for polished alerts/file browser.                     */
+/* ------------------------------------------------------------------------- */
+static void hfix58_alert_set(const char *msg, int level);
+static void hfix58_draw_alert(u8 *fb);
+static bool hfix58_file_browser_select(char *out_path, size_t out_sz);
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58B_FORWARD_DECLS                                                      */
+/* ------------------------------------------------------------------------- */
+static void hfix58b_ui_init_once(void);
+static void hfix58b_draw_bottom_glass_ui(u8 *fb);
+static void hfix58b_transport_handle_input(u32 down, u32 held);
+
+
+/* ------------------------------------------------------------------------- */
+
+/*                                                                           */
+/* These must appear before hfix51c_draw_bottom_ui_throttled(), because that  */
+/* function reads g_mivf_ui_skin.selected_index / play_pause.pressed.         */
+/* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58B_R3_ACCESSOR_FORWARD_DECLS                                          */
+/*                                                                           */
+/* hfix51c_draw_bottom_ui_throttled() appears before the full HFIX58B skin    */
+/* type/global declarations. Use accessors so the throttler does not need     */
+/* to know MivfTransportSkin yet.                                             */
+/* ------------------------------------------------------------------------- */
+static int hfix58b_get_selected_index(void);
+static bool hfix58b_get_play_pressed(void);
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58D_FORWARD_DECLS                                                      */
+/* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58J_SYSTEM_OVERLAY                                                     */
+/* ------------------------------------------------------------------------- */
+static void hfix58j_draw_system_overlay(u8 *fb, int top_y_offset) {
+    time_t unix_time = time(NULL);
+    struct tm *ts = gmtime(&unix_time);
+    char clock_txt[16];
+
+    if (!ts) {
+        snprintf(clock_txt, sizeof(clock_txt), "--:--");
+    } else {
+        snprintf(clock_txt, sizeof(clock_txt), "%02d:%02d", ts->tm_hour, ts->tm_min);
+    }
+
+    int y = 22 + top_y_offset;
+    if (y < -12 || y > 240) return;
+
+    u8 battery = 0;
+    (void)PTMU_GetBatteryLevel(&battery);
+    if (battery > 5) battery = 5;
+
+    /* Move battery slightly up and tightly right */
+    int bx = 282;
+    int by = y - 2;
+
+    hfix58_rect565(fb, bx, by, 22, 9, 90, 110, 130);
+    hfix58_rect565(fb, bx + 22, by + 3, 2, 3, 90, 110, 130);
+    hfix58_rect565(fb, bx + 2, by + 2, 18, 5, 3, 6, 14);
+
+    for (u8 i = 0; i < battery; i++) {
+        hfix58_rect565(fb, bx + 3 + i * 3, by + 3, 2, 3, 80, 220, 120);
+    }
+
+    /* Tuck clock right-aligned directly beneath battery */
+    hfix58_draw_text_shadow(fb, 268, y + 10, clock_txt, 1, 220, 235, 250);
+}
+
+static void hfix58d_draw_bottom_fluent_ui(u8 *fb);
+
+/* HFIX58F_R2_FORWARD_DECLS */
+static void hfix58f_tick_seek_ui_tail(void);
+static void wait_stream_prebuffer(MivfStream *stream);
+
+static void hfix58d_anim_tick(void);
+static bool hfix58d_anim_needs_redraw(void);
+static void hfix58d_notify_input(u32 down, u32 held);
+
+/* Accessors avoid early throttler depending on late HFIX58B struct layout. */
+static int hfix58b_get_selected_index(void);
+static bool hfix58b_get_play_pressed(void);
+
+
+/* HFIX58F_FORWARD_DECLS */
+static u32 hfix58f_current_frame(void);
+static u32 hfix58f_total_frames(void);
+static bool hfix58f_seek_active(void);
+static void hfix58f_request_relative_seek(int delta_frames);
+static void hfix58f_draw_timeline(u8 *fb, int panel_y);
+
+static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up);
+static void hfix51c_draw_bottom_ui(void) {
+    u16 fw = 0;
+    u16 fh = 0;
+    u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+
+    (void)fw;
+    (void)fh;
+
+    hfix58d_draw_bottom_fluent_ui(fb);
+}
+
+static void hfix51c_draw_bottom_ui_throttled(void) {
+    static u32 last_frame_idx = 0xFFFFFFFFu;
+    static u32 hfix58f_last_rendered_sec = 0xFFFFFFFFu;
+    static MediaPlaybackState last_state = STATE_STOPPED;
+    static int last_dummy_seek_state = 999;
+    static bool last_visible = false;
+    static int force_redraw_frames = 2;
+
+    /* HFIX58D_THROTTLER_TICK */
+    hfix58d_anim_tick();
+    if (hfix58d_anim_needs_redraw()) {
+        force_redraw_frames = 2;
+    }
+    static int last_hfix58b_selected_index = -1;
+    static bool last_hfix58b_play_pressed = false;
+    static Hfix57TouchButton last_hfix57_touch_button = HFIX57_TOUCH_NONE;
+
+    if (!g_media_ctl.ui_visible) {
+        last_visible = false;
+        return;
+    }
+
+    int hfix58b_cur_selected_index = hfix58b_get_selected_index();
+    bool hfix58b_cur_play_pressed = hfix58b_get_play_pressed();
+
+    if (hfix58b_cur_selected_index != last_hfix58b_selected_index ||
+        hfix58b_cur_play_pressed != last_hfix58b_play_pressed) {
+        force_redraw_frames = 2;
+        last_hfix58b_selected_index = hfix58b_cur_selected_index;
+        last_hfix58b_play_pressed = hfix58b_cur_play_pressed;
+    }
+
+    if (g_hfix57_touch_button != last_hfix57_touch_button) {
+        force_redraw_frames = 2;
+        last_hfix57_touch_button = g_hfix57_touch_button;
+    }
+
+    if (!last_visible ||
+        g_media_ctl.state != last_state ||
+        g_media_ctl.dummy_seek_state != last_dummy_seek_state) {
+        force_redraw_frames = 2;
+        last_state = g_media_ctl.state;
+        last_dummy_seek_state = g_media_ctl.dummy_seek_state;
+        last_visible = true;
+    }
+
+    if (g_media_ctl.state == STATE_PLAYING) {
+        if (g_media_ctl.current_frame_idx != last_frame_idx &&
+            ((g_media_ctl.current_frame_idx & 15u) == 0u)) {
+            force_redraw_frames = 2;
+            last_frame_idx = g_media_ctl.current_frame_idx;
+        }
+    } else {
+        if (g_media_ctl.current_frame_idx != last_frame_idx) {
+            force_redraw_frames = 2;
+            last_frame_idx = g_media_ctl.current_frame_idx;
+        }
+    }
+
+    /* HFIX58F_TIMELINE_THROTTLE */
+    if (hfix58f_seek_active()) {
+        force_redraw_frames = 2;
+    } else {
+        u32 hfix58f_sec = hfix58f_current_frame() / 30u;
+        if (hfix58f_sec != hfix58f_last_rendered_sec) {
+            force_redraw_frames = 2;
+            hfix58f_last_rendered_sec = hfix58f_sec;
+        }
+    }
+
+    if (force_redraw_frames > 0) {
+        hfix51c_draw_bottom_ui();
+        force_redraw_frames--;
+    }
+}
+
+static void hfix51c_present_finish(void) {
+    hfix51c_draw_bottom_ui_throttled();
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+}
+
+
+static void m2y0_to_top_rgb565_direct(const M2Y0Frame *src) {
+    if (!src || !src->y || !src->cb || !src->cr) {
+        return;
+    }
+
+    int w = (int)src->w;
+    int h = (int)src->h;
+
+    /*
+        HFIX51B diagnostic path is only for native 400x240 top-screen assets.
+        Non-native assets must use the legacy RGB565 frame + blit path.
+    */
+    if (w != TOP_W || h != TOP_H) {
+        return;
+    }
+
+    u16 fw, fh;
+    u8 *fb8 = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
+    if (!fb8) {
+        return;
+    }
+
+    u16 *fb = (u16*)fb8;
+
+    /*
+        Display-only luma deblocking support.
+        This reads from a temporary display copy if enabled and never mutates
+        the closed-loop Y/Cb/Cr reference frame.
+    */
+    const u8 *display_y = src->y;
+    if (g_m2y1_deblock_this_frame) {
+        u8 *tmp_y = m2y1_get_display_y_copy(src->y, w, h, g_m2y1_display_qp);
+        if (tmp_y) {
+            display_y = tmp_y;
+        }
+    }
+    g_m2y1_deblock_this_frame = false;
+
+    int cw = w >> 1;
+
+    /*
+        Column-major destination traversal.
+        x is outer, y is inner, making destination writes contiguous inside 
+        each hardware framebuffer column. Inner loop index tracking scales 
+        via accumulation (ci += cw) to preserve register cycles.
+    */
+    for (int x = 0; x < w; x += 2) {
+        u16 *dst0 = fb + (x + 0) * TOP_H;
+        u16 *dst1 = fb + (x + 1) * TOP_H;
+
+        int chroma_x = x >> 1;
+        int ci = chroma_x;
+
+        for (int y = 0; y < h; y += 2) {
+            u8 u = src->cb[ci];
+            u8 v = src->cr[ci];
+
+            const u8 *y0 = display_y + y * w;
+            const u8 *y1 = display_y + (y + 1) * w;
+
+            dst0[TOP_H - 1 - (y + 0)] = yuv_to_rgb565_pixel(y0[x + 0], u, v);
+            dst1[TOP_H - 1 - (y + 0)] = yuv_to_rgb565_pixel(y0[x + 1], u, v);
+            dst0[TOP_H - 1 - (y + 1)] = yuv_to_rgb565_pixel(y1[x + 0], u, v);
+            dst1[TOP_H - 1 - (y + 1)] = yuv_to_rgb565_pixel(y1[x + 1], u, v);
+
+            ci += cw;
+        }
+    }
+
+    hfix51c_present_finish();
+}
+
+static void m2y0_to_rgb565(const M2Y0Frame *src, u8 *dst_rgb565) {
+    if (!src || !dst_rgb565 || !src->y || !src->cb || !src->cr) {
+        return;
+    }
+
+    int w = (int)src->w;
+    int h = (int)src->h;
+
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    /*
+        HFIX33 display-only deblock hook.
+
+        The compressed M2Y1 path sets g_m2y1_deblock_this_frame=true
+        immediately before calling this converter. This function consumes
+        that one-shot flag and resets it, so raw M2Y0 conversion remains
+        untouched.
+    */
+    const u8 *display_y = src->y;
+
+    if (g_m2y1_deblock_this_frame) {
+        u8 *tmp_y = m2y1_get_display_y_copy(
+            src->y,
+            w,
+            h,
+            g_m2y1_display_qp
+        );
+
+        if (tmp_y) {
+            display_y = tmp_y;
+        }
+    }
+
+    g_m2y1_deblock_this_frame = false;
+
+    u16 *dst = (u16*)dst_rgb565;
+
+    for (int y = 0; y < h; y += 2) {
+        const u8 *y0 = display_y + y * w;
+        const u8 *y1 = display_y + (y + 1) * w;
+
+        const u8 *cb = src->cb + (y / 2) * (w / 2);
+        const u8 *cr = src->cr + (y / 2) * (w / 2);
+
+        u16 *d0 = dst + y * w;
+        u16 *d1 = dst + (y + 1) * w;
+
+        for (int x = 0; x < w; x += 2) {
+            u8 u = cb[x / 2];
+            u8 v = cr[x / 2];
+
+            d0[x + 0] = yuv_to_rgb565_pixel(y0[x + 0], u, v);
+            d0[x + 1] = yuv_to_rgb565_pixel(y0[x + 1], u, v);
+            d1[x + 0] = yuv_to_rgb565_pixel(y1[x + 0], u, v);
+            d1[x + 1] = yuv_to_rgb565_pixel(y1[x + 1], u, v);
+        }
+    }
+}
+
+static int dec_m2y0_raw(const u8 *p, size_t n, M2Y0Frame *out) {
+    if (n < 28 || memcmp(p, "M2Y0", 4)) {
+        return -1;
+    }
+
+    u16 w = le16(p + 4);
+    u16 h = le16(p + 6);
+
+    u32 y_size  = le32(p + 16);
+    u32 cb_size = le32(p + 20);
+    u32 cr_size = le32(p + 24);
+
+    if (w != out->w || h != out->h) {
+        return -2;
+    }
+
+    if (y_size != out->y_size ||
+        cb_size != out->c_size ||
+        cr_size != out->c_size) {
+        return -3;
+    }
+
+    size_t need = 28u + (size_t)y_size + (size_t)cb_size + (size_t)cr_size;
+
+    if (n < need) {
+        return -4;
+    }
+
+    const u8 *q = p + 28;
+
+    memcpy(out->y, q, y_size);
+    q += y_size;
+
+    memcpy(out->cb, q, cb_size);
+    q += cb_size;
+
+    memcpy(out->cr, q, cr_size);
+
+    return 0;
+}
+
+
+static void m2y0_frame_copy(M2Y0Frame *dst, const M2Y0Frame *src) {
+    if (!dst || !src || !dst->base || !src->base) {
+        return;
+    }
+
+    if (dst->total_size != src->total_size) {
+        return;
+    }
+
+    memcpy(dst->base, src->base, src->total_size);
+}
+
+enum {
+    M2Y1_SKIP     = 0,
+    M2Y1_RAW      = 1,
+    M2Y1_DELTA    = 2,
+    M2Y1_SOLID    = 3,
+    M2Y1_RUN_SKIP = 4,
+    M2Y1_QRES     = 5,
+    M2Y1_MVCOPY   = 6,
+    M2Y1_MVQRES   = 7,
+    M2Y1_TRANSFORM   = 8,
+    M2Y1_MVTRANSFORM = 9,
+    M2Y1_QRESZ         = 10,
+    M2Y1_MVQRESZ       = 11,
+    M2Y1_TRANSFORMZ    = 12,
+    M2Y1_MVTRANSFORMZ  = 13
+};
+
+static void m2y1_copy_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int bx,
+    int by
+) {
+    int x0 = bx * 8;
+    int y0 = by * 8;
+
+    for (int y = 0; y < 8; y++) {
+        memcpy(
+            dst  + (y0 + y) * plane_w + x0,
+            prev + (y0 + y) * plane_w + x0,
+            8
+        );
+    }
+}
+
+static void m2y1_raw_block(
+    u8 *dst,
+    const u8 *src,
+    int plane_w,
+    int bx,
+    int by
+) {
+    int x0 = bx * 8;
+    int y0 = by * 8;
+
+    for (int y = 0; y < 8; y++) {
+        memcpy(dst + (y0 + y) * plane_w + x0, src + y * 8, 8);
+    }
+}
+
+static void m2y1_solid_block(
+    u8 *dst,
+    int plane_w,
+    int bx,
+    int by,
+    u8 value
+) {
+    int x0 = bx * 8;
+    int y0 = by * 8;
+
+    for (int y = 0; y < 8; y++) {
+        memset(dst + (y0 + y) * plane_w + x0, value, 8);
+    }
+}
+
+static void m2y1_delta_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int bx,
+    int by,
+    int delta
+) {
+    int x0 = bx * 8;
+    int y0 = by * 8;
+
+    for (int y = 0; y < 8; y++) {
+        u8 *d = dst + (y0 + y) * plane_w + x0;
+        const u8 *p = prev + (y0 + y) * plane_w + x0;
+
+        for (int x = 0; x < 8; x++) {
+            int v = (int)p[x] + delta;
+
+            if (v < 0) {
+                v = 0;
+            } else if (v > 255) {
+                v = 255;
+            }
+
+            d[x] = (u8)v;
+        }
+    }
+}
+
+
+static inline u8 m2y1_clamp_u8_int(int v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (u8)v;
+}
+
+static void m2y1_qres_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int bx,
+    int by,
+    int global_delta,
+    const int8_t residuals[16]
+) {
+    int x0 = bx * 8;
+    int y0 = by * 8;
+
+    for (int y = 0; y < 8; y++) {
+        u8 *d = dst + (y0 + y) * plane_w + x0;
+        const u8 *p = prev + (y0 + y) * plane_w + x0;
+
+        int cell_y = (y >> 1) * 4;
+
+        for (int x = 0; x < 8; x++) {
+            int cell = cell_y + (x >> 1);
+            int v = (int)p[x] + global_delta + (int)residuals[cell];
+            d[x] = m2y1_clamp_u8_int(v);
+        }
+    }
+}
+
+
+static void m2y1_mvcopy_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int plane_h,
+    int bx,
+    int by,
+    int mx,
+    int my
+) {
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int src_x0 = dst_x0 + mx;
+    int src_y0 = dst_y0 + my;
+
+    /*
+        Bounds safety:
+        Encoder should never emit invalid vectors, but the decoder must
+        never read outside the previous plane.
+    */
+    if (src_x0 < 0 || src_y0 < 0 ||
+        src_x0 + 8 > plane_w ||
+        src_y0 + 8 > plane_h) {
+        /*
+            Fallback to same-position copy rather than crashing.
+            This preserves byte sync and prevents off-plane reads.
+        */
+        src_x0 = dst_x0;
+        src_y0 = dst_y0;
+    }
+
+    for (int y = 0; y < 8; y++) {
+        memcpy(
+            dst  + (dst_y0 + y) * plane_w + dst_x0,
+            prev + (src_y0 + y) * plane_w + src_x0,
+            8
+        );
+    }
+}
+
+
+static void m2y1_mvqres_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int plane_h,
+    int bx,
+    int by,
+    int mx,
+    int my,
+    int global_delta,
+    const int8_t residuals[16]
+) {
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int src_x0 = dst_x0 + mx;
+    int src_y0 = dst_y0 + my;
+
+    if (src_x0 < 0 || src_y0 < 0 ||
+        src_x0 + 8 > plane_w ||
+        src_y0 + 8 > plane_h) {
+        src_x0 = dst_x0;
+        src_y0 = dst_y0;
+    }
+
+    for (int y = 0; y < 8; y++) {
+        u8 *d = dst + (dst_y0 + y) * plane_w + dst_x0;
+        const u8 *p = prev + (src_y0 + y) * plane_w + src_x0;
+
+        int cell_y = (y >> 1) * 4;
+
+        for (int x = 0; x < 8; x++) {
+            int cell = cell_y + (x >> 1);
+            int v = (int)p[x] + global_delta + (int)residuals[cell];
+
+            d[x] = m2y1_clamp_u8_int(v);
+        }
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX29B M2Y1 4x4 inverse transform decoder                                */
+/* ------------------------------------------------------------------------- */
+
+/* HFIX32: transform QP is read from each plane payload, no fixed define. */
+
+static void m2y1_transform4_inverse(
+    const int16_t input[16],
+    int16_t output[16]
+) {
+    int tmp[16];
+
+    for (int y = 0; y < 4; y++) {
+        int x0 = input[y * 4 + 0];
+        int x1 = input[y * 4 + 1];
+        int x2 = input[y * 4 + 2];
+        int x3 = input[y * 4 + 3];
+
+        int a0 = x0 + x3;
+        int a1 = x1 + x2;
+        int a2 = x1 - x2;
+        int a3 = x0 - x3;
+
+        tmp[y * 4 + 0] = a0 + a1;
+        tmp[y * 4 + 1] = a3 + a2;
+        tmp[y * 4 + 2] = a0 - a1;
+        tmp[y * 4 + 3] = a3 - a2;
+    }
+
+    for (int x = 0; x < 4; x++) {
+        int x0 = tmp[0 * 4 + x];
+        int x1 = tmp[1 * 4 + x];
+        int x2 = tmp[2 * 4 + x];
+        int x3 = tmp[3 * 4 + x];
+
+        int a0 = x0 + x3;
+        int a1 = x1 + x2;
+        int a2 = x1 - x2;
+        int a3 = x0 - x3;
+
+        output[0 * 4 + x] = (int16_t)((a0 + a1 + 8) >> 4);
+        output[1 * 4 + x] = (int16_t)((a3 + a2 + 8) >> 4);
+        output[2 * 4 + x] = (int16_t)((a0 - a1 + 8) >> 4);
+        output[3 * 4 + x] = (int16_t)((a3 - a2 + 8) >> 4);
+    }
+}
+
+static void m2y1_transform_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int plane_h,
+    int bx,
+    int by,
+    int mx,
+    int my,
+    int qp,
+    const int8_t coeffs[16]
+) {
+    /*
+        Reconstructs one 8x8 block.
+
+        Prediction source:
+            prev at same-position for M2Y1_TRANSFORM
+            prev at motion offset for M2Y1_MVTRANSFORM
+
+        Transform payload:
+            four 4x4 quadrants
+            four kept coefficients per quadrant:
+                0, 1, 4, 5
+    */
+    static const int keep_idx[4] = {
+        0, 1,
+        4, 5
+    };
+
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int src_x0 = dst_x0 + mx;
+    int src_y0 = dst_y0 + my;
+
+    if (src_x0 < 0 || src_y0 < 0 ||
+        src_x0 + 8 > plane_w ||
+        src_y0 + 8 > plane_h) {
+        src_x0 = dst_x0;
+        src_y0 = dst_y0;
+    }
+
+    /*
+        Start output from prediction.
+    */
+    for (int y = 0; y < 8; y++) {
+        memcpy(
+            dst + (dst_y0 + y) * plane_w + dst_x0,
+            prev + (src_y0 + y) * plane_w + src_x0,
+            8
+        );
+    }
+
+    int coeff_ptr = 0;
+
+    for (int qy = 0; qy < 2; qy++) {
+        for (int qx = 0; qx < 2; qx++) {
+            int16_t deq[16];
+            int16_t inv[16];
+
+            memset(deq, 0, sizeof(deq));
+
+            for (int k = 0; k < 4; k++) {
+                int ci = keep_idx[k];
+                int qv = (int)coeffs[coeff_ptr++];
+
+                deq[ci] = (int16_t)(qv * qp);
+            }
+
+            m2y1_transform4_inverse(deq, inv);
+
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 4; x++) {
+                    int px = qx * 4 + x;
+                    int py = qy * 4 + y;
+
+                    int dst_x = dst_x0 + px;
+                    int dst_y = dst_y0 + py;
+
+                    int src_x = src_x0 + px;
+                    int src_y = src_y0 + py;
+
+                    int idx4 = y * 4 + x;
+
+                    int v =
+                        (int)prev[src_y * plane_w + src_x] +
+                        (int)inv[idx4];
+
+                    dst[dst_y * plane_w + dst_x] = m2y1_clamp_u8_int(v);
+                }
+            }
+        }
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX30B M2Y1 sparse zero-masked decoder helpers                           */
+/* ------------------------------------------------------------------------- */
+
+static int m2y1_read_sparse16_le(
+    const u8 *src,
+    size_t n,
+    size_t *off,
+    int8_t vals[16]
+) {
+    if (*off + 2 > n) {
+        return -1;
+    }
+
+    u16 mask =
+        (u16)src[*off] |
+        ((u16)src[*off + 1] << 8);
+
+    *off += 2;
+
+    memset(vals, 0, 16);
+
+    for (int i = 0; i < 16; i++) {
+        if (mask & (u16)(1u << i)) {
+            if (*off >= n) {
+                return -2;
+            }
+
+            vals[i] = (int8_t)src[*off];
+            *off += 1;
+        }
+    }
+
+    return 0;
+}
+
+static void m2y1_qresz_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int plane_h,
+    int bx,
+    int by,
+    int mx,
+    int my,
+    int global_delta,
+    const int8_t residuals[16]
+) {
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int src_x0 = dst_x0 + mx;
+    int src_y0 = dst_y0 + my;
+
+    if (src_x0 < 0 || src_y0 < 0 ||
+        src_x0 + 8 > plane_w ||
+        src_y0 + 8 > plane_h) {
+        src_x0 = dst_x0;
+        src_y0 = dst_y0;
+    }
+
+    for (int y = 0; y < 8; y++) {
+        int cell_y = (y >> 1) * 4;
+
+        for (int x = 0; x < 8; x++) {
+            int cell = cell_y + (x >> 1);
+
+            int src_idx = (src_y0 + y) * plane_w + src_x0 + x;
+            int dst_idx = (dst_y0 + y) * plane_w + dst_x0 + x;
+
+            int v =
+                (int)prev[src_idx] +
+                global_delta +
+                (int)residuals[cell];
+
+            dst[dst_idx] = m2y1_clamp_u8_int(v);
+        }
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX37-REDUX single-block bounds-checked GMV copy                          */
+/* ------------------------------------------------------------------------- */
+
+static void m2y1_mvcopyp_block(
+    u8 *dst,
+    const u8 *prev,
+    int plane_w,
+    int plane_h,
+    int bx,
+    int by,
+    int mx,
+    int my
+) {
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int src_x0 = dst_x0 + mx;
+    int src_y0 = dst_y0 + my;
+
+    if (src_x0 < 0 || src_y0 < 0 ||
+        src_x0 + 8 > plane_w ||
+        src_y0 + 8 > plane_h) {
+        src_x0 = dst_x0;
+        src_y0 = dst_y0;
+    }
+
+    for (int y = 0; y < 8; y++) {
+        memcpy(
+            dst + (dst_y0 + y) * plane_w + dst_x0,
+            prev + (src_y0 + y) * plane_w + src_x0,
+            8
+        );
+    }
+}
+
+static int dec_m2y1_plane(
+    const u8 *src,
+    size_t n,
+    u8 *dst,
+    const u8 *prev,
+    bool have_prev,
+    int plane_w,
+    int plane_h
+) {
+    if ((plane_w & 7) || (plane_h & 7)) {
+        return -1;
+    }
+
+    int bxcount = plane_w / 8;
+    int bycount = plane_h / 8;
+    u32 block_count = (u32)(bxcount * bycount);
+
+    size_t off = 0;
+
+    /*
+        HFIX32:
+        Each plane payload begins with one active QP byte.
+        This must be consumed before macroblock token parsing.
+    */
+    if (off >= n) {
+        return -50;
+    }
+
+    int current_frame_qp = (int)src[off++];
+    g_m2y1_display_qp = current_frame_qp;
+
+    if (current_frame_qp < 1 || current_frame_qp > 51) {
+        return -51;
+    }
+
+    /*
+        HFIX37-REDUX:
+        Plane-local global motion vector follows QP.
+        Decoder applies these values directly and never rescales chroma.
+    */
+    if (off + 2 > n) {
+        return -80;
+    }
+
+    int g_mx = (int)(int8_t)src[off++];
+    int g_my = (int)(int8_t)src[off++];
+
+    /*
+        HFIX39A:
+        Base-relative transform QP state. DQP tokens set active_qp from
+        base_qp + signed delta. They are not cumulative.
+    */
+    int base_qp = current_frame_qp;
+    int active_qp = base_qp;
+
+    u32 bi = 0;
+    int bx = 0;
+    int by = 0;
+
+    while (bi < block_count) {
+        if (off >= n) {
+            return -2;
+        }
+
+        u8 m = src[off++];
+
+        if (m == M2Y1_SET_BASE_DQP) {
+            if (off >= n) {
+                return -90;
+            }
+
+            int dqp = (int)(int8_t)src[off++];
+            int q = base_qp + dqp;
+
+            if (q < 18) {
+                q = 18;
+            } else if (q > 48) {
+                q = 48;
+            }
+
+            active_qp = q;
+
+            continue;
+        }
+
+        if (m == M2Y1_RUN_SKIP) {
+            if (!have_prev) {
+                return -3;
+            }
+
+            if (off >= n) {
+                return -4;
+            }
+
+            u32 run = (u32)src[off++] + 1;
+
+            if (bi + run > block_count) {
+                return -5;
+            }
+
+            for (u32 i = 0; i < run; i++) {
+                m2y1_copy_block(dst, prev, plane_w, bx, by);
+
+                bx++;
+
+                if (bx >= bxcount) {
+                    bx = 0;
+                    by++;
+                }
+
+                bi++;
+            }
+
+            continue;
+        }
+
+        if (m == M2Y1_GMVCOPY) {
+            if (!have_prev) {
+                return -81;
+            }
+
+            m2y1_mvcopyp_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                g_mx,
+                g_my
+            );
+
+        } else if (m == M2Y1_SKIP) {
+            if (!have_prev) {
+                return -6;
+            }
+
+            m2y1_copy_block(dst, prev, plane_w, bx, by);
+
+        } else if (m == M2Y1_RAW) {
+            if (off + 64 > n) {
+                return -7;
+            }
+
+            m2y1_raw_block(dst, src + off, plane_w, bx, by);
+            off += 64;
+
+        } else if (m == M2Y1_DELTA) {
+            if (!have_prev) {
+                return -8;
+            }
+
+            if (off >= n) {
+                return -9;
+            }
+
+            int delta = (int)(int8_t)src[off++];
+            m2y1_delta_block(dst, prev, plane_w, bx, by, delta);
+
+                } else if (m == M2Y1_MVCOPYP) {
+            if (!have_prev) return -60;
+            if (off + 1 > n) return -61;
+            int mx = 0, my = 0;
+            m2y1_unpack_mv4(src[off++], &mx, &my);
+            m2y1_mvcopy_block(dst, prev, plane_w, plane_h, bx, by, mx, my);
+        } else if (m == M2Y1_MVCOPY) {
+            if (!have_prev) {
+                return -14;
+            }
+
+            /*
+                MVCOPY payload:
+                    signed mx byte
+                    signed my byte
+            */
+            if (off + 2 > n) {
+                return -15;
+            }
+
+            int mx = (int)(int8_t)src[off++];
+            int my = (int)(int8_t)src[off++];
+
+            m2y1_mvcopy_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                mx,
+                my
+            );
+
+        } else if (m == M2Y1_QRESZ) {
+            if (!have_prev) {
+                return -30;
+            }
+
+            /*
+                QRESZ payload after mode:
+                    signed global delta byte
+                    little-endian 16-bit sparse residual mask
+                    N signed residual bytes
+            */
+            if (off + 1 > n) {
+                return -31;
+            }
+
+            int global_delta = (int)(int8_t)src[off++];
+
+            int8_t residuals[16];
+
+            size_t off2 = off;
+            int rr = m2y1_read_sparse16_le(src, n, &off2, residuals);
+
+            if (rr < 0) {
+                return -32;
+            }
+
+            off = off2;
+
+            m2y1_qresz_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                0,
+                0,
+                global_delta,
+                residuals
+            );
+
+        } else if (m == M2Y1_MVQRESZ) {
+            if (!have_prev) {
+                return -33;
+            }
+
+            /*
+                MVQRESZ payload after mode:
+                    signed mx byte
+                    signed my byte
+                    signed global delta byte
+                    little-endian 16-bit sparse residual mask
+                    N signed residual bytes
+            */
+            if (off + 3 > n) {
+                return -34;
+            }
+
+            int mx = (int)(int8_t)src[off++];
+            int my = (int)(int8_t)src[off++];
+            int global_delta = (int)(int8_t)src[off++];
+
+            int8_t residuals[16];
+
+            size_t off2 = off;
+            int rr = m2y1_read_sparse16_le(src, n, &off2, residuals);
+
+            if (rr < 0) {
+                return -35;
+            }
+
+            off = off2;
+
+            m2y1_qresz_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                mx,
+                my,
+                global_delta,
+                residuals
+            );
+
+        } else if (m == M2Y1_TRANSFORMZ) {
+            if (!have_prev) {
+                return -36;
+            }
+
+            /*
+                TRANSFORMZ payload after mode:
+                    reserved byte
+                    little-endian 16-bit sparse coefficient mask
+                    N signed coefficient bytes
+            */
+            if (off + 1 > n) {
+                return -37;
+            }
+
+            off++; /* reserved */
+
+            int8_t coeffs[16];
+
+            size_t off2 = off;
+            int rr = m2y1_read_sparse16_le(src, n, &off2, coeffs);
+
+            if (rr < 0) {
+                return -38;
+            }
+
+            off = off2;
+
+            m2y1_transform_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                0,
+                0,
+                active_qp,
+                coeffs
+            );
+
+                } else if (m == M2Y1_MVTRANSFORMZP) {
+            if (!have_prev) return -62;
+            if (off + 2 > n) return -63;
+            int mx = 0, my = 0;
+            m2y1_unpack_mv4(src[off++], &mx, &my);
+            off++; /* skip reserved byte */
+            int8_t coeffs[16];
+            size_t off2 = off;
+            int rr = m2y1_read_sparse16_le(src, n, &off2, coeffs);
+            if (rr < 0) return -64;
+            off = off2;
+            m2y1_transform_block(dst, prev, plane_w, plane_h, bx, by, mx, my, active_qp, coeffs);
+        } else if (m == M2Y1_MVTRANSFORMZ) {
+            if (!have_prev) {
+                return -39;
+            }
+
+            /*
+                MVTRANSFORMZ payload after mode:
+                    signed mx byte
+                    signed my byte
+                    reserved byte
+                    little-endian 16-bit sparse coefficient mask
+                    N signed coefficient bytes
+            */
+            if (off + 3 > n) {
+                return -40;
+            }
+
+            int mx = (int)(int8_t)src[off++];
+            int my = (int)(int8_t)src[off++];
+
+            off++; /* reserved */
+
+            int8_t coeffs[16];
+
+            size_t off2 = off;
+            int rr = m2y1_read_sparse16_le(src, n, &off2, coeffs);
+
+            if (rr < 0) {
+                return -41;
+            }
+
+            off = off2;
+
+            m2y1_transform_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                mx,
+                my,
+                active_qp,
+                coeffs
+            );
+
+        } else if (m == M2Y1_TRANSFORM) {
+            if (!have_prev) {
+                return -18;
+            }
+
+            /*
+                TRANSFORM payload after mode:
+                    reserved byte
+                    16 signed coefficients
+            */
+            if (off + 17 > n) {
+                return -19;
+            }
+
+            off++; /* reserved */
+
+            int8_t coeffs[16];
+
+            for (int i = 0; i < 16; i++) {
+                coeffs[i] = (int8_t)src[off++];
+            }
+
+            m2y1_transform_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                0,
+                0,
+                active_qp,
+                coeffs
+            );
+
+        } else if (m == M2Y1_MVTRANSFORM) {
+            if (!have_prev) {
+                return -20;
+            }
+
+            /*
+                MVTRANSFORM payload after mode:
+                    signed mx byte
+                    signed my byte
+                    reserved byte
+                    16 signed coefficients
+            */
+            if (off + 19 > n) {
+                return -21;
+            }
+
+            int mx = (int)(int8_t)src[off++];
+            int my = (int)(int8_t)src[off++];
+
+            off++; /* reserved */
+
+            int8_t coeffs[16];
+
+            for (int i = 0; i < 16; i++) {
+                coeffs[i] = (int8_t)src[off++];
+            }
+
+            m2y1_transform_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                mx,
+                my,
+                active_qp,
+                coeffs
+            );
+
+        } else if (m == M2Y1_MVQRES) {
+            if (!have_prev) {
+                return -16;
+            }
+
+            if (off + 19 > n) {
+                return -17;
+            }
+
+            int mx = (int)(int8_t)src[off++];
+            int my = (int)(int8_t)src[off++];
+            int global_delta = (int)(int8_t)src[off++];
+
+            int8_t residuals[16];
+
+            for (int i = 0; i < 16; i++) {
+                residuals[i] = (int8_t)src[off++];
+            }
+
+            m2y1_mvqres_block(
+                dst,
+                prev,
+                plane_w,
+                plane_h,
+                bx,
+                by,
+                mx,
+                my,
+                global_delta,
+                residuals
+            );
+
+        } else if (m == M2Y1_QRES) {
+            if (!have_prev) {
+                return -12;
+            }
+
+            if (off + 17 > n) {
+                return -13;
+            }
+
+            int global_delta = (int)(int8_t)src[off++];
+
+            int8_t residuals[16];
+
+            for (int i = 0; i < 16; i++) {
+                residuals[i] = (int8_t)src[off++];
+            }
+
+            m2y1_qres_block(
+                dst,
+                prev,
+                plane_w,
+                bx,
+                by,
+                global_delta,
+                residuals
+            );
+
+        } else if (m == M2Y1_SOLID) {
+            if (off >= n) {
+                return -10;
+            }
+
+            u8 value = src[off++];
+            m2y1_solid_block(dst, plane_w, bx, by, value);
+
+        } else {
+            return -11;
+        }
+
+        bx++;
+
+        if (bx >= bxcount) {
+            bx = 0;
+            by++;
+        }
+
+        bi++;
+    }
+
+    return 0;
+}
+
+static int dec_m2y1(
+    const u8 *p,
+    size_t n,
+    M2Y0Frame *out,
+    const M2Y0Frame *prev,
+    bool have_prev
+) {
+    if (n < 28 || memcmp(p, "M2Y1", 4)) {
+        return -1;
+    }
+
+    u16 w = le16(p + 4);
+    u16 h = le16(p + 6);
+
+    if (w != out->w || h != out->h) {
+        return -2;
+    }
+
+    u32 y_payload  = le32(p + 16);
+    u32 cb_payload = le32(p + 20);
+    u32 cr_payload = le32(p + 24);
+
+    size_t need = 28u + (size_t)y_payload + (size_t)cb_payload + (size_t)cr_payload;
+
+    if (n < need) {
+        return -3;
+    }
+
+    const u8 *q = p + 28;
+
+    const u8 *yp = q;
+    q += y_payload;
+
+    const u8 *cbp = q;
+    q += cb_payload;
+
+    const u8 *crp = q;
+
+    int r;
+
+    r = dec_m2y1_plane(
+        yp,
+        y_payload,
+        out->y,
+        prev ? prev->y : NULL,
+        have_prev,
+        out->w,
+        out->h
+    );
+
+    if (r) {
+        return -100 + r;
+    }
+
+    r = dec_m2y1_plane(
+        cbp,
+        cb_payload,
+        out->cb,
+        prev ? prev->cb : NULL,
+        have_prev,
+        out->w / 2,
+        out->h / 2
+    );
+
+    if (r) {
+        return -200 + r;
+    }
+
+    r = dec_m2y1_plane(
+        crp,
+        cr_payload,
+        out->cr,
+        prev ? prev->cr : NULL,
+        have_prev,
+        out->w / 2,
+        out->h / 2
+    );
+
+    if (r) {
+        return -300 + r;
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Display                                                                    */
+/* ------------------------------------------------------------------------- */
+
+/* ------------------------------------------------------------------------- */
+/* HFIX52B_Y2R_UI_MASTER                                           */
+/*                                                                           */
+/* Hardware YUV420 -> linear RGB565 diagnostic.                               */
+/*                                                                           */
+/* This does NOT replace the HFIX51B direct renderer permanently. It tests:   */
+/*     decoded Y/Cb/Cr -> Y2R RGB565 linear buffer -> legacy rotated blit     */
+/*                                                                           */
+/* If Y2R fails, playback falls back to HFIX51B direct CPU YUV->VRAM.         */
+/* ------------------------------------------------------------------------- */
+static u8 *g_hfix52a_y2r_rgb565 = NULL;
+static size_t g_hfix52a_y2r_rgb565_cap = 0;
+static bool g_hfix52a_y2r_ready = false;
+
+static bool hfix52a_y2r_init_once(void) {
+    if (g_hfix52a_y2r_ready) {
+        return true;
+    }
+
+    Result rc = y2rInit();
+
+    if (R_FAILED(rc)) {
+        printf("Y2R init failed: 0x%08lx\n", (unsigned long)rc);
+        return false;
+    }
+
+    Y2RU_ConversionParams params;
+    memset(&params, 0, sizeof(params));
+
+    params.input_format = INPUT_YUV420_INDIV_8;
+    params.output_format = OUTPUT_RGB_16_565;
+    params.rotation = ROTATION_NONE;
+    params.block_alignment = BLOCK_LINE;
+    params.input_line_width = TOP_W;
+    params.input_lines = TOP_H;
+
+    /*
+        Current software path uses TV-range style conversion:
+            c = Y - 16
+            298/409/516 coefficients
+        So start with BT.601 scaling.
+    */
+    params.standard_coefficient = COEFFICIENT_ITU_R_BT_601_SCALING;
+    params.alpha = 0xFF;
+
+    rc = Y2RU_SetConversionParams(&params);
+
+    if (R_FAILED(rc)) {
+        printf("Y2R params failed: 0x%08lx\n", (unsigned long)rc);
+        y2rExit();
+        return false;
+    }
+
+    /* HFIX52C_SPATIAL_DITHER: reduce RGB565 banding */
+    (void)Y2RU_SetSpacialDithering(true);
+    /* Keep temporal dithering off to avoid shimmer on flat anime colors. */
+    (void)Y2RU_SetTemporalDithering(false);
+
+    g_hfix52a_y2r_ready = true;
+    return true;
+}
+
+static void hfix52a_y2r_shutdown(void) {
+    if (g_hfix52a_y2r_rgb565) {
+        linearFree(g_hfix52a_y2r_rgb565);
+        g_hfix52a_y2r_rgb565 = NULL;
+        g_hfix52a_y2r_rgb565_cap = 0;
+    }
+
+    if (g_hfix52a_y2r_ready) {
+        y2rExit();
+        g_hfix52a_y2r_ready = false;
+    }
+}
+
+static bool hfix52a_y2r_ensure_buffer(int w, int h) {
+    size_t need = (size_t)w * (size_t)h * 2u;
+
+    if (g_hfix52a_y2r_rgb565 && g_hfix52a_y2r_rgb565_cap >= need) {
+        return true;
+    }
+
+    if (g_hfix52a_y2r_rgb565) {
+        linearFree(g_hfix52a_y2r_rgb565);
+        g_hfix52a_y2r_rgb565 = NULL;
+        g_hfix52a_y2r_rgb565_cap = 0;
+    }
+
+    g_hfix52a_y2r_rgb565 = (u8*)linearAlloc(need);
+
+    if (!g_hfix52a_y2r_rgb565) {
+        printf("Y2R RGB565 buffer OOM\n");
+        return false;
+    }
+
+    memset(g_hfix52a_y2r_rgb565, 0, need);
+    g_hfix52a_y2r_rgb565_cap = need;
+    return true;
+}
+
+static bool m2y0_to_rgb565_y2r_linear(const M2Y0Frame *src) {
+    if (!src || !src->y || !src->cb || !src->cr) {
+        return false;
+    }
+
+    int w = (int)src->w;
+    int h = (int)src->h;
+
+    if (w != TOP_W || h != TOP_H) {
+        return false;
+    }
+
+    if (!hfix52a_y2r_init_once()) {
+        return false;
+    }
+
+    if (!hfix52a_y2r_ensure_buffer(w, h)) {
+        return false;
+    }
+
+    /*
+        Preserve display-only luma deblocking.
+        This may copy src->y into temporary display Y, but never mutates
+        the closed-loop reference plane.
+    */
+    const u8 *display_y = src->y;
+
+    if (g_m2y1_deblock_this_frame) {
+        u8 *tmp_y = m2y1_get_display_y_copy(
+            src->y,
+            w,
+            h,
+            g_m2y1_display_qp
+        );
+
+        if (tmp_y) {
+            display_y = tmp_y;
+        }
+    }
+
+    g_m2y1_deblock_this_frame = false;
+
+    u32 y_size = (u32)(w * h);
+    u32 c_size = (u32)((w >> 1) * (h >> 1));
+    u32 out_size = (u32)(w * h * 2);
+
+    /*
+        Critical:
+        transfer_unit is s16. Do NOT pass total buffer size.
+        Use row stride in bytes/samples.
+    */
+    s16 y_transfer_unit = (s16)w;        /* 400 */
+    s16 c_transfer_unit = (s16)(w >> 1); /* 200 */
+    s16 out_transfer_unit = (s16)(w * 2);/* 800 bytes per RGB565 row */
+
+    Result rc;
+
+    rc = Y2RU_SetSendingY(display_y, y_size, y_transfer_unit, 0);
+    if (R_FAILED(rc)) {
+        printf("Y2R send Y failed: 0x%08lx\n", (unsigned long)rc);
+        return false;
+    }
+
+    rc = Y2RU_SetSendingU(src->cb, c_size, c_transfer_unit, 0);
+    if (R_FAILED(rc)) {
+        printf("Y2R send U failed: 0x%08lx\n", (unsigned long)rc);
+        return false;
+    }
+
+    rc = Y2RU_SetSendingV(src->cr, c_size, c_transfer_unit, 0);
+    if (R_FAILED(rc)) {
+        printf("Y2R send V failed: 0x%08lx\n", (unsigned long)rc);
+        return false;
+    }
+
+    rc = Y2RU_SetReceiving(
+        g_hfix52a_y2r_rgb565,
+        out_size,
+        out_transfer_unit,
+        0
+    );
+
+    if (R_FAILED(rc)) {
+        printf("Y2R recv failed: 0x%08lx\n", (unsigned long)rc);
+        return false;
+    }
+
+    rc = Y2RU_StartConversion();
+
+    if (R_FAILED(rc)) {
+        printf("Y2R start failed: 0x%08lx\n", (unsigned long)rc);
+        return false;
+    }
+
+    /*
+        Poll instead of event first. y2r.h warns transfer-end events can fire
+        too early depending on transfer_unit.
+    */
+    bool busy = true;
+    int guard = 1000000;
+
+    while (guard-- > 0) {
+        rc = Y2RU_IsBusyConversion(&busy);
+
+        if (R_FAILED(rc)) {
+            printf("Y2R busy failed: 0x%08lx\n", (unsigned long)rc);
+            return false;
+        }
+
+        if (!busy) {
+            break;
+        }
+
+        /*
+            Yield briefly; this avoids spinning at 100% while hardware works.
+        */
+        svcSleepThread(1000);
+    }
+
+    if (busy) {
+        printf("Y2R timeout\n");
+        (void)Y2RU_StopConversion();
+        return false;
+    }
+
+    return true;
+}
+
+
+
+static void blit565_scaled(const u8 *src, int w, int h) {
+    u16 fw, fh;
+    u8 *fb8 = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
+    u16 *fb = (u16*)fb8;
+
+    memset(fb8, 0, TOP_W * TOP_H * 2);
+
+#if MIVF_SCALE_FULLSCREEN
+    for (int y = 0; y < TOP_H; y++) {
+        int sy = y * h / TOP_H;
+
+        for (int x = 0; x < TOP_W; x++) {
+            int sx = x * w / TOP_W;
+
+            u16 c = rgb565_read(src + ((sy * w + sx) * 2));
+
+            int dst_index = x * TOP_H + (TOP_H - 1 - y);
+            fb[dst_index] = c;
+        }
+    }
+#else
+    int x0 = (TOP_W - w) / 2;
+    int y0 = (TOP_H - h) / 2;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+
+    for (int y = 0; y < h && (y + y0) < TOP_H; y++) {
+        for (int x = 0; x < w && (x + x0) < TOP_W; x++) {
+            u16 c = rgb565_read(src + ((y * w + x) * 2));
+
+            int dx = x + x0;
+            int dy = y + y0;
+
+            int dst_index = dx * TOP_H + (TOP_H - 1 - dy);
+            fb[dst_index] = c;
+        }
+    }
+#endif
+
+    hfix51c_present_finish();
+}
+
+/* ------------------------------------------------------------------------- */
+/* Audio                                                                      */
+/* ------------------------------------------------------------------------- */
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX56A_VOLUME_STEREO                                                      */
+/*                                                                           */
+/* Player-side PCM16 gain, soft limiter, and stereo output/upmix.             */
+/*                                                                           */
+/* This operates only on decoded PCM16 immediately before NDSP queueing.      */
+/* It never mutates compressed audio packets.                                 */
+/* ------------------------------------------------------------------------- */
+static int  g_hfix56_volume_percent = 160;     /* default 160% */
+static bool g_hfix56_limiter_enabled = true;
+static bool g_hfix56_force_stereo = true;
+static u8   g_hfix56_audio_src_channels = 1;
+
+static u8  *g_hfix56_audio_mix_buf = NULL;
+static u32  g_hfix56_audio_mix_cap = 0;
+
+static inline s16 hfix56_clamp_s16_i32(int v) {
+    if (v < -32768) {
+        return -32768;
+    }
+
+    if (v > 32767) {
+        return 32767;
+    }
+
+    return (s16)v;
+}
+
+static bool hfix56_audio_mix_ensure(u32 bytes) {
+    if (bytes == 0) {
+        return false;
+    }
+
+    if (g_hfix56_audio_mix_buf && g_hfix56_audio_mix_cap >= bytes) {
+        return true;
+    }
+
+    if (g_hfix56_audio_mix_buf) {
+        linearFree(g_hfix56_audio_mix_buf);
+        g_hfix56_audio_mix_buf = NULL;
+        g_hfix56_audio_mix_cap = 0;
+    }
+
+    g_hfix56_audio_mix_buf = (u8*)linearAlloc(bytes);
+
+    if (!g_hfix56_audio_mix_buf) {
+        printf("HFIX56 audio mix OOM\n");
+        return false;
+    }
+
+    g_hfix56_audio_mix_cap = bytes;
+    return true;
+}
+
+static inline int hfix56_apply_gain_one(int sample) {
+    int v = (sample * g_hfix56_volume_percent) / 100;
+
+    if (g_hfix56_limiter_enabled) {
+        /*
+            Cheap soft limiter. Prevents horrible hard-wrap or harsh clipping
+            when volume is boosted above 100%.
+        */
+        const int knee = 28000;
+
+        if (v > knee) {
+            v = knee + ((v - knee) >> 2);
+        } else if (v < -knee) {
+            v = -knee + ((v + knee) >> 2);
+        }
+    }
+
+    return (int)hfix56_clamp_s16_i32(v);
+}
+
+static void hfix56_audio_controls_on_input(u32 down, u32 held) {
+    /*
+        Runtime controls:
+          L + Up    volume +10%
+          L + Down  volume -10%
+          L + Right toggle forced stereo/upmix
+          L + Left  toggle limiter
+    */
+    if (!(held & KEY_L)) {
+        return;
+    }
+
+    if (down & KEY_DUP) {
+        g_hfix56_volume_percent += 10;
+
+        if (g_hfix56_volume_percent > 300) {
+            g_hfix56_volume_percent = 300;
+        }
+
+        char hfix58_tmp[64]; snprintf(hfix58_tmp, sizeof(hfix58_tmp), "VOLUME %d%%", g_hfix56_volume_percent); hfix58_alert_set(hfix58_tmp, 1);
+    }
+
+    if (down & KEY_DDOWN) {
+        g_hfix56_volume_percent -= 10;
+
+        if (g_hfix56_volume_percent < 0) {
+            g_hfix56_volume_percent = 0;
+        }
+
+        char hfix58_tmp[64]; snprintf(hfix58_tmp, sizeof(hfix58_tmp), "VOLUME %d%%", g_hfix56_volume_percent); hfix58_alert_set(hfix58_tmp, 1);
+    }
+
+    if (down & KEY_DRIGHT) {
+        g_hfix56_force_stereo = !g_hfix56_force_stereo;
+        hfix58_alert_set(g_hfix56_force_stereo ? "STEREO OUTPUT ON" : "STEREO OUTPUT OFF", 1);
+    }
+
+    if (down & KEY_DLEFT) {
+        g_hfix56_limiter_enabled = !g_hfix56_limiter_enabled;
+        hfix58_alert_set(g_hfix56_limiter_enabled ? "LIMITER ON" : "LIMITER OFF", 2);
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58A_POLISHED_UI_FILE_BROWSER                                           */
+/*                                                                           */
+/* Professional RGB565 UI drawing, alert/status overlays, and a boot-time     */
+/* SD card .mivf file browser.                                                */
+/*                                                                           */
+/* Design rules:                                                              */
+/*   - file scanning happens before playback, never inside the decode loop     */
+/*   - bottom UI text is framebuffer-native RGB565, not console debug text     */
+/*   - alerts/status draw through dirty UI redraw only                         */
+/* ------------------------------------------------------------------------- */
+
+#define HFIX58_MAX_BROWSER_FILES 256
+#define HFIX58_MAX_PATH 512
+#define HFIX58_BROWSER_VISIBLE_ROWS 10
+
+typedef struct {
+    char name[256];
+    char path[HFIX58_MAX_PATH];
+} Hfix58FileEntry;
+
+typedef struct {
+    Hfix58FileEntry entries[HFIX58_MAX_BROWSER_FILES];
+    int count;
+    int selected;
+    int scroll;
+    char cwd[HFIX58_MAX_PATH];
+} Hfix58FileBrowser;
+
+static Hfix58FileBrowser g_hfix58_browser;
+static char g_hfix58_selected_media[HFIX58_MAX_PATH] = "sdmc:/test_rawv.mivf";
+static bool g_hfix58_has_selected_media = false;
+
+static char g_hfix58_alert_text[96] = "";
+static int  g_hfix58_alert_level = 0;
+
+static inline u16 hfix58_rgb565(int r, int g, int b) {
+    if (r < 0) r = 0; if (r > 255) r = 255;
+    if (g < 0) g = 0; if (g > 255) g = 255;
+    if (b < 0) b = 0; if (b > 255) b = 255;
+
+    return (u16)(((r & 0xF8) << 8) |
+                 ((g & 0xFC) << 3) |
+                 ((b & 0xF8) >> 3));
+}
+
+static inline void hfix58_unpack565(u16 c, int *r, int *g, int *b) {
+    int rr = (c >> 11) & 31;
+    int gg = (c >> 5) & 63;
+    int bb = c & 31;
+
+    *r = (rr << 3) | (rr >> 2);
+    *g = (gg << 2) | (gg >> 4);
+    *b = (bb << 3) | (bb >> 2);
+}
+
+static inline void hfix58_px565(u8 *fb8, int x, int y, u16 c) {
+    if (!fb8 || x < 0 || x >= 320 || y < 0 || y >= 240) {
+        return;
+    }
+
+    ((u16*)fb8)[x * 240 + (239 - y)] = c;
+}
+
+static inline void hfix58_blend_px565(u8 *fb8, int x, int y, int r, int g, int b, int a) {
+    if (!fb8 || x < 0 || x >= 320 || y < 0 || y >= 240) {
+        return;
+    }
+
+    if (a <= 0) {
+        return;
+    }
+
+    if (a >= 255) {
+        hfix58_px565(fb8, x, y, hfix58_rgb565(r, g, b));
+        return;
+    }
+
+    u16 *fb = (u16*)fb8;
+    int idx = x * 240 + (239 - y);
+
+    int dr, dg, db;
+    hfix58_unpack565(fb[idx], &dr, &dg, &db);
+
+    int nr = (dr * (255 - a) + r * a) / 255;
+    int ng = (dg * (255 - a) + g * a) / 255;
+    int nb = (db * (255 - a) + b * a) / 255;
+
+    fb[idx] = hfix58_rgb565(nr, ng, nb);
+}
+
+static void hfix58_rect565(u8 *fb, int x, int y, int w, int h, int r, int g, int b) {
+    u16 c = hfix58_rgb565(r, g, b);
+
+    int x2 = x + w;
+    int y2 = y + h;
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x2 > 320) x2 = 320;
+    if (y2 > 240) y2 = 240;
+
+    for (int xx = x; xx < x2; xx++) {
+        u16 *col = ((u16*)fb) + xx * 240;
+
+        for (int yy = y; yy < y2; yy++) {
+            col[239 - yy] = c;
+        }
+    }
+}
+
+static void hfix58_blend_rect565(u8 *fb, int x, int y, int w, int h, int r, int g, int b, int a) {
+    int x2 = x + w;
+    int y2 = y + h;
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x2 > 320) x2 = 320;
+    if (y2 > 240) y2 = 240;
+
+    for (int xx = x; xx < x2; xx++) {
+        for (int yy = y; yy < y2; yy++) {
+            hfix58_blend_px565(fb, xx, yy, r, g, b, a);
+        }
+    }
+}
+
+/*
+    Compact 5x7 uppercase bitmap font.
+    Bits are stored left-to-right in the low five bits.
+*/
+static const u8 *hfix58_glyph(char c) {
+    static const u8 sp[7] = {0,0,0,0,0,0,0};
+    static const u8 qn[7] = {14,17,1,2,4,0,4};
+
+    static const u8 d0[7] = {14,17,19,21,25,17,14};
+    static const u8 d1[7] = {4,12,4,4,4,4,14};
+    static const u8 d2[7] = {14,17,1,2,4,8,31};
+    static const u8 d3[7] = {31,2,4,2,1,17,14};
+    static const u8 d4[7] = {2,6,10,18,31,2,2};
+    static const u8 d5[7] = {31,16,30,1,1,17,14};
+    static const u8 d6[7] = {6,8,16,30,17,17,14};
+    static const u8 d7[7] = {31,1,2,4,8,8,8};
+    static const u8 d8[7] = {14,17,17,14,17,17,14};
+    static const u8 d9[7] = {14,17,17,15,1,2,12};
+
+    static const u8 A[7] = {14,17,17,31,17,17,17};
+    static const u8 B[7] = {30,17,17,30,17,17,30};
+    static const u8 C[7] = {14,17,16,16,16,17,14};
+    static const u8 D[7] = {30,17,17,17,17,17,30};
+    static const u8 E[7] = {31,16,16,30,16,16,31};
+    static const u8 F[7] = {31,16,16,30,16,16,16};
+    static const u8 G[7] = {14,17,16,23,17,17,14};
+    static const u8 H[7] = {17,17,17,31,17,17,17};
+    static const u8 I[7] = {14,4,4,4,4,4,14};
+    static const u8 J[7] = {1,1,1,1,17,17,14};
+    static const u8 K[7] = {17,18,20,24,20,18,17};
+    static const u8 L[7] = {16,16,16,16,16,16,31};
+    static const u8 M[7] = {17,27,21,21,17,17,17};
+    static const u8 N[7] = {17,25,21,19,17,17,17};
+    static const u8 O[7] = {14,17,17,17,17,17,14};
+    static const u8 P[7] = {30,17,17,30,16,16,16};
+    static const u8 Q[7] = {14,17,17,17,21,18,13};
+    static const u8 R[7] = {30,17,17,30,20,18,17};
+    static const u8 S[7] = {15,16,16,14,1,1,30};
+    static const u8 T[7] = {31,4,4,4,4,4,4};
+    static const u8 U[7] = {17,17,17,17,17,17,14};
+    static const u8 V[7] = {17,17,17,17,17,10,4};
+    static const u8 W[7] = {17,17,17,21,21,21,10};
+    static const u8 X[7] = {17,17,10,4,10,17,17};
+    static const u8 Y[7] = {17,17,10,4,4,4,4};
+    static const u8 Z[7] = {31,1,2,4,8,16,31};
+
+    static const u8 dot[7] = {0,0,0,0,0,12,12};
+    static const u8 slash[7] = {1,1,2,4,8,16,16};
+    static const u8 dash[7] = {0,0,0,31,0,0,0};
+    static const u8 colon[7] = {0,12,12,0,12,12,0};
+    static const u8 us[7] = {0,0,0,0,0,0,31};
+
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 32);
+    }
+
+    if (c == ' ') return sp;
+    if (c == '.') return dot;
+    if (c == '/') return slash;
+    if (c == '-') return dash;
+    if (c == ':') return colon;
+    if (c == '_') return us;
+
+    if (c >= '0' && c <= '9') {
+        const u8 *digits[10] = {d0,d1,d2,d3,d4,d5,d6,d7,d8,d9};
+        return digits[c - '0'];
+    }
+
+    switch (c) {
+        case 'A': return A; case 'B': return B; case 'C': return C; case 'D': return D;
+        case 'E': return E; case 'F': return F; case 'G': return G; case 'H': return H;
+        case 'I': return I; case 'J': return J; case 'K': return K; case 'L': return L;
+        case 'M': return M; case 'N': return N; case 'O': return O; case 'P': return P;
+        case 'Q': return Q; case 'R': return R; case 'S': return S; case 'T': return T;
+        case 'U': return U; case 'V': return V; case 'W': return W; case 'X': return X;
+        case 'Y': return Y; case 'Z': return Z;
+        default: return qn;
+    }
+}
+
+static void hfix58_draw_char(u8 *fb, int x, int y, char c, int scale, int r, int g, int b) {
+    const u8 *glyph = hfix58_glyph(c);
+    u16 color = hfix58_rgb565(r, g, b);
+
+    if (scale < 1) {
+        scale = 1;
+    }
+
+    for (int row = 0; row < 7; row++) {
+        u8 bits = glyph[row];
+
+        for (int col = 0; col < 5; col++) {
+            if (bits & (1 << (4 - col))) {
+                for (int yy = 0; yy < scale; yy++) {
+                    for (int xx = 0; xx < scale; xx++) {
+                        hfix58_px565(fb, x + col * scale + xx, y + row * scale + yy, color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void hfix58_draw_text(u8 *fb, int x, int y, const char *text, int scale, int r, int g, int b) {
+    if (!text) {
+        return;
+    }
+
+    int cx = x;
+
+    for (const char *p = text; *p; p++) {
+        hfix58_draw_char(fb, cx, y, *p, scale, r, g, b);
+        cx += 6 * scale;
+    }
+}
+
+static void hfix58_draw_text_shadow(u8 *fb, int x, int y, const char *text, int scale, int r, int g, int b) {
+    hfix58_draw_text(fb, x + scale, y + scale, text, scale, 0, 0, 0);
+    hfix58_draw_text(fb, x, y, text, scale, r, g, b);
+}
+
+static void hfix58_alert_set(const char *msg, int level) {
+    if (!msg) {
+        return;
+    }
+
+    snprintf(g_hfix58_alert_text, sizeof(g_hfix58_alert_text), "%s", msg);
+    g_hfix58_alert_level = level;
+
+    /*
+        HFIX58A_R5_ALERT_FORCE_REDRAW:
+        keep bottom UI visible so alert can render on next present pass.
+    */
+#ifdef HFIX51C_DIRECT_UI
+    g_media_ctl.ui_visible = true;
+#endif
+}
+
+static void hfix58_draw_alert(u8 *fb) {
+    if (!fb || g_hfix58_alert_text[0] == '\0') {
+        return;
+    }
+
+    int rr = 70;
+    int gg = 150;
+    int bb = 230;
+
+    if (g_hfix58_alert_level == 1) {
+        rr = 70; gg = 210; bb = 110;
+    } else if (g_hfix58_alert_level == 2) {
+        rr = 235; gg = 150; bb = 45;
+    }
+
+    hfix58_blend_rect565(fb, 18, 66, 284, 28, 5, 8, 18, 210);
+    hfix58_rect565(fb, 18, 66, 284, 2, rr, gg, bb);
+    hfix58_rect565(fb, 18, 92, 284, 2, 2, 4, 8);
+
+    hfix58_draw_text_shadow(fb, 28, 74, g_hfix58_alert_text, 1, 240, 245, 255);
+}
+
+static bool hfix58_has_ext_mivf(const char *name) {
+    if (!name) {
+        return false;
+    }
+
+    size_t n = strlen(name);
+
+    if (n < 5) {
+        return false;
+    }
+
+    const char *e = name + n - 5;
+
+    return (tolower((unsigned char)e[0]) == '.' &&
+            tolower((unsigned char)e[1]) == 'm' &&
+            tolower((unsigned char)e[2]) == 'i' &&
+            tolower((unsigned char)e[3]) == 'v' &&
+            tolower((unsigned char)e[4]) == 'f');
+}
+
+static int hfix58_file_cmp(const void *a, const void *b) {
+    const Hfix58FileEntry *fa = (const Hfix58FileEntry*)a;
+    const Hfix58FileEntry *fb = (const Hfix58FileEntry*)b;
+    return strcmp(fa->name, fb->name);
+}
+
+static bool hfix58_scan_dir(const char *dir) {
+    DIR *d = opendir(dir);
+
+    g_hfix58_browser.count = 0;
+    g_hfix58_browser.selected = 0;
+    g_hfix58_browser.scroll = 0;
+    snprintf(g_hfix58_browser.cwd, sizeof(g_hfix58_browser.cwd), "%s", dir);
+
+    if (!d) {
+        return false;
+    }
+
+    struct dirent *ent;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (g_hfix58_browser.count >= HFIX58_MAX_BROWSER_FILES) {
+            break;
+        }
+
+        if (!hfix58_has_ext_mivf(ent->d_name)) {
+            continue;
+        }
+
+        Hfix58FileEntry *out = &g_hfix58_browser.entries[g_hfix58_browser.count++];
+
+        snprintf(out->name, sizeof(out->name), "%s", ent->d_name);
+
+        if (dir[strlen(dir) - 1] == '/') {
+            snprintf(out->path, sizeof(out->path), "%s%s", dir, ent->d_name);
+        } else {
+            snprintf(out->path, sizeof(out->path), "%s/%s", dir, ent->d_name);
+        }
+    }
+
+    closedir(d);
+
+    if (g_hfix58_browser.count > 1) {
+        qsort(
+            g_hfix58_browser.entries,
+            g_hfix58_browser.count,
+            sizeof(g_hfix58_browser.entries[0]),
+            hfix58_file_cmp
+        );
+    }
+
+    return g_hfix58_browser.count > 0;
+}
+
+static bool hfix58_scan_default_dirs(void) {
+    static const char *dirs[] = {
+        "sdmc:/mivf",
+        "sdmc:/3ds/mivf_player_3ds",
+        "sdmc:/",
+        NULL
+    };
+
+    for (int i = 0; dirs[i]; i++) {
+        if (hfix58_scan_dir(dirs[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void hfix58_draw_browser(u8 *fb) {
+    if (!fb) {
+        return;
+    }
+
+    hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
+
+    hfix58_blend_rect565(fb, 10, 8, 300, 224, 12, 18, 34, 230);
+    hfix58_rect565(fb, 10, 8, 300, 2, 70, 120, 210);
+    hfix58_rect565(fb, 10, 230, 300, 2, 2, 4, 8);
+
+    hfix58_draw_text_shadow(fb, 20, 18, "OPEN MIVF VIDEO", 2, 235, 245, 255);
+
+    hfix58_blend_rect565(fb, 18, 46, 284, 22, 6, 10, 22, 220);
+    hfix58_draw_text_shadow(fb, 26, 53, g_hfix58_browser.cwd, 1, 160, 200, 255);
+
+    if (g_hfix58_browser.count <= 0) {
+        hfix58_draw_text_shadow(fb, 36, 106, "NO .MIVF FILES FOUND", 1, 250, 180, 70);
+        hfix58_draw_text_shadow(fb, 42, 132, "PUT FILES IN SDMC:/MIVF", 1, 210, 220, 230);
+    } else {
+        int first = g_hfix58_browser.scroll;
+        int last = first + HFIX58_BROWSER_VISIBLE_ROWS;
+
+        if (last > g_hfix58_browser.count) {
+            last = g_hfix58_browser.count;
+        }
+
+        int y = 78;
+
+        for (int i = first; i < last; i++) {
+            bool selected = (i == g_hfix58_browser.selected);
+
+            if (selected) {
+                hfix58_blend_rect565(fb, 22, y - 4, 276, 16, 42, 100, 185, 230);
+                hfix58_rect565(fb, 22, y - 4, 4, 16, 100, 190, 255);
+            }
+
+            char line[48];
+            snprintf(line, sizeof(line), "%s", g_hfix58_browser.entries[i].name);
+
+            /*
+                Clip long names visually by truncating the text buffer.
+            */
+            line[35] = '\0';
+
+            hfix58_draw_text_shadow(
+                fb,
+                selected ? 34 : 30,
+                y,
+                line,
+                1,
+                selected ? 255 : 205,
+                selected ? 255 : 220,
+                selected ? 255 : 240
+            );
+
+            y += 14;
+        }
+
+        /*
+            Scroll bar.
+        */
+        if (g_hfix58_browser.count > HFIX58_BROWSER_VISIBLE_ROWS) {
+            int track_y = 78;
+            int track_h = HFIX58_BROWSER_VISIBLE_ROWS * 14;
+            int knob_h = (track_h * HFIX58_BROWSER_VISIBLE_ROWS) / g_hfix58_browser.count;
+
+            if (knob_h < 12) knob_h = 12;
+
+            int max_scroll = g_hfix58_browser.count - HFIX58_BROWSER_VISIBLE_ROWS;
+            int knob_y = track_y;
+
+            if (max_scroll > 0) {
+                knob_y += ((track_h - knob_h) * g_hfix58_browser.scroll) / max_scroll;
+            }
+
+            hfix58_rect565(fb, 300, track_y, 4, track_h, 30, 35, 48);
+            hfix58_rect565(fb, 300, knob_y, 4, knob_h, 80, 170, 255);
+        }
+    }
+
+    hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
+    hfix58_draw_text_shadow(fb, 28, 212, "A SELECT   B CANCEL   START EXIT", 1, 210, 225, 245);
+}
+
+static void hfix58_browser_redraw(void) {
+    u16 fw = 0;
+    u16 fh = 0;
+    u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+
+    hfix58_draw_browser(fb);
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+}
+
+static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
+    if (!out_path || out_sz == 0) {
+        return false;
+    }
+
+    if (!hfix58_scan_default_dirs()) {
+        /*
+            Still show a no-files screen so the user gets feedback.
+        */
+        g_hfix58_browser.count = 0;
+        snprintf(g_hfix58_browser.cwd, sizeof(g_hfix58_browser.cwd), "sdmc:/mivf");
+    }
+
+    hfix58_browser_redraw();
+    hfix58_browser_redraw();
+
+    while (aptMainLoop()) {
+        hidScanInput();
+
+        u32 down = hidKeysDown();
+
+        if (down & KEY_START) {
+            return false;
+        }
+
+        if (down & KEY_B) {
+            return false;
+        }
+
+        if (g_hfix58_browser.count > 0) {
+            if (down & KEY_DUP) {
+                g_hfix58_browser.selected--;
+
+                if (g_hfix58_browser.selected < 0) {
+                    g_hfix58_browser.selected = g_hfix58_browser.count - 1;
+                }
+
+                if (g_hfix58_browser.selected < g_hfix58_browser.scroll) {
+                    g_hfix58_browser.scroll = g_hfix58_browser.selected;
+                }
+
+                if (g_hfix58_browser.selected >= g_hfix58_browser.scroll + HFIX58_BROWSER_VISIBLE_ROWS) {
+                    g_hfix58_browser.scroll = g_hfix58_browser.selected - HFIX58_BROWSER_VISIBLE_ROWS + 1;
+                }
+
+                hfix58_browser_redraw();
+            }
+
+            if (down & KEY_DDOWN) {
+                g_hfix58_browser.selected++;
+
+                if (g_hfix58_browser.selected >= g_hfix58_browser.count) {
+                    g_hfix58_browser.selected = 0;
+                }
+
+                if (g_hfix58_browser.selected < g_hfix58_browser.scroll) {
+                    g_hfix58_browser.scroll = g_hfix58_browser.selected;
+                }
+
+                if (g_hfix58_browser.selected >= g_hfix58_browser.scroll + HFIX58_BROWSER_VISIBLE_ROWS) {
+                    g_hfix58_browser.scroll = g_hfix58_browser.selected - HFIX58_BROWSER_VISIBLE_ROWS + 1;
+                }
+
+                hfix58_browser_redraw();
+            }
+
+            if (down & KEY_A) {
+                snprintf(
+                    out_path,
+                    out_sz,
+                    "%s",
+                    g_hfix58_browser.entries[g_hfix58_browser.selected].path
+                );
+
+                snprintf(g_hfix58_selected_media, sizeof(g_hfix58_selected_media), "%s", out_path);
+                g_hfix58_has_selected_media = true;
+                return true;
+            }
+        }
+
+        gspWaitForVBlank();
+    }
+
+    return false;
+}
+
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58B_CUSTOM_GLASS_UI                                                    */
+/*                                                                           */
+/* Native retained UI skin and vector transport icon engine.                  */
+/* No external textures. No NintendoWare runtime. RGB565 framebuffer only.    */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    int x, y, w, h;
+    u16 bg_color;
+    u16 border_color;
+    bool hovered;
+    bool pressed;
+} MivfButtonSkin;
+
+typedef struct {
+    int panel_x, panel_y, panel_w, panel_h;
+    MivfButtonSkin rewind;
+    MivfButtonSkin play_pause;
+    MivfButtonSkin forward;
+    MivfButtonSkin volume_indicator;
+    int selected_index; /* 0=RW, 1=Play/Pause, 2=FF */
+    bool initialized;
+} MivfTransportSkin;
+
+static MivfTransportSkin g_mivf_ui_skin;
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58B_R3_ACCESSOR_DEFS                                                   */
+/* ------------------------------------------------------------------------- */
+static int hfix58b_get_selected_index(void) {
+    return g_mivf_ui_skin.selected_index;
+}
+
+static bool hfix58b_get_play_pressed(void) {
+    return g_mivf_ui_skin.play_pause.pressed;
+}
+
+static void hfix58b_ui_init_once(void) {
+    if (g_mivf_ui_skin.initialized) {
+        return;
+    }
+
+    g_mivf_ui_skin.panel_x = 10;
+    g_mivf_ui_skin.panel_y = 96;
+    g_mivf_ui_skin.panel_w = 300;
+    g_mivf_ui_skin.panel_h = 112;
+
+    g_mivf_ui_skin.rewind.x = 28;
+    g_mivf_ui_skin.rewind.y = 132;
+    g_mivf_ui_skin.rewind.w = 70;
+    g_mivf_ui_skin.rewind.h = 54;
+
+    g_mivf_ui_skin.play_pause.x = 125;
+    g_mivf_ui_skin.play_pause.y = 126;
+    g_mivf_ui_skin.play_pause.w = 70;
+    g_mivf_ui_skin.play_pause.h = 66;
+
+    g_mivf_ui_skin.forward.x = 222;
+    g_mivf_ui_skin.forward.y = 132;
+    g_mivf_ui_skin.forward.w = 70;
+    g_mivf_ui_skin.forward.h = 54;
+
+    g_mivf_ui_skin.volume_indicator.x = 214;
+    g_mivf_ui_skin.volume_indicator.y = 56;
+    g_mivf_ui_skin.volume_indicator.w = 88;
+    g_mivf_ui_skin.volume_indicator.h = 34;
+
+    g_mivf_ui_skin.selected_index = 1;
+    g_mivf_ui_skin.initialized = true;
+}
+
+static void hfix58b_sync_hover_state(void) {
+    g_mivf_ui_skin.rewind.hovered = false;
+    g_mivf_ui_skin.play_pause.hovered = false;
+    g_mivf_ui_skin.forward.hovered = false;
+
+    if (g_mivf_ui_skin.selected_index == 0) {
+        g_mivf_ui_skin.rewind.hovered = true;
+    } else if (g_mivf_ui_skin.selected_index == 2) {
+        g_mivf_ui_skin.forward.hovered = true;
+    } else {
+        g_mivf_ui_skin.play_pause.hovered = true;
+    }
+
+    g_mivf_ui_skin.rewind.pressed = (g_media_ctl.dummy_seek_state == -1);
+    g_mivf_ui_skin.forward.pressed = (g_media_ctl.dummy_seek_state == 1);
+}
+
+static void hfix58b_transport_handle_input(u32 down, u32 held) {
+    hfix58b_ui_init_once();
+
+    if (down & KEY_DLEFT) {
+        g_mivf_ui_skin.selected_index--;
+        if (g_mivf_ui_skin.selected_index < 0) {
+            g_mivf_ui_skin.selected_index = 0;
+        }
+    }
+
+    if (down & KEY_DRIGHT) {
+        g_mivf_ui_skin.selected_index++;
+        if (g_mivf_ui_skin.selected_index > 2) {
+            g_mivf_ui_skin.selected_index = 2;
+        }
+    }
+
+    /*
+        Existing KEY_A / KEY_LEFT / KEY_RIGHT engine behavior stays centralized
+        in the playback loop. This routine only updates retained UI state.
+    */
+    g_mivf_ui_skin.play_pause.pressed =
+        ((held & KEY_A) && g_mivf_ui_skin.selected_index == 1);
+
+    hfix58b_sync_hover_state();
+}
+
+static void hfix58b_draw_shadow_strip(u8 *fb, int x, int y, int w) {
+    hfix58_blend_rect565(fb, x, y + 0, w, 2, 0, 0, 0, 75);
+    hfix58_blend_rect565(fb, x, y + 2, w, 2, 0, 0, 0, 45);
+    hfix58_blend_rect565(fb, x, y + 4, w, 2, 0, 0, 0, 20);
+}
+
+static void hfix58b_draw_roundedish_panel(u8 *fb, int x, int y, int w, int h) {
+    /*
+        HFIX58E:
+        Pre-baked glass colors. The bottom background is always RGB(3,6,14),
+        so alpha blending huge panel rectangles is wasted CPU work.
+    */
+    hfix58_rect565(fb, x + 8, y,     w - 16, h,     10, 14, 24);
+    hfix58_rect565(fb, x,     y + 8, w,      h - 16, 10, 14, 24);
+
+    hfix58_rect565(fb, x + 4, y + 4, w - 8,  h - 8,  16, 22, 36);
+
+    /*
+        Top glass highlight and console-blue accent are small solid bands.
+    */
+    hfix58_rect565(fb, x + 10, y + 6, w - 20, 3, 34, 54, 86);
+    hfix58_rect565(fb, x + 12, y + 2, w - 24, 2, 0, 140, 255);
+
+    /*
+        Cheap shadow approximation: solid strips instead of alpha blend.
+    */
+    hfix58_rect565(fb, x + 10, y + h + 2, w - 20, 2, 1, 2, 6);
+    hfix58_rect565(fb, x + 10, y + h + 4, w - 20, 2, 2, 3, 8);
+}
+
+static void hfix58b_draw_button(u8 *fb, MivfButtonSkin *b) {
+    if (!b) {
+        return;
+    }
+
+    /*
+        HFIX58E:
+        Use baked solid colors for buttons. This avoids large per-pixel
+        RGB565 unpack/blend/repack loops while the UI is visible.
+    */
+    bool hot = b->hovered || b->pressed;
+
+    int br = b->pressed ? 30 : (hot ? 34 : 18);
+    int bg = b->pressed ? 72 : (hot ? 66 : 26);
+    int bb = b->pressed ? 122 : (hot ? 116 : 42);
+
+    /*
+        Shadow / rounded-ish silhouette.
+    */
+    hfix58_rect565(fb, b->x + 5, b->y,     b->w - 10, b->h,      4, 6, 12);
+    hfix58_rect565(fb, b->x,     b->y + 5, b->w,      b->h - 10, 4, 6, 12);
+
+    /*
+        Solid button face.
+    */
+    hfix58_rect565(fb, b->x + 4, b->y + 4, b->w - 8, b->h - 8, br, bg, bb);
+
+    if (hot) {
+        hfix58_rect565(fb, b->x + 7, b->y + 5, b->w - 14, 2, 120, 200, 255);
+        hfix58_rect565(fb, b->x + 7, b->y + b->h - 7, b->w - 14, 2, 0, 70, 150);
+        hfix58_rect565(fb, b->x + 4, b->y + 8, 2, b->h - 16, 70, 160, 255);
+        hfix58_rect565(fb, b->x + b->w - 6, b->y + 8, 2, b->h - 16, 70, 160, 255);
+    } else {
+        hfix58_rect565(fb, b->x + 8, b->y + 6, b->w - 16, 1, 90, 120, 160);
+    }
+}
+
+static void hfix58b_draw_vector_play(u8 *fb, int x, int y, int size, u16 color) {
+    /*
+        HFIX58K: Genuine right-pointing vector triangle.
+        Wide flat base on the left, sharp apex pointing right.
+    */
+    for (int dx = 0; dx < size; dx++) {
+        int h = (size - 1 - dx) / 2;
+        for (int yy = -h; yy <= h; yy++) {
+            hfix58_px565(fb, x + dx, y + yy, color);
+        }
+    }
+}
+
+static void hfix58b_draw_vector_pause(u8 *fb, int x, int y, int size, u16 color) {
+    int bar_w = size / 4;
+    int gap = size / 5;
+    int h = size;
+
+    hfix58_rect565(fb, x, y - h / 2, bar_w, h, 245, 245, 245);
+    hfix58_rect565(fb, x + bar_w + gap, y - h / 2, bar_w, h, 245, 245, 245);
+
+    (void)color;
+}
+
+static void hfix58b_draw_left_tri(u8 *fb, int tip_x, int cy, int half_h, u16 color) {
+    for (int dx = 0; dx < half_h; dx++) {
+        int x = tip_x + dx;
+
+        for (int y = cy - dx; y <= cy + dx; y++) {
+            hfix58_px565(fb, x, y, color);
+        }
+    }
+}
+
+static void hfix58b_draw_right_tri(u8 *fb, int tip_x, int cy, int half_h, u16 color) {
+    for (int dx = 0; dx < half_h; dx++) {
+        int x = tip_x - dx;
+
+        for (int y = cy - dx; y <= cy + dx; y++) {
+            hfix58_px565(fb, x, y, color);
+        }
+    }
+}
+
+static void hfix58b_draw_vector_rewind(u8 *fb, int x, int y, int size, u16 color) {
+    hfix58b_draw_left_tri(fb, x + size / 3, y, size / 2, color);
+    hfix58b_draw_left_tri(fb, x + size,     y, size / 2, color);
+}
+
+static void hfix58b_draw_vector_forward(u8 *fb, int x, int y, int size, u16 color) {
+    hfix58b_draw_right_tri(fb, x + size,     y, size / 2, color);
+    hfix58b_draw_right_tri(fb, x + size / 3, y, size / 2, color);
+}
+
+static void hfix58b_draw_timeline(u8 *fb) {
+    int x = 30;
+    int y = 194;
+    int w = 260;
+    int h = 5;
+
+    /*
+        Without a stable public timestamp field in this branch, draw a clean
+        inactive track. Future seek/index work can wire real progress here.
+    */
+    hfix58_blend_rect565(fb, x, y, w, h, 22, 30, 45, 230);
+    hfix58_rect565(fb, x, y, w / 3, h, 0, 140, 255);
+    hfix58_rect565(fb, x + w / 3 - 2, y - 3, 5, 11, 230, 245, 255);
+}
+
+static void hfix58b_draw_bottom_glass_ui(u8 *fb) {
+    if (!fb) {
+        return;
+    }
+
+    hfix58b_ui_init_once();
+    hfix58b_sync_hover_state();
+
+    /*
+        Full bottom background: professional dark, not console debug.
+    */
+    hfix58_rect565(fb, 0, 0, 320, 240, 3, 6, 14);
+
+    /*
+        Header/status panel.
+    */
+    hfix58_rect565(fb, 10, 10, 300, 42, 11, 15, 26);
+    hfix58_rect565(fb, 18, 12, 284, 2, 0, 140, 255);
+
+    if (g_media_ctl.state == STATE_PLAYING) {
+        hfix58_draw_text_shadow(fb, 22, 22, "MIVF PLAYER   PLAYING", 1, 220, 245, 255);
+    } else {
+        hfix58_draw_text_shadow(fb, 22, 22, "MIVF PLAYER   PAUSED", 1, 255, 210, 120);
+    }
+
+    /*
+        Optional alert/toast from HFIX58A.
+    */
+    hfix58_draw_alert(fb);
+
+    /*
+        Main transport panel.
+    */
+    hfix58b_draw_roundedish_panel(
+        fb,
+        g_mivf_ui_skin.panel_x,
+        g_mivf_ui_skin.panel_y,
+        g_mivf_ui_skin.panel_w,
+        g_mivf_ui_skin.panel_h
+    );
+
+    /*
+        Side audio/status area.
+    */
+    hfix58_blend_rect565(fb, 214, 100, 88, 56, 8, 12, 22, 180);
+    hfix58_rect565(fb, 218, 102, 80, 2, 70, 120, 210);
+
+
+    /*
+        Volume meter, integrated into the right status module.
+    */
+    int vol = g_hfix56_volume_percent;
+    if (vol < 0) vol = 0;
+    if (vol > 300) vol = 300;
+
+    int meter_x = 222;
+    int meter_y = 118;
+    int meter_w = 72;
+    int meter_h = 8;
+    int fill = (vol * meter_w) / 300;
+
+    hfix58_rect565(fb, meter_x, meter_y, meter_w, meter_h, 19, 27, 40);
+    hfix58_rect565(fb, meter_x, meter_y, fill, meter_h, 70, 210, 130);
+    hfix58_rect565(fb, meter_x + (100 * meter_w) / 300, meter_y - 2, 1, meter_h + 4, 235, 210, 90);
+    hfix58_rect565(fb, meter_x + (200 * meter_w) / 300, meter_y - 2, 1, meter_h + 4, 235, 150, 70);
+
+    char vol_txt[32];
+    snprintf(vol_txt, sizeof(vol_txt), "VOL %d%%", vol);
+    hfix58_draw_text_shadow(fb, 222, 102, vol_txt, 1, 230, 240, 250);
+
+    if (g_hfix56_limiter_enabled) {
+        hfix58_draw_text_shadow(fb, 222, 132, "LIM ON", 1, 120, 230, 150);
+    } else {
+        hfix58_draw_text_shadow(fb, 222, 132, "LIM OFF", 1, 160, 165, 175);
+    }
+
+    if (g_hfix56_force_stereo) {
+        hfix58_draw_text_shadow(fb, 222, 144, "STEREO", 1, 130, 190, 255);
+    } else {
+        hfix58_draw_text_shadow(fb, 222, 144, "MONO", 1, 160, 165, 175);
+    }
+
+
+    /*
+        Buttons.
+    */
+    hfix58b_draw_button(fb, &g_mivf_ui_skin.rewind);
+    hfix58b_draw_button(fb, &g_mivf_ui_skin.play_pause);
+    hfix58b_draw_button(fb, &g_mivf_ui_skin.forward);
+
+    u16 white = hfix58_rgb565(245, 245, 245);
+
+    hfix58b_draw_vector_rewind(
+        fb,
+        g_mivf_ui_skin.rewind.x + 16,
+        g_mivf_ui_skin.rewind.y + g_mivf_ui_skin.rewind.h / 2,
+        32,
+        white
+    );
+
+    if (g_media_ctl.state == STATE_PLAYING) {
+        hfix58b_draw_vector_pause(
+            fb,
+            g_mivf_ui_skin.play_pause.x + 24,
+            g_mivf_ui_skin.play_pause.y + g_mivf_ui_skin.play_pause.h / 2,
+            30,
+            white
+        );
+    } else {
+        hfix58b_draw_vector_play(
+            fb,
+            g_mivf_ui_skin.play_pause.x + 24,
+            g_mivf_ui_skin.play_pause.y + g_mivf_ui_skin.play_pause.h / 2,
+            34,
+            white
+        );
+    }
+
+    hfix58b_draw_vector_forward(
+        fb,
+        g_mivf_ui_skin.forward.x + 16,
+        g_mivf_ui_skin.forward.y + g_mivf_ui_skin.forward.h / 2,
+        32,
+        white
+    );
+
+    hfix58b_draw_timeline(fb);
+
+    /*
+        Footer hints.
+    */
+    hfix58_draw_text_shadow(fb, 22, 216, "D-PAD SELECT   A PRESS   L+D-PAD AUDIO", 1, 170, 190, 215);
+}
+
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58D_FLUENT_UI_ENGINE                                                   */
+/* ------------------------------------------------------------------------- */
+typedef enum {
+    UI_STATE_HIDDEN,
+    UI_STATE_SLIDING_UP,
+    UI_STATE_VISIBLE,
+    UI_STATE_SLIDING_DOWN
+} MivfUiVisibilityState;
+
+typedef struct {
+    int panel_target_y;
+    int panel_current_y;
+    MivfUiVisibilityState visibility_state;
+
+    u32 idle_frame_counter;
+    u32 last_input_mask;
+
+    int hover_box_target_x;
+    int hover_box_current_x;
+    int hover_box_w;
+    int hover_box_h;
+
+    int marquee_scroll_offset;
+    u32 marquee_delay_ticks;
+    bool marquee_reverse_dir;
+    u32 marquee_frame_counter;
+    u32 force_clear_frames;
+    bool is_touch_scrubbing;
+    u32 scrub_target_frame;
+    u32 wake_settle_frames;
+    bool initialized;
+} MivfAnimationEngine;
+
+static MivfAnimationEngine g_mivf_anim;
+
+static int hfix58d_iabs(int v) {
+    return v < 0 ? -v : v;
+}
+
+static const char *hfix58d_basename(const char *path) {
+    const char *last = path;
+    if (!path) {
+        return "";
+    }
+
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            last = p + 1;
+        }
+    }
+
+    return last;
+}
+
+static void hfix58d_anim_init_once(void) {
+    if (g_mivf_anim.initialized) {
+        return;
+    }
+
+    g_mivf_anim.panel_target_y = 96;
+    g_mivf_anim.panel_current_y = 96;
+    g_mivf_anim.visibility_state = UI_STATE_VISIBLE;
+    g_mivf_anim.idle_frame_counter = 0;
+    g_mivf_anim.last_input_mask = 0;
+    g_mivf_anim.hover_box_target_x = 125;
+    g_mivf_anim.hover_box_current_x = 125;
+    g_mivf_anim.hover_box_w = 78;
+    g_mivf_anim.hover_box_h = 72;
+    g_mivf_anim.marquee_scroll_offset = 0;
+    g_mivf_anim.marquee_delay_ticks = 30;
+    g_mivf_anim.marquee_reverse_dir = false;
+    g_mivf_anim.marquee_frame_counter = 0;
+    g_mivf_anim.force_clear_frames = 2;
+    g_mivf_anim.wake_settle_frames = 0;
+    g_mivf_anim.initialized = true;
+}
+
+static void hfix58d_set_hover_target_from_selection(void) {
+    int sel = hfix58b_get_selected_index();
+
+    if (sel == 0) {
+        g_mivf_anim.hover_box_target_x = 28 - 4;
+        g_mivf_anim.hover_box_w = 78;
+    } else if (sel == 2) {
+        g_mivf_anim.hover_box_target_x = 222 - 4;
+        g_mivf_anim.hover_box_w = 78;
+    } else {
+        g_mivf_anim.hover_box_target_x = 125 - 4;
+        g_mivf_anim.hover_box_w = 78;
+    }
+
+    g_mivf_anim.hover_box_h = 74;
+}
+
+static void hfix58d_notify_input(u32 down, u32 held) {
+    hfix58d_anim_init_once();
+
+    u32 relevant = down & (
+        KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT |
+        KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R |
+        KEY_TOUCH
+    );
+
+    if (relevant || (held & KEY_TOUCH)) {
+        g_mivf_anim.idle_frame_counter = 0;
+        g_mivf_anim.last_input_mask = relevant;
+
+        if (g_mivf_anim.visibility_state == UI_STATE_HIDDEN ||
+            g_mivf_anim.visibility_state == UI_STATE_SLIDING_DOWN) {
+            g_mivf_anim.visibility_state = UI_STATE_SLIDING_UP;
+            g_mivf_anim.panel_target_y = 96;
+        }
+
+        g_mivf_anim.force_clear_frames = 2;
+        /* HFIX58J_WAKE_INPUT */
+        g_mivf_anim.wake_settle_frames = 30;
+        /* HFIX58H_WAKE_SETTLE_INPUT */
+        g_mivf_anim.wake_settle_frames = 30;
+    }
+
+    hfix58d_set_hover_target_from_selection();
+}
+
+static void hfix58d_anim_tick(void) {
+    hfix58d_anim_init_once();
+
+    /*
+        HFIX58J_WAKE_SETTLE:
+        Prevent immediate hide re-trigger after waking.
+    */
+    if (g_mivf_anim.wake_settle_frames > 0) {
+        g_mivf_anim.wake_settle_frames--;
+        g_mivf_anim.idle_frame_counter = 0;
+    }
+
+    if (g_mivf_anim.visibility_state == UI_STATE_VISIBLE) {
+        if (g_mivf_anim.idle_frame_counter < 1000000) {
+            g_mivf_anim.idle_frame_counter++;
+        }
+
+        if (g_mivf_anim.idle_frame_counter >= 450) {
+            g_mivf_anim.visibility_state = UI_STATE_SLIDING_DOWN;
+            g_mivf_anim.panel_target_y = 240;
+            g_mivf_anim.force_clear_frames = 2;
+        }
+    }
+
+    /*
+        HFIX58J_KINEMATIC_EASING:
+        integer-only deceleration. No alpha fade, no float.
+    */
+    if (g_mivf_anim.visibility_state == UI_STATE_SLIDING_UP ||
+        g_mivf_anim.visibility_state == UI_STATE_SLIDING_DOWN) {
+        int dy = g_mivf_anim.panel_target_y - g_mivf_anim.panel_current_y;
+
+        if (dy >= -2 && dy <= 2) {
+            g_mivf_anim.panel_current_y = g_mivf_anim.panel_target_y;
+
+            if (g_mivf_anim.visibility_state == UI_STATE_SLIDING_UP) {
+                g_mivf_anim.visibility_state = UI_STATE_VISIBLE;
+                g_mivf_anim.idle_frame_counter = 0;
+                g_mivf_anim.wake_settle_frames = 30;
+            } else {
+                g_mivf_anim.visibility_state = UI_STATE_HIDDEN;
+                g_mivf_anim.idle_frame_counter = 0;
+            }
+
+            g_mivf_anim.force_clear_frames = 2;
+        } else {
+            int step = dy / 4;
+
+            if (step == 0) {
+                step = dy > 0 ? 1 : -1;
+            }
+
+            g_mivf_anim.panel_current_y += step;
+        }
+    }
+
+    hfix58d_set_hover_target_from_selection();
+
+    int dx = g_mivf_anim.hover_box_target_x - g_mivf_anim.hover_box_current_x;
+    if (hfix58d_iabs(dx) < 2) {
+        g_mivf_anim.hover_box_current_x = g_mivf_anim.hover_box_target_x;
+    } else {
+        g_mivf_anim.hover_box_current_x += dx / 2;
+    }
+
+    if (g_mivf_anim.force_clear_frames > 0) {
+        g_mivf_anim.force_clear_frames--;
+    }
+
+    if (g_mivf_anim.visibility_state == UI_STATE_VISIBLE ||
+        g_mivf_anim.visibility_state == UI_STATE_SLIDING_UP) {
+        g_mivf_anim.marquee_frame_counter++;
+    }
+
+    hfix58f_tick_seek_ui_tail();
+
+}
+
+static bool hfix58d_anim_needs_redraw(void) {
+    /* HFIX58F_SEEK_REDRAW_PRIORITY */
+    if (hfix58f_seek_active()) {
+        return true;
+    }
+
+    hfix58d_anim_init_once();
+
+    if (g_mivf_anim.visibility_state == UI_STATE_SLIDING_UP ||
+        g_mivf_anim.visibility_state == UI_STATE_SLIDING_DOWN) {
+        return true;
+    }
+
+    if (g_mivf_anim.force_clear_frames > 0) {
+        return true;
+    }
+
+    if (g_mivf_anim.hover_box_current_x != g_mivf_anim.hover_box_target_x) {
+        return true;
+    }
+
+    /*
+        HFIX58E:
+        Marquee redraw is throttled aggressively. It only wakes the UI if the
+        filename is long enough to scroll, and only every 8 frames.
+    */
+    if (g_mivf_anim.visibility_state == UI_STATE_VISIBLE) {
+        const char *base = hfix58d_basename(MIVF_PATH);
+        int title_len = 17 + 10 + (int)strlen(base); /* "MIVF PLAYER   " + state + filename */
+        int text_w = title_len * 6;
+
+        if (text_w > 276 && (g_mivf_anim.marquee_frame_counter % 8) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void hfix58d_draw_char_clipped(
+    u8 *fb,
+    int x,
+    int y,
+    char c,
+    int scale,
+    int r,
+    int g,
+    int b,
+    int clip_x,
+    int clip_w
+) {
+    const u8 *glyph = hfix58_glyph(c);
+    u16 color = hfix58_rgb565(r, g, b);
+    int clip_r = clip_x + clip_w;
+
+    if (scale < 1) {
+        scale = 1;
+    }
+
+    for (int row = 0; row < 7; row++) {
+        u8 bits = glyph[row];
+
+        for (int col = 0; col < 5; col++) {
+            if (bits & (1 << (4 - col))) {
+                for (int yy = 0; yy < scale; yy++) {
+                    for (int xx = 0; xx < scale; xx++) {
+                        int px = x + col * scale + xx;
+                        if (px >= clip_x && px < clip_r) {
+                            hfix58_px565(fb, px, y + row * scale + yy, color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void hfix58d_draw_text_shadow_clipped(
+    u8 *fb,
+    int x,
+    int y,
+    const char *text,
+    int scale,
+    int r,
+    int g,
+    int b,
+    int clip_x,
+    int clip_w
+) {
+    if (!text) {
+        return;
+    }
+
+    int cx = x;
+    for (const char *p = text; *p; p++) {
+        hfix58d_draw_char_clipped(fb, cx + scale, y + scale, *p, scale, 0, 0, 0, clip_x, clip_w);
+        hfix58d_draw_char_clipped(fb, cx, y, *p, scale, r, g, b, clip_x, clip_w);
+        cx += 6 * scale;
+    }
+}
+
+static void hfix58d_draw_header_marquee(u8 *fb) {
+    char title[192];
+    const char *base = hfix58d_basename(MIVF_PATH);
+
+    snprintf(title, sizeof(title), "MIVF PLAYER   %s   %s",
+        g_media_ctl.state == STATE_PLAYING ? "PLAYING" : "PAUSED",
+        base);
+
+    int clip_x = 22;
+    int clip_w = 276;
+    int text_w = (int)strlen(title) * 6;
+    int offset = 0;
+
+    if (text_w > clip_w) {
+        int max_off = text_w - clip_w + 18;
+
+        if (g_mivf_anim.marquee_delay_ticks > 0) {
+            g_mivf_anim.marquee_delay_ticks--;
+        } else {
+            if (!g_mivf_anim.marquee_reverse_dir) {
+                g_mivf_anim.marquee_scroll_offset++;
+                if (g_mivf_anim.marquee_scroll_offset >= max_off) {
+                    g_mivf_anim.marquee_scroll_offset = max_off;
+                    g_mivf_anim.marquee_reverse_dir = true;
+                    g_mivf_anim.marquee_delay_ticks = 30;
+                }
+            } else {
+                g_mivf_anim.marquee_scroll_offset--;
+                if (g_mivf_anim.marquee_scroll_offset <= 0) {
+                    g_mivf_anim.marquee_scroll_offset = 0;
+                    g_mivf_anim.marquee_reverse_dir = false;
+                    g_mivf_anim.marquee_delay_ticks = 30;
+                }
+            }
+        }
+
+        offset = g_mivf_anim.marquee_scroll_offset;
+    } else {
+        g_mivf_anim.marquee_scroll_offset = 0;
+        g_mivf_anim.marquee_reverse_dir = false;
+        g_mivf_anim.marquee_delay_ticks = 30;
+    }
+
+    hfix58d_draw_text_shadow_clipped(
+        fb,
+        clip_x - offset,
+        22,
+        title,
+        1,
+        g_media_ctl.state == STATE_PLAYING ? 220 : 255,
+        g_media_ctl.state == STATE_PLAYING ? 245 : 210,
+        g_media_ctl.state == STATE_PLAYING ? 255 : 120,
+        clip_x,
+        clip_w
+    );
+}
+
+static void hfix58d_draw_fluent_panel(u8 *fb, int panel_y) {
+    int panel_x = 10;
+    int panel_w = 300;
+    int panel_h = 112;
+
+    if (panel_y >= 240) {
+        return;
+    }
+
+    hfix58b_draw_roundedish_panel(fb, panel_x, panel_y, panel_w, panel_h);
+
+    int off = panel_y - 96;
+
+    MivfButtonSkin rew = g_mivf_ui_skin.rewind;
+    MivfButtonSkin play = g_mivf_ui_skin.play_pause;
+    MivfButtonSkin fwd = g_mivf_ui_skin.forward;
+
+    rew.y += off;
+    play.y += off;
+    fwd.y += off;
+
+    int hover_y = play.y - 4;
+    int hover_x = g_mivf_anim.hover_box_current_x;
+
+    /*
+        Traveling hover halo.
+    */
+    hfix58_rect565(fb, hover_x, hover_y, g_mivf_anim.hover_box_w, g_mivf_anim.hover_box_h,
+        3, 38, 82);
+    hfix58_rect565(fb, hover_x + 6, hover_y + 3, g_mivf_anim.hover_box_w - 12, 2,
+        120, 210, 255);
+
+    hfix58b_draw_button(fb, &rew);
+    hfix58b_draw_button(fb, &play);
+    hfix58b_draw_button(fb, &fwd);
+
+    u16 white = hfix58_rgb565(245, 245, 245);
+
+    hfix58b_draw_vector_rewind(fb, rew.x + 16, rew.y + rew.h / 2, 32, white);
+
+    if (g_media_ctl.state == STATE_PLAYING) {
+        hfix58b_draw_vector_pause(fb, play.x + 25, play.y + play.h / 2, 30, white);
+    } else {
+        hfix58b_draw_vector_play(fb, play.x + 18, play.y + play.h / 2, 34, white);
+    }
+
+    hfix58b_draw_vector_forward(fb, fwd.x + 16, fwd.y + fwd.h / 2, 32, white);
+
+    /*
+        Timeline follows the panel.
+    */
+    int tx = 30;
+    int ty = panel_y + 98;
+    int tw = 260;
+    int th = 5;
+
+    /* HFIX58K: Removed legacy fake timeline placeholder block */
+
+    hfix58f_draw_timeline(fb, panel_y);
+
+    int footer_y = panel_y + 120;
+    if (footer_y < 232) {
+        hfix58_draw_text_shadow(fb, 22, footer_y, "D-PAD SELECT   A PRESS   L+D-PAD AUDIO", 1, 170, 190, 215);
+    }
+}
+
+static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
+    if (!fb) {
+        return;
+    }
+
+    hfix58d_anim_init_once();
+    hfix58b_ui_init_once();
+    hfix58b_sync_hover_state();
+
+    /*
+        Mandatory hard clear for double-buffered animation.
+    */
+    hfix58_rect565(fb, 0, 0, 320, 240, 3, 6, 14);
+
+    /*
+        Header/status panel.
+    */
+    hfix58_rect565(fb, 10, 10, 300, 42, 11, 15, 26);
+    hfix58_rect565(fb, 18, 12, 284, 2, 0, 140, 255);
+    hfix58d_draw_header_marquee(fb);
+    hfix58j_draw_system_overlay(fb, 0);
+
+    /*
+        Optional HFIX58A alert/toast.
+    */
+    hfix58_draw_alert(fb);
+
+    /*
+        Volume/status module stays above transport panel.
+    */
+
+    int vol = g_hfix56_volume_percent;
+    if (vol < 0) vol = 0;
+    if (vol > 300) vol = 300;
+
+    int meter_x = 222;
+    int meter_y = 74;
+    int meter_w = 72;
+    int meter_h = 8;
+    int fill = (vol * meter_w) / 300;
+
+    hfix58_rect565(fb, 214, 56, 88, 34, 7, 11, 20);
+    hfix58_rect565(fb, 218, 58, 80, 2, 70, 120, 210);
+
+    char vol_txt[32];
+    snprintf(vol_txt, sizeof(vol_txt), "VOL %d%%", vol);
+    hfix58_draw_text_shadow(fb, 222, 62, vol_txt, 1, 230, 240, 250);
+
+    hfix58_rect565(fb, meter_x, meter_y, meter_w, meter_h, 19, 27, 40);
+    hfix58_rect565(fb, meter_x, meter_y, fill, meter_h, 70, 210, 130);
+    hfix58_rect565(fb, meter_x + (100 * meter_w) / 300, meter_y - 2, 1, meter_h + 4, 235, 210, 90);
+    hfix58_rect565(fb, meter_x + (200 * meter_w) / 300, meter_y - 2, 1, meter_h + 4, 235, 150, 70);
+
+    hfix58_draw_text_shadow(fb, 222, 84, "LIM", 1,
+        g_hfix56_limiter_enabled ? 120 : 160,
+        g_hfix56_limiter_enabled ? 230 : 165,
+        g_hfix56_limiter_enabled ? 150 : 175);
+
+    hfix58_draw_text_shadow(fb, 254, 84, g_hfix56_force_stereo ? "ST" : "MO", 1,
+        g_hfix56_force_stereo ? 130 : 160,
+        g_hfix56_force_stereo ? 190 : 165,
+        g_hfix56_force_stereo ? 255 : 175);
+
+
+    /*
+        Sliding transport panel.
+    */
+    hfix58d_draw_fluent_panel(fb, g_mivf_anim.panel_current_y);
+}
+
+
+static bool audio_parse_stream(const Stream *s) {
+    if (!s) {
+        return false;
+    }
+
+    /*
+        HFIX27A:
+        Accept both legacy PC16 and compressed IA4M audio.
+        IA4M packets are decoded to PCM16 immediately before audio_queue().
+    */
+    if (memcmp(s->codec, "PC16", 4) != 0 &&
+        memcmp(s->codec, "IA4M", 4) != 0) {
+        return false;
+    }
+
+    audio.sid = s->id;
+    audio.rate = s->w ? s->w : 16000;
+    audio.channels = s->h ? (u8)s->h : 1;
+
+    if (audio.channels != 1 && audio.channels != 2) {
+        audio.channels = 1;
+    }
+
+    /*
+        HFIX56A:
+        Preserve source channel count, then optionally force NDSP output to
+        stereo. Mono sources are upmixed immediately before audio_queue_raw_ndsp.
+    */
+    g_hfix56_audio_src_channels = audio.channels;
+
+    if (g_hfix56_force_stereo) {
+        audio.channels = 2;
+    }
+
+    audio.samples_per_frame = s->fpsn ? s->fpsn : (audio.rate / 30);
+
+    if (audio.samples_per_frame == 0) {
+        audio.samples_per_frame = audio.rate / 30;
+    }
+
+    if (audio.samples_per_frame == 0) {
+        audio.samples_per_frame = 1;
+    }
+
+    /*
+        This is decoded PCM16 packet size, even for IA4M.
+        audio_queue() receives PCM16 bytes.
+    */
+    audio.bytes_per_packet = audio.samples_per_frame * audio.channels * 2;
+
+    if (audio.bytes_per_packet > AUDIO_MAX_PACKET) {
+        audio.bytes_per_packet = AUDIO_MAX_PACKET;
+    }
+
+    return true;
+}
+
+static bool audio_init_from_stream(const Stream *s) {
+    if (!audio_parse_stream(s)) {
+        return false;
+    }
+
+    Result rc = ndspInit();
+
+    if (R_FAILED(rc)) {
+        printf("ndspInit failed: 0x%08lx\n", (unsigned long)rc);
+        audio.ready = false;
+        return false;
+    }
+
+    ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
+
+    ndspChnReset(0);
+    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+    ndspChnSetRate(0, (float)audio.rate);
+    ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
+
+    float mix[12];
+    memset(mix, 0, sizeof(mix));
+    mix[0] = 1.0f;
+    mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
+
+    ndspChnSetMix(0, mix);
+
+    for (int i = 0; i < AUDIO_BUFS; i++) {
+        audio.buf[i] = (u8*)linearAlloc(AUDIO_MAX_PACKET);
+
+        if (!audio.buf[i]) {
+            printf("audio linearAlloc fail\n");
+            return false;
+        }
+
+        memset(&audio.wb[i], 0, sizeof(ndspWaveBuf));
+
+        audio.wb[i].data_pcm16 = (s16*)audio.buf[i];
+        audio.wb[i].nsamples = audio.samples_per_frame;
+        audio.wb[i].looping = false;
+    }
+
+    audio.ready = true;
+    audio.next = 0;
+
+    printf("audio %c%c%c%c %luHz ch=%u samples/frame=%lu\n", s->codec[0], s->codec[1], s->codec[2], s->codec[3],
+        (unsigned long)audio.rate,
+        audio.channels,
+        (unsigned long)audio.samples_per_frame);
+
+    return true;
+}
+
+static void audio_shutdown(void) {
+    if (audio.ready) {
+        ndspChnReset(0);
+        ndspExit();
+    }
+
+    for (int i = 0; i < AUDIO_BUFS; i++) {
+        if (audio.buf[i]) {
+            linearFree(audio.buf[i]);
+            audio.buf[i] = NULL;
+        }
+    }
+
+    memset(&audio, 0, sizeof(audio));
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX24A IA4M IMA ADPCM software decoder                                   */
+/* ------------------------------------------------------------------------- */
+static const int ia4m_index_table[16] = { -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8 };
+static const int ia4m_step_table[89] = {
+        7,     8,     9,    10,    11,    12,    13,    14, 16,    17,    19,    21,    23,    25,    28,    31,
+       34,    37,    41,    45,    50,    55,    60,    66, 73,    80,    88,    97,   107,   118,   130,   143,
+      157,   173,   190,   209,   230,   253,   279,   307, 337,   371,   408,   449,   494,   544,   598,   658,
+      724,   796,   876,   963,  1060,  1166,  1282,  1411, 1552,  1707,  1878,  2066,  2272,  2499,  2749,  3024,
+     3327,  3660,  4026,  4428,  4871,  5358,  5894,  6484, 7132,  7845,  8630,  9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+};
+static inline int ia4m_clamp_index(int v) { return (v < 0) ? 0 : (v > 88) ? 88 : v; }
+static inline s16 ia4m_clamp_s16(int v) { return (v < -32768) ? -32768 : (v > 32767) ? 32767 : (s16)v; }
+
+static s16 ia4m_decode_nibble(int nibble, int *predictor, int *index) {
+    int step = ia4m_step_table[*index];
+    int diff = step >> 3;
+    if (nibble & 1) diff += step >> 2;
+    if (nibble & 2) diff += step >> 1;
+    if (nibble & 4) diff += step;
+    if (nibble & 8) *predictor -= diff; else *predictor += diff;
+    *predictor = ia4m_clamp_s16(*predictor);
+    *index = ia4m_clamp_index(*index + ia4m_index_table[nibble & 15]);
+    return (s16)(*predictor);
+}
+
+static int decode_ia4m_packet(const u8 *p, size_t n, s16 *out, int out_cap) {
+    if (n < 20 || memcmp(p, "IA4M", 4)) return -1;
+    u16 nsamples = le16(p + 8);
+    if (p[10] != 1) return -2;
+    if (nsamples == 0 || nsamples > (u16)out_cap) return -3;
+    int predictor = (int)(int16_t)le16(p + 12);
+    int index = ia4m_clamp_index((int)p[14]);
+    u32 adpcm_bytes = le32(p + 16);
+    if (20u + adpcm_bytes > n) return -4;
+    const u8 *q = p + 20;
+    int sample = 0;
+    out[sample++] = (s16)predictor;
+    for (u32 i = 0; i < adpcm_bytes && sample < nsamples; i++) {
+        u8 b = q[i];
+        out[sample++] = ia4m_decode_nibble(b & 15, &predictor, &index);
+        if (sample < nsamples) {
+            out[sample++] = ia4m_decode_nibble((b >> 4) & 15, &predictor, &index);
+        }
+    }
+    return sample;
+}
+
+static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
+    if (!audio.ready || !data) {
+        return;
+    }
+
+    int start = audio.next;
+
+    for (int tries = 0; tries < AUDIO_BUFS; tries++) {
+        int i = (start + tries) % AUDIO_BUFS;
+
+        if (audio.wb[i].status == NDSP_WBUF_FREE ||
+            audio.wb[i].status == NDSP_WBUF_DONE) {
+
+            /*
+                HFIX9:
+                Use the actual packet size to determine the NDSP sample count.
+
+                This matters for rates like 16000 Hz at 30 FPS:
+                    16000 / 30 = 533.333...
+
+                The muxer may emit a pattern of 533/534-sample packets.
+                Older code forced every packet to 533 samples and truncated
+                534-sample packets, causing tiny audio/video wobble.
+            */
+            u32 bytes_per_sample_frame = audio.channels * 2;
+
+            if (bytes_per_sample_frame == 0) {
+                bytes_per_sample_frame = 2;
+            }
+
+            u32 max_bytes = AUDIO_MAX_PACKET;
+            u32 n = size;
+
+            if (n > max_bytes) {
+                n = max_bytes;
+            }
+
+            /*
+                Keep sample alignment.
+            */
+            n -= (n % bytes_per_sample_frame);
+
+            u32 nsamples = n / bytes_per_sample_frame;
+
+            if (nsamples == 0) {
+                g_audio_drop++;
+                return;
+            }
+
+            memcpy(audio.buf[i], data, n);
+
+            audio.wb[i].data_pcm16 = (s16*)audio.buf[i];
+            audio.wb[i].nsamples = nsamples;
+            audio.wb[i].looping = false;
+
+            DSP_FlushDataCache(audio.buf[i], n);
+            ndspChnWaveBufAdd(0, &audio.wb[i]);
+
+            audio.next = (i + 1) % AUDIO_BUFS;
+
+            g_audio_submit++;
+            g_last_audio_bytes = n;
+            g_last_audio_samples = nsamples;
+
+            return;
+        }
+    }
+
+    /*
+        No free audio buffer.
+        Do not stall video.
+    */
+    g_audio_drop++;
+}
+
+/*
+    HFIX56A wrapper:
+    Input is decoded PCM16, using g_hfix56_audio_src_channels as source layout.
+    Output is audio.channels, which may be forced to stereo.
+*/
+static void audio_queue(const u8 *data, u32 size) {
+    if (!data || size == 0) {
+        return;
+    }
+
+    int src_ch = g_hfix56_audio_src_channels ? g_hfix56_audio_src_channels : 1;
+    int out_ch = audio.channels ? audio.channels : src_ch;
+
+    if (src_ch != 1 && src_ch != 2) {
+        src_ch = 1;
+    }
+
+    if (out_ch != 1 && out_ch != 2) {
+        out_ch = src_ch;
+    }
+
+    u32 in_frame_bytes = (u32)(src_ch * 2);
+
+    if (in_frame_bytes == 0) {
+        return;
+    }
+
+    u32 sample_frames = size / in_frame_bytes;
+
+    if (sample_frames == 0) {
+        return;
+    }
+
+    /*
+        Keep output inside AUDIO_MAX_PACKET because the NDSP wave buffers were
+        allocated at AUDIO_MAX_PACKET.
+    */
+    u32 max_frames = AUDIO_MAX_PACKET / (u32)(out_ch * 2);
+
+    if (sample_frames > max_frames) {
+        sample_frames = max_frames;
+    }
+
+    u32 out_bytes = sample_frames * (u32)(out_ch * 2);
+
+    /*
+        Fast path if no processing needed.
+    */
+    if (g_hfix56_volume_percent == 100 &&
+        !g_hfix56_limiter_enabled &&
+        src_ch == out_ch) {
+        audio_queue_raw_ndsp(data, out_bytes);
+        return;
+    }
+
+    if (!hfix56_audio_mix_ensure(out_bytes)) {
+        audio_queue_raw_ndsp(data, out_bytes);
+        return;
+    }
+
+    const s16 *in = (const s16*)data;
+    s16 *out = (s16*)g_hfix56_audio_mix_buf;
+
+    if (src_ch == 1 && out_ch == 2) {
+        /*
+            Mono -> stereo upmix.
+        */
+        for (u32 i = 0; i < sample_frames; i++) {
+            int v = hfix56_apply_gain_one(in[i]);
+            out[i * 2 + 0] = (s16)v;
+            out[i * 2 + 1] = (s16)v;
+        }
+    } else if (src_ch == 2 && out_ch == 2) {
+        /*
+            True stereo path.
+        */
+        for (u32 i = 0; i < sample_frames; i++) {
+            int l = hfix56_apply_gain_one(in[i * 2 + 0]);
+            int r = hfix56_apply_gain_one(in[i * 2 + 1]);
+            out[i * 2 + 0] = (s16)l;
+            out[i * 2 + 1] = (s16)r;
+        }
+    } else if (src_ch == 2 && out_ch == 1) {
+        /*
+            Stereo -> mono downmix if forced stereo is off and stream/output
+            somehow request mono.
+        */
+        for (u32 i = 0; i < sample_frames; i++) {
+            int mixed = ((int)in[i * 2 + 0] + (int)in[i * 2 + 1]) >> 1;
+            out[i] = (s16)hfix56_apply_gain_one(mixed);
+        }
+    } else {
+        /*
+            Mono -> mono.
+        */
+        for (u32 i = 0; i < sample_frames; i++) {
+            out[i] = (s16)hfix56_apply_gain_one(in[i]);
+        }
+    }
+
+    audio_queue_raw_ndsp(g_hfix56_audio_mix_buf, out_bytes);
+}
+
+
+
+/* ------------------------------------------------------------------------- */
+/* Frame pacing                                                               */
+/* ------------------------------------------------------------------------- */
+
+static void pace(void) {
+    /*
+        Kept as a no-op compatibility stub.
+    */
+}
+
+static void cap_frame_budget(u64 frame_start_tick, const Stream *v) {
+    u32 fpsn = v->fpsn ? v->fpsn : 30;
+    u32 fpsd = v->fpsd ? v->fpsd : 1;
+
+    u64 frame_ticks = ((u64)SYSCLOCK_ARM11 * fpsd) / fpsn;
+
+    if (frame_ticks == 0) {
+        frame_ticks = ((u64)SYSCLOCK_ARM11 / 30);
+    }
+
+    u64 target = frame_start_tick + frame_ticks;
+
+    /*
+        VBlank-aware pacing:
+        - Reduces tiny fast/slow wobble from pure busy-yield timing.
+        - Avoids pegging ARM11 while waiting.
+        - At 30 FPS on a 60 Hz display, this naturally settles near every
+          second VBlank when decode/blit time is stable.
+    */
+    while (svcGetSystemTick() < target) {
+        gspWaitForVBlank();
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Phase 5A streaming playback                                                */
+/* ------------------------------------------------------------------------- */
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58F keyframe seek index and execution                                  */
+/* ------------------------------------------------------------------------- */
+
+#define HFIX58F_MAX_SEEK_POINTS 4096
+#define HFIX58F_SEEK_STEP_FRAMES 150
+
+typedef struct {
+    u32 frame;
+    u64 file_offset;
+} Hfix58FSeekPoint;
+
+typedef struct {
+    Hfix58FSeekPoint points[HFIX58F_MAX_SEEK_POINTS];
+    u32 count;
+    u32 total_frames;
+    bool ready;
+} Hfix58FSeekIndex;
+
+static Hfix58FSeekIndex g_hfix58f_seek;
+
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58J_TOUCH_SCRUB_HELPERS                                                */
+/* ------------------------------------------------------------------------- */
+
+/* HFIX58J-R2 RESTORED SEEK GLOBALS */
+static u32 g_hfix58f_seek_target = 0;
+static bool g_hfix58f_seek_pending = false;
+static bool g_hfix58f_seek_ui_active = false;
+static u32 g_hfix58f_seek_ui_frames = 0;
+
+static void hfix58j_request_absolute_seek(u32 target_frame) {
+    u32 total = hfix58f_total_frames();
+
+    if (total > 30 && target_frame > total - 30) {
+        target_frame = total - 30;
+    } else if (total <= 30) {
+        target_frame = 0;
+    }
+
+    if (!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
+        hfix58_alert_set("SEEK INDEX MISSING", 2);
+        return;
+    }
+
+    g_hfix58f_seek_target = target_frame;
+    g_hfix58f_seek_pending = true;
+    g_hfix58f_seek_ui_active = true;
+    g_hfix58f_seek_ui_frames = 18;
+}
+
+static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up) {
+    touchPosition touch;
+
+    if ((held & KEY_TOUCH) != 0) {
+        hidTouchRead(&touch);
+
+        if (touch.py >= 180 && touch.py <= 239) {
+            u32 total = hfix58f_total_frames();
+            int x = (int)touch.px;
+
+            if (x < 30) x = 30;
+            if (x > 290) x = 290;
+
+            g_mivf_anim.is_touch_scrubbing = true;
+            g_mivf_anim.scrub_target_frame = (u32)(((u64)(x - 30) * (u64)total) / 260u);
+            g_mivf_anim.force_clear_frames = 2;
+            g_mivf_anim.idle_frame_counter = 0;
+            g_mivf_anim.wake_settle_frames = 30;
+
+            if (g_mivf_anim.visibility_state == UI_STATE_HIDDEN ||
+                g_mivf_anim.visibility_state == UI_STATE_SLIDING_DOWN) {
+                g_mivf_anim.visibility_state = UI_STATE_SLIDING_UP;
+                g_mivf_anim.panel_target_y = 96;
+            }
+        }
+    }
+
+    if ((up & KEY_TOUCH) != 0 && g_mivf_anim.is_touch_scrubbing) {
+        g_mivf_anim.is_touch_scrubbing = false;
+        hfix58j_request_absolute_seek(g_mivf_anim.scrub_target_frame);
+        g_mivf_anim.force_clear_frames = 2;
+    }
+
+    (void)down;
+}
+
+
+
+
+
+
+/* HFIX58F_R2_SEEK_UI_TAIL_DEF */
+static void hfix58f_tick_seek_ui_tail(void) {
+    if (g_hfix58f_seek_ui_frames > 0) {
+        g_hfix58f_seek_ui_frames--;
+
+        if (g_hfix58f_seek_ui_frames == 0) {
+            g_hfix58f_seek_ui_active = false;
+        }
+    }
+}
+
+static u32 hfix58f_current_frame(void) {
+    return g_media_ctl.current_frame_idx;
+}
+
+static u32 hfix58f_total_frames(void) {
+    if (g_hfix58f_seek.total_frames) {
+        return g_hfix58f_seek.total_frames;
+    }
+
+    if (g_media_ctl.total_frames) {
+        return g_media_ctl.total_frames;
+    }
+
+    return 1;
+}
+
+static bool hfix58f_seek_active(void) {
+    return g_hfix58f_seek_ui_active || g_hfix58f_seek_pending;
+}
+
+static bool hfix58f_packet_body_is_sync_video(const u8 *body, u32 psize, const Stream *v, const Packet *k) {
+    if (!body || psize < 4 || !v || !k) {
+        return false;
+    }
+
+    /*
+        Best-known safe sync points:
+          - M2Y0 raw YUV420 packet
+          - M1P0 all-intra packet if present
+          - packet flag bit 0 if encoder marks key packets
+          - RAWV-sized video packet
+    */
+    if (body[0] == 'M' && body[1] == '2' && body[2] == 'Y' && body[3] == '0') {
+        return true;
+    }
+
+    if (body[0] == 'M' && body[1] == '1' && body[2] == 'P' && body[3] == '0') {
+        return true;
+    }
+
+    if ((k->flags & 1) != 0 &&
+        body[0] == 'M' &&
+        (body[1] == '2' || body[1] == '1')) {
+        return true;
+    }
+
+    if (!strcmp(v->codec, "RAWV")) {
+        u32 raw_size = (u32)v->w * (u32)v->h * 2u;
+        if (raw_size != 0 && psize == raw_size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58I_IDX_CACHE_HELPERS                                                   */
+/* Persistent .idx seek table cache.                                           */
+/* ------------------------------------------------------------------------- */
+
+#define HFIX58I_IDX_MAGIC   0x31494458u  /* "XDI1" little-endian-ish */
+#define HFIX58I_IDX_VERSION 1u
+
+static bool hfix58i_make_idx_path(char *out, size_t out_sz, const char *mivf_path) {
+    if (!out || out_sz == 0 || !mivf_path) {
+        return false;
+    }
+
+    snprintf(out, out_sz, "%s", mivf_path);
+
+    char *dot = strrchr(out, '.');
+
+    if (dot && dot > out) {
+        snprintf(dot, out_sz - (size_t)(dot - out), ".idx");
+    } else {
+        size_t len = strlen(out);
+        if (len + 4 >= out_sz) {
+            return false;
+        }
+        strcat(out, ".idx");
+    }
+
+    return true;
+}
+
+static bool hfix58i_write_u32(FILE *f, u32 v) {
+    return fwrite(&v, 1, sizeof(v), f) == sizeof(v);
+}
+
+static bool hfix58i_write_u64(FILE *f, u64 v) {
+    return fwrite(&v, 1, sizeof(v), f) == sizeof(v);
+}
+
+static bool hfix58i_read_u32(FILE *f, u32 *v) {
+    return v && fread(v, 1, sizeof(*v), f) == sizeof(*v);
+}
+
+static bool hfix58i_read_u64(FILE *f, u64 *v) {
+    return v && fread(v, 1, sizeof(*v), f) == sizeof(*v);
+}
+
+static bool hfix58i_try_load_seek_cache(const char *cache_path, u64 file_size, u32 first_offset) {
+    if (!cache_path) {
+        return false;
+    }
+
+    FILE *cf = fopen(cache_path, "rb");
+    if (!cf) {
+        return false;
+    }
+
+    u32 magic = 0;
+    u32 version = 0;
+    u64 cached_file_size = 0;
+    u32 cached_first = 0;
+    u32 total_frames = 0;
+    u32 count = 0;
+
+    bool ok =
+        hfix58i_read_u32(cf, &magic) &&
+        hfix58i_read_u32(cf, &version) &&
+        hfix58i_read_u64(cf, &cached_file_size) &&
+        hfix58i_read_u32(cf, &cached_first) &&
+        hfix58i_read_u32(cf, &total_frames) &&
+        hfix58i_read_u32(cf, &count);
+
+    if (!ok ||
+        magic != HFIX58I_IDX_MAGIC ||
+        version != HFIX58I_IDX_VERSION ||
+        cached_file_size != file_size ||
+        cached_first != first_offset ||
+        count == 0 ||
+        count > HFIX58F_MAX_SEEK_POINTS) {
+        fclose(cf);
+        return false;
+    }
+
+    size_t want = (size_t)count * sizeof(g_hfix58f_seek.points[0]);
+
+    if (fread(g_hfix58f_seek.points, 1, want, cf) != want) {
+        fclose(cf);
+        return false;
+    }
+
+    fclose(cf);
+
+    g_hfix58f_seek.count = count;
+    g_hfix58f_seek.total_frames = total_frames;
+    g_hfix58f_seek.ready = true;
+    g_media_ctl.total_frames = total_frames;
+
+    hfix58_alert_set("SEEK CACHE HIT", 1);
+    return true;
+}
+
+static void hfix58i_save_seek_cache(const char *cache_path, u64 file_size, u32 first_offset) {
+    if (!cache_path || !g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
+        return;
+    }
+
+    FILE *cf = fopen(cache_path, "wb");
+
+    if (!cf) {
+        return;
+    }
+
+    bool ok = true;
+
+    ok = ok && hfix58i_write_u32(cf, HFIX58I_IDX_MAGIC);
+    ok = ok && hfix58i_write_u32(cf, HFIX58I_IDX_VERSION);
+    ok = ok && hfix58i_write_u64(cf, file_size);
+    ok = ok && hfix58i_write_u32(cf, first_offset);
+    ok = ok && hfix58i_write_u32(cf, g_hfix58f_seek.total_frames);
+    ok = ok && hfix58i_write_u32(cf, g_hfix58f_seek.count);
+
+    if (ok) {
+        size_t bytes = (size_t)g_hfix58f_seek.count * sizeof(g_hfix58f_seek.points[0]);
+        ok = fwrite(g_hfix58f_seek.points, 1, bytes, cf) == bytes;
+    }
+
+    fclose(cf);
+
+    if (ok) {
+        hfix58_alert_set("SEEK CACHE SAVED", 1);
+    }
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* HFIX58J_IDX_CACHE_HELPERS                                                   */
+/* ------------------------------------------------------------------------- */
+
+#define HFIX58J_IDX_MAGIC   0x314A4458u
+#define HFIX58J_IDX_VERSION 1u
+
+static bool hfix58j_make_idx_path(char *out, size_t out_sz, const char *mivf_path) {
+    if (!out || out_sz == 0 || !mivf_path) {
+        return false;
+    }
+
+    snprintf(out, out_sz, "%s", mivf_path);
+
+    char *dot = strrchr(out, '.');
+    if (dot && dot > out) {
+        snprintf(dot, out_sz - (size_t)(dot - out), ".idx");
+    } else {
+        size_t len = strlen(out);
+        if (len + 4 >= out_sz) {
+            return false;
+        }
+        strcat(out, ".idx");
+    }
+
+    return true;
+}
+
+static bool hfix58j_read_u32(FILE *f, u32 *v) {
+    return v && fread(v, 1, sizeof(*v), f) == sizeof(*v);
+}
+
+static bool hfix58j_read_u64(FILE *f, u64 *v) {
+    return v && fread(v, 1, sizeof(*v), f) == sizeof(*v);
+}
+
+static bool hfix58j_write_u32(FILE *f, u32 v) {
+    return fwrite(&v, 1, sizeof(v), f) == sizeof(v);
+}
+
+static bool hfix58j_write_u64(FILE *f, u64 v) {
+    return fwrite(&v, 1, sizeof(v), f) == sizeof(v);
+}
+
+static bool hfix58j_try_load_seek_cache(const char *cache_path, u64 file_size, u32 first_offset) {
+    FILE *cf = fopen(cache_path, "rb");
+    if (!cf) {
+        return false;
+    }
+
+    u32 magic = 0;
+    u32 version = 0;
+    u64 cached_file_size = 0;
+    u32 cached_first = 0;
+    u32 total_frames = 0;
+    u32 count = 0;
+
+    bool ok =
+        hfix58j_read_u32(cf, &magic) &&
+        hfix58j_read_u32(cf, &version) &&
+        hfix58j_read_u64(cf, &cached_file_size) &&
+        hfix58j_read_u32(cf, &cached_first) &&
+        hfix58j_read_u32(cf, &total_frames) &&
+        hfix58j_read_u32(cf, &count);
+
+    if (!ok ||
+        magic != HFIX58J_IDX_MAGIC ||
+        version != HFIX58J_IDX_VERSION ||
+        cached_file_size != file_size ||
+        cached_first != first_offset ||
+        count == 0 ||
+        count > HFIX58F_MAX_SEEK_POINTS) {
+        fclose(cf);
+        return false;
+    }
+
+    size_t bytes = (size_t)count * sizeof(g_hfix58f_seek.points[0]);
+
+    if (fread(g_hfix58f_seek.points, 1, bytes, cf) != bytes) {
+        fclose(cf);
+        return false;
+    }
+
+    fclose(cf);
+
+    g_hfix58f_seek.count = count;
+    g_hfix58f_seek.total_frames = total_frames;
+    g_hfix58f_seek.ready = true;
+    g_media_ctl.total_frames = total_frames;
+
+    hfix58_alert_set("SEEK CACHE HIT", 1);
+    return true;
+}
+
+static void hfix58j_save_seek_cache(const char *cache_path, u64 file_size, u32 first_offset) {
+    if (!cache_path || !g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
+        return;
+    }
+
+    FILE *cf = fopen(cache_path, "wb");
+    if (!cf) {
+        return;
+    }
+
+    bool ok = true;
+
+    ok = ok && hfix58j_write_u32(cf, HFIX58J_IDX_MAGIC);
+    ok = ok && hfix58j_write_u32(cf, HFIX58J_IDX_VERSION);
+    ok = ok && hfix58j_write_u64(cf, file_size);
+    ok = ok && hfix58j_write_u32(cf, first_offset);
+    ok = ok && hfix58j_write_u32(cf, g_hfix58f_seek.total_frames);
+    ok = ok && hfix58j_write_u32(cf, g_hfix58f_seek.count);
+
+    if (ok) {
+        size_t bytes = (size_t)g_hfix58f_seek.count * sizeof(g_hfix58f_seek.points[0]);
+        ok = fwrite(g_hfix58f_seek.points, 1, bytes, cf) == bytes;
+    }
+
+    fclose(cf);
+
+    if (ok) {
+        hfix58_alert_set("SEEK CACHE SAVED", 1);
+    }
+}
+
+static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v) {
+    memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
+
+    if (!f || !v) {
+        return false;
+    }
+
+    long saved = ftell(f);
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        return false;
+    }
+
+    long end_pos_l = ftell(f);
+
+    if (end_pos_l <= 0) {
+        if (saved >= 0) {
+            fseek(f, saved, SEEK_SET);
+        }
+        return false;
+    }
+
+    u64 file_size = (u64)end_pos_l;
+    char cache_path[512];
+
+    if (hfix58j_make_idx_path(cache_path, sizeof(cache_path), MIVF_PATH)) {
+        /*
+            HFIX58J_IDX_CACHE_LOAD:
+            Avoid thousands of tiny SD reads when cache exists.
+        */
+        if (hfix58j_try_load_seek_cache(cache_path, file_size, first_offset)) {
+            if (saved >= 0) {
+                fseek(f, saved, SEEK_SET);
+            }
+            return true;
+        }
+    } else {
+        cache_path[0] = 0;
+    }
+
+    /*
+        HFIX58J_IDX_CACHE_MISS_SCAN:
+        First-run fallback. Metadata-only scan; payloads are skipped.
+    */
+    u64 end_pos = file_size;
+    u64 pos = (u64)first_offset;
+    u8 page_hdr[MIVF_PAGE_HEADER_SIZE];
+    u8 pkt_hdr[16];
+    u32 highest_frame = 0;
+
+    while (pos + MIVF_PAGE_HEADER_SIZE < end_pos &&
+           g_hfix58f_seek.count < HFIX58F_MAX_SEEK_POINTS) {
+        if (fseek(f, (long)pos, SEEK_SET) != 0) {
+            break;
+        }
+
+        if (fread(page_hdr, 1, MIVF_PAGE_HEADER_SIZE, f) != MIVF_PAGE_HEADER_SIZE) {
+            break;
+        }
+
+        u32 payload = le32(page_hdr + 0x10);
+        u16 packets = le16(page_hdr + 0x14);
+
+        if (payload == 0 || payload > (512 * 1024) || packets == 0 || packets > 128) {
+            break;
+        }
+
+        u64 page_payload_start = pos + MIVF_PAGE_HEADER_SIZE;
+        u64 page_end = page_payload_start + payload;
+
+        if (page_end > end_pos) {
+            break;
+        }
+
+        u64 pkt_pos = page_payload_start;
+        bool page_has_sync = false;
+        u32 sync_frame = 0;
+
+        for (u16 i = 0; i < packets && pkt_pos + 16 <= page_end; i++) {
+            if (fseek(f, (long)pkt_pos, SEEK_SET) != 0) {
+                break;
+            }
+
+            if (fread(pkt_hdr, 1, sizeof(pkt_hdr), f) != sizeof(pkt_hdr)) {
+                break;
+            }
+
+            Packet k;
+            memset(&k, 0, sizeof(k));
+
+            /*
+                Packet has no .stream field in this branch.
+                Header byte 0 is the stream id.
+            */
+            u8 pkt_stream = pkt_hdr[0];
+
+            k.flags = pkt_hdr[1];
+            k.hsize = le16(pkt_hdr + 2);
+            k.psize = le32(pkt_hdr + 8);
+            k.frame = le32(pkt_hdr + 12);
+
+            if (k.hsize < 16 || k.psize > payload || pkt_pos + k.hsize + k.psize > page_end) {
+                break;
+            }
+
+            if (pkt_stream != v->id) {
+                pkt_pos += (u64)k.hsize + (u64)k.psize;
+                continue;
+            }
+
+            if (k.frame > highest_frame) {
+                highest_frame = k.frame;
+            }
+
+            bool sync = false;
+            u8 magic[4] = {0, 0, 0, 0};
+
+            if (k.psize >= 4 && pkt_pos + k.hsize + 4 <= page_end) {
+                if (fseek(f, (long)(pkt_pos + k.hsize), SEEK_SET) == 0) {
+                    (void)fread(magic, 1, 4, f);
+                }
+            }
+
+            if (magic[0] == 'M' && magic[1] == '2' && magic[2] == 'Y' && magic[3] == '0') {
+                sync = true;
+            }
+
+            if (magic[0] == 'M' && magic[1] == '1' && magic[2] == 'P' && magic[3] == '0') {
+                sync = true;
+            }
+
+            if ((k.flags & 1) != 0 &&
+                magic[0] == 'M' &&
+                (magic[1] == '2' || magic[1] == '1')) {
+                sync = true;
+            }
+
+            if (!strcmp(v->codec, "RAWV")) {
+                u32 raw_size = (u32)v->w * (u32)v->h * 2u;
+                if (raw_size != 0 && k.psize == raw_size) {
+                    sync = true;
+                }
+            }
+
+            if (sync) {
+                page_has_sync = true;
+                sync_frame = k.frame;
+                break;
+            }
+
+            pkt_pos += (u64)k.hsize + (u64)k.psize;
+        }
+
+        if (page_has_sync) {
+            Hfix58FSeekPoint *sp = &g_hfix58f_seek.points[g_hfix58f_seek.count++];
+            sp->frame = sync_frame;
+            sp->file_offset = pos;
+        }
+
+        pos = page_end;
+    }
+
+    g_hfix58f_seek.total_frames = highest_frame + 1;
+    g_media_ctl.total_frames = g_hfix58f_seek.total_frames;
+    g_hfix58f_seek.ready = g_hfix58f_seek.count > 0;
+
+    if (saved >= 0) {
+        fseek(f, saved, SEEK_SET);
+    }
+
+    if (!g_hfix58f_seek.ready) {
+        hfix58_alert_set("SEEK INDEX MISSING", 2);
+        return false;
+    }
+
+    if (cache_path[0]) {
+        /*
+            HFIX58J_IDX_CACHE_SAVE:
+            First run creates cache; later boots hit cache.
+        */
+        hfix58j_save_seek_cache(cache_path, file_size, first_offset);
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "SEEK POINTS %lu", (unsigned long)g_hfix58f_seek.count);
+    hfix58_alert_set(msg, 1);
+    return true;
+}
+
+static const Hfix58FSeekPoint *hfix58f_find_seekpoint(u32 target_frame) {
+    if (!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
+        return NULL;
+    }
+
+    const Hfix58FSeekPoint *best = &g_hfix58f_seek.points[0];
+
+    for (u32 i = 0; i < g_hfix58f_seek.count; i++) {
+        const Hfix58FSeekPoint *sp = &g_hfix58f_seek.points[i];
+
+        if (sp->frame <= target_frame) {
+            best = sp;
+        } else {
+            break;
+        }
+    }
+
+    return best;
+}
+
+static void hfix58f_request_relative_seek(int delta_frames) {
+    u32 cur = hfix58f_current_frame();
+    u32 total = hfix58f_total_frames();
+    u32 target = cur;
+
+    if (delta_frames < 0) {
+        u32 step = (u32)(-delta_frames);
+        target = cur < step ? 0 : cur - step;
+    } else {
+        target = cur + (u32)delta_frames;
+
+        if (total > 30 && target > total - 30) {
+            target = total - 30;
+        } else if (total <= 30) {
+            target = 0;
+        }
+    }
+
+    if (!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
+        hfix58_alert_set("SEEK INDEX MISSING", 2);
+        g_hfix58f_seek_ui_active = true;
+        g_hfix58f_seek_ui_frames = 12;
+        return;
+    }
+
+    g_hfix58f_seek_target = target;
+    g_hfix58f_seek_pending = true;
+    g_hfix58f_seek_ui_active = true;
+    g_hfix58f_seek_ui_frames = 18;
+}
+
+static void hfix58f_audio_flush_for_seek(void) {
+    if (!audio.ready) {
+        return;
+    }
+
+    ndspChnReset(0);
+    ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
+    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+    ndspChnSetRate(0, (float)audio.rate);
+    ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
+
+    float mix[12];
+    memset(mix, 0, sizeof(mix));
+    mix[0] = 1.0f;
+    mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
+    ndspChnSetMix(0, mix);
+
+    for (int i = 0; i < AUDIO_BUFS; i++) {
+        memset(&audio.wb[i], 0, sizeof(ndspWaveBuf));
+        audio.wb[i].data_vaddr = audio.buf[i];
+        audio.wb[i].nsamples = audio.samples_per_frame;
+    }
+
+    g_audio_submit = 0;
+    g_audio_drop = 0;
+    g_last_audio_bytes = 0;
+    g_last_audio_samples = 0;
+}
+
+static void hfix58f_reset_m2y_frame(M2Y0Frame *f) {
+    if (!f || !f->base) {
+        return;
+    }
+
+    if (f->y && f->y_size) {
+        memset(f->y, 0, f->y_size);
+    }
+
+    if (f->cb && f->c_size) {
+        memset(f->cb, 128, f->c_size);
+    }
+
+    if (f->cr && f->c_size) {
+        memset(f->cr, 128, f->c_size);
+    }
+}
+
+static bool hfix58f_execute_pending_seek(
+    MivfStream *stream,
+    FILE *f,
+    M2Y0Frame *m2y0,
+    M2Y0Frame *m2y0_prev,
+    bool *m2y0_have_prev,
+    u8 *frame,
+    u8 *prev,
+    size_t fsz,
+    bool *have_prev,
+    u32 *shown,
+    u64 *next_frame_tick,
+    u64 frame_ticks_abs
+) {
+    /* HFIX58J_ZERO_WAIT_SEEK: do not block; reader refills asynchronously. */
+    if (!g_hfix58f_seek_pending) {
+        return false;
+    }
+
+    g_hfix58f_seek_pending = false;
+
+    const Hfix58FSeekPoint *sp = hfix58f_find_seekpoint(g_hfix58f_seek_target);
+
+    if (!sp) {
+        hfix58_alert_set("SEEK FAILED", 2);
+        return false;
+    }
+
+    hfix58f_audio_flush_for_seek();
+
+    /*
+        Kill the active stream reader thread/ring before moving FILE*.
+        Then reopen at the chosen keyframe page offset.
+    */
+    mivf_stream_close(stream);
+
+    if (fseek(f, (long)sp->file_offset, SEEK_SET) != 0) {
+        hfix58_alert_set("FSEEK FAILED", 2);
+        return false;
+    }
+
+    if (!mivf_stream_open(stream, f)) {
+        hfix58_alert_set("STREAM REOPEN FAIL", 2);
+        return false;
+    }
+
+    /* HFIX58I_ZERO_WAIT_SEEK: do not block after seek; reader fills asynchronously. */
+
+    /*
+        HFIX58H_SEEK_NO_BLACK_FLASH:
+        Do not clear RGB frame buffers here. Keeping the last presented frame
+        avoids the half-second black flash while the stream produces the first
+        post-seek sync frame.
+    */
+    (void)frame;
+    (void)prev;
+    (void)fsz;
+
+    if (have_prev) {
+        *have_prev = false;
+    }
+
+    hfix58f_reset_m2y_frame(m2y0);
+    hfix58f_reset_m2y_frame(m2y0_prev);
+
+    if (m2y0_have_prev) {
+        *m2y0_have_prev = false;
+    }
+
+    g_m2y1_deblock_this_frame = false;
+
+    if (shown) {
+        *shown = sp->frame;
+    }
+
+    g_media_ctl.current_frame_idx = sp->frame;
+
+    if (next_frame_tick) {
+        *next_frame_tick = svcGetSystemTick() + frame_ticks_abs;
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "SEEK %lu", (unsigned long)(sp->frame / 30u));
+    hfix58_alert_set(msg, 1);
+
+    g_hfix58f_seek_ui_active = true;
+    g_hfix58f_seek_ui_frames = 18;
+    return true;
+}
+
+static void hfix58f_draw_mmss(u8 *fb, int x, int y, u32 seconds) {
+    char t[16];
+    u32 mm = seconds / 60u;
+    u32 ss = seconds % 60u;
+
+    if (mm > 99) {
+        mm = 99;
+    }
+
+    snprintf(t, sizeof(t), "%02lu:%02lu", (unsigned long)mm, (unsigned long)ss);
+    hfix58_draw_text_shadow(fb, x, y, t, 1, 220, 235, 250);
+}
+
+static void hfix58f_draw_timeline(u8 *fb, int panel_y) {
+    int x = 30;
+    int y = panel_y + 98;
+    int w = 260;
+    int h = 5;
+
+    if (y >= 240) {
+        return;
+    }
+
+    u32 cur = hfix58f_current_frame();
+    /* HFIX58J_SCRUB_TIMELINE_FRAME */
+    if (g_mivf_anim.is_touch_scrubbing) {
+        cur = g_mivf_anim.scrub_target_frame;
+    }
+    u32 total = hfix58f_total_frames();
+
+    if (total == 0) {
+        total = 1;
+    }
+
+    if (cur > total) {
+        cur = total;
+    }
+
+    u32 cur_secs = cur / 30u;
+    u32 total_secs = total / 30u;
+
+    int fill_w = (int)(((u64)cur * (u64)w) / (u64)total);
+
+    if (fill_w < 0) fill_w = 0;
+    if (fill_w > w) fill_w = w;
+
+    int text_y = panel_y + 88;
+
+    if (text_y >= 0 && text_y < 240) {
+        hfix58f_draw_mmss(fb, 30, text_y, cur_secs);
+        hfix58f_draw_mmss(fb, 254, text_y, total_secs);
+    }
+
+    hfix58_rect565(fb, x, y, w, h, 20, 28, 42);
+    hfix58_rect565(fb, x, y, fill_w, h, 0, 140, 255);
+
+    int knob_x = x + fill_w - 2;
+
+    if (knob_x < x) {
+        knob_x = x;
+    }
+
+    if (knob_x > x + w - 5) {
+        knob_x = x + w - 5;
+    }
+
+    hfix58_rect565(fb, knob_x, y - 3, 5, 11, 230, 245, 255);
+}
+
+
+static void wait_stream_prebuffer(MivfStream *stream) {
+    if (!stream) {
+        return;
+    }
+
+    /*
+        HFIX58J_QUICK_START_PREBUFFER:
+        Startup should not wait for a giant fill. Let reader keep filling while
+        first frames begin.
+    */
+    const u32 target = 24 * 1024;
+    int spins = 0;
+
+    while (aptMainLoop()) {
+        u32 fill = 0;
+        bool eof = false;
+        bool err = false;
+
+        RecursiveLock_Lock(&stream->ring.lock);
+        fill = stream->ring.fill;
+        eof = stream->ring.eof;
+        err = stream->ring.error;
+        RecursiveLock_Unlock(&stream->ring.lock);
+
+        if (fill >= target || eof || err) {
+            break;
+        }
+
+        spins++;
+
+        if (spins >= 3) {
+            break;
+        }
+
+        gspWaitForVBlank();
+    }
+}
+
+static void print_ring_telemetry(MivfStream *stream, u32 shown) {
+    u32 fill = 0;
+    u32 size = 0;
+    bool eof = false;
+    bool err = false;
+
+    RecursiveLock_Lock(&stream->ring.lock);
+
+    fill = stream->ring.fill;
+    size = stream->ring.size;
+    eof = stream->ring.eof;
+    err = stream->ring.error;
+
+    RecursiveLock_Unlock(&stream->ring.lock);
+
+    /* HFIX58D: scrubbed full bottom-console printf statement. */
+}
+
+static int play(void) {
+    FILE *f = fopen(MIVF_PATH, "rb");
+
+    if (!f) {
+        printf("open fail: %s\n", MIVF_PATH);
+        return -1;
+    }
+
+    setvbuf(f, (char*)file_iobuf, _IOFBF, sizeof(file_iobuf));
+
+    Header h;
+
+    if (read_header(f, &h)) {
+        printf("bad header\n");
+        fclose(f);
+        return -2;
+    }
+
+    Stream v;
+    Stream a;
+
+    memset(&v, 0, sizeof(v));
+    memset(&a, 0, sizeof(a));
+
+    bool hv = false;
+    bool ha = false;
+
+    for (u32 i = 0; i < h.streams; i++) {
+        Stream st;
+
+        if (read_stream(f, &st)) {
+            printf("stream read err\n");
+            fclose(f);
+            return -3;
+        }
+
+        if (st.type == 1 && !hv) {
+            v = st;
+            hv = true;
+        } else if (st.type == 2 && !ha) {
+            a = st;
+            ha = true;
+        }
+    }
+
+    if (!hv) {
+        printf("no video stream\n");
+        fclose(f);
+        return -4;
+    }
+
+    printf("%ux%u %s fps=%u/%u RGB565fb\n",
+        v.w,
+        v.h,
+        v.codec,
+        v.fpsn,
+        v.fpsd ? v.fpsd : 1);
+
+    if (ha) {
+        audio_init_from_stream(&a);
+    } else {
+        printf("no audio stream\n");
+    }
+
+    /* HFIX58F_BUILD_SEEK_INDEX: scan keyframe/sync page offsets before streaming. */
+    hfix58f_build_seek_index(f, h.first, &v);
+
+    fseek(f, (long)h.first, SEEK_SET);
+
+    MivfStream stream;
+
+    if (!mivf_stream_open(&stream, f)) {
+        printf("stream open fail\n");
+        audio_shutdown();
+        fclose(f);
+        return -5;
+    }
+
+    size_t fsz = (size_t)v.w * (size_t)v.h * 2u;
+
+
+    M2Y0Frame m2y0;
+    memset(&m2y0, 0, sizeof(m2y0));
+
+    M2Y0Frame m2y0_prev;
+    memset(&m2y0_prev, 0, sizeof(m2y0_prev));
+
+    bool m2y0_ready = false;
+    bool m2y0_have_prev = false;
+
+    u8 *frame = (u8*)malloc(fsz);
+    u8 *prev  = (u8*)malloc(fsz);
+
+    if (!frame || !prev) {
+        printf("OOM frame\n");
+
+        free(frame);
+        free(prev);
+
+        /*
+            Strict order:
+            close stream / join I/O thread before fclose().
+        */
+        mivf_stream_close(&stream);
+        audio_shutdown();
+        fclose(f);
+
+        return -6;
+    }
+
+    if (!strcmp(v.codec, "M2Y0") || !strcmp(v.codec, "M2Y1")) {
+        if (!m2y0_frame_alloc(&m2y0, v.w, v.h) ||
+            !m2y0_frame_alloc(&m2y0_prev, v.w, v.h)) {
+            printf("OOM M2Y0/M2Y1 frame\n");
+            m2y0_frame_free(&m2y0);
+            m2y0_frame_free(&m2y0_prev);
+            free(frame);
+            free(prev);
+            mivf_stream_close(&stream);
+            audio_shutdown();
+            fclose(f);
+            return -7;
+        }
+
+        m2y0_ready = true;
+
+        if (!strcmp(v.codec, "M2Y1")) {
+            printf("M2Y1 compressed YUV420 chassis ready %ux%u\n", v.w, v.h);
+        } else {
+            printf("M2Y0 YUV420 chassis ready %ux%u\n", v.w, v.h);
+        }
+    }
+
+    memset(frame, 0, fsz);
+    memset(prev, 0, fsz);
+
+    bool have_prev = false;
+    u32 shown = 0;
+
+    wait_stream_prebuffer(&stream);
+
+    u32 fpsn_abs = v.fpsn ? v.fpsn : 30;
+    u32 fpsd_abs = v.fpsd ? v.fpsd : 1;
+    u64 frame_ticks_abs = ((u64)SYSCLOCK_ARM11 * fpsd_abs) / fpsn_abs;
+    if (frame_ticks_abs == 0) frame_ticks_abs = ((u64)SYSCLOCK_ARM11 / 30);
+    u64 next_frame_tick = svcGetSystemTick() + frame_ticks_abs;
+
+    /*
+        HFIX51C:
+        Persistent presentation-history flag. If the last successful video
+        presentation used the direct YUV path, pause mode redraws from m2y0
+        rather than stale RGB565 frame memory.
+    */
+    bool hfix51c_last_direct_yuv = false;
+
+    while (aptMainLoop()) {
+        u64 frame_start_tick = svcGetSystemTick();
+        (void)frame_start_tick;
+
+        u64 page_wait_us = 0;
+        u64 parse_us = 0;
+        u64 blit_us = 0;
+        u32 diag_ring_kb = 0;
+        u32 diag_page_no = 0;
+        u32 diag_page_payload = 0;
+        u16 diag_page_packets = 0;
+        u32 diag_video_pkts = 0;
+        u32 diag_audio_pkts = 0;
+        /* HFIX51B: Direct present flag instantiation */
+        bool hfix51b_direct_present_pending = false;
+
+        hidScanInput();
+
+        u32 h_keys_down = hidKeysDown();
+        u32 h_keys_held = hidKeysHeld();
+        u32 h_keys_up = hidKeysUp();
+
+        hfix58b_transport_handle_input(h_keys_down, h_keys_held);
+        hfix58d_notify_input(h_keys_down, h_keys_held);
+        hfix58j_touch_scrub_update(h_keys_down, h_keys_held, h_keys_up);
+        /* HFIX57A_INPUT_REPAIR */
+
+        hfix56_audio_controls_on_input(h_keys_down, h_keys_held);
+
+        /*
+            HFIX58A_R5_CONSUME_L_DPAD:
+            when L is held, D-pad is reserved for audio controls.
+        */
+        if (h_keys_held & KEY_L) {
+            h_keys_down &= ~(KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT);
+        }
+
+
+        /*
+            HFIX57A input repair:
+            When L is held, D-pad is reserved for audio controls.
+            This prevents transport LEFT/RIGHT dummy highlights from firing.
+        */
+        if (h_keys_held & KEY_L) {
+            h_keys_down &= ~(KEY_DUP | KEY_DDOWN | KEY_DLEFT | KEY_DRIGHT);
+        }
+
+
+        /*
+            HFIX57A inject touch transport keys:
+            touch controls synthesize KEY_A/KEY_LEFT/KEY_RIGHT so existing
+            pause/audio/transport logic remains centralized.
+        */
+        u32 hfix57_touch_keys = hfix57_touch_transport_to_keys(h_keys_down, h_keys_held);
+        h_keys_down |= hfix57_touch_keys;
+
+        if (h_keys_down & KEY_START) {
+            break;
+        }
+
+        if (h_keys_down & KEY_A) {
+            g_media_ctl.dummy_seek_state = 0;
+
+            if (g_media_ctl.state == STATE_PLAYING) {
+                g_media_ctl.state = STATE_PAUSED;
+                hfix58_alert_set("PAUSED", 2);
+
+                if (audio.ready) {
+                    ndspChnSetPaused(0, true);
+                }
+            } else {
+                g_media_ctl.state = STATE_PLAYING;
+                hfix58_alert_set("PLAYING", 1);
+
+                if (audio.ready) {
+                    ndspChnSetPaused(0, false);
+                }
+            }
+        }
+
+        /* HFIX58F_REQUEST_SEEK_KEYS */
+        if (h_keys_down & KEY_LEFT) {
+            g_media_ctl.dummy_seek_state = -1;
+            hfix58f_request_relative_seek(-HFIX58F_SEEK_STEP_FRAMES);
+        } else if (h_keys_down & KEY_RIGHT) {
+            g_media_ctl.dummy_seek_state = 1;
+            hfix58f_request_relative_seek(HFIX58F_SEEK_STEP_FRAMES);
+        }
+
+        g_media_ctl.current_frame_idx = shown;
+
+        /*
+            HFIX51C pause gate:
+            Do not consume stream pages while paused. Redraw the last known
+            presentation source safely.
+        */
+        if (g_media_ctl.state == STATE_PAUSED) {
+            if (hfix51c_last_direct_yuv &&
+                m2y0_have_prev &&
+                m2y0.w == TOP_W &&
+                m2y0.h == TOP_H) {
+                m2y0_to_top_rgb565_direct(&m2y0);
+            } else {
+                hfix51c_last_direct_yuv = false;
+                blit565_scaled(frame, v.w, v.h);
+            }
+
+            gspWaitForVBlank();
+            continue;
+        }
+
+        /* HFIX58F_EXECUTE_PENDING_SEEK */
+        if (hfix58f_execute_pending_seek(
+                &stream,
+                f,
+                &m2y0,
+                &m2y0_prev,
+                &m2y0_have_prev,
+                frame,
+                prev,
+                fsz,
+                &have_prev,
+                &shown,
+                &next_frame_tick,
+                frame_ticks_abs)) {
+            continue;
+        }
+
+        MivfPageView page;
+
+        u64 page_t0 = svcGetSystemTick();
+
+        if (!mivf_stream_next_page(&stream, &page)) {
+            /* HFIX58D: scrubbed full bottom-console printf statement. */
+            break;
+        }
+
+        u64 page_t1 = svcGetSystemTick();
+        page_wait_us = ticks_to_us(page_t1 - page_t0);
+
+        MivfPage pg = page.pg;
+        u8 *cur_page = page.data;
+
+        diag_page_no = pg.no;
+        diag_page_payload = pg.payload;
+        diag_page_packets = pg.packets;
+
+        size_t off = 0;
+        bool got_video = false;
+
+        u64 parse_t0 = svcGetSystemTick();
+
+        for (u16 i = 0; i < pg.packets; i++) {
+            Packet k;
+
+            if (read_packet(cur_page + off, pg.payload - off, &k)) {
+                /* HFIX58D: scrubbed full bottom-console printf statement. */
+                break;
+            }
+
+            const u8 *body = cur_page + off + k.hsize;
+
+            if (k.sid == v.id) {
+                diag_video_pkts++;
+                if (!strcmp(v.codec, "RAWV")) {
+                    if (k.psize == fsz) {
+                        memcpy(frame, body, fsz);
+                    }
+                } else if (k.psize >= 4 &&
+                           body[0] == 'M' &&
+                           body[1] == '2' &&
+                           body[2] == 'Y' &&
+                           body[3] == '1') {
+                    /*
+                        HFIX21:
+                        Decode compressed M2Y1 YUV420 packet, then convert
+                        into the existing RGB565 frame buffer.
+                    */
+                    if (!m2y0_ready) {
+                        /* HFIX58D: scrubbed full bottom-console printf statement. */
+                    } else {
+                        int r = dec_m2y1(body, k.psize, &m2y0, &m2y0_prev, m2y0_have_prev);
+
+                        if (r) {
+                            /* HFIX58D: scrubbed full bottom-console printf statement. */
+
+                            if (have_prev) {
+                                memcpy(frame, prev, fsz);
+                            } else {
+                                memset(frame, 0, fsz);
+                            }
+                        } else {
+                            m2y0_frame_copy(&m2y0_prev, &m2y0);
+                            m2y0_have_prev = true;
+                            g_m2y1_deblock_this_frame = true;
+                            hfix51b_direct_present_pending = true;
+                            hfix51c_last_direct_yuv = true;
+                        }
+                    }
+                } else if (k.psize >= 4 &&
+                           body[0] == 'M' &&
+                           body[1] == '2' &&
+                           body[2] == 'Y' &&
+                           body[3] == '0') {
+                    /*
+                        HFIX20:
+                        Decode raw M2Y0 YUV420 packet, then immediately
+                        convert into the existing RGB565 frame buffer.
+                    */
+                    if (!m2y0_ready) {
+                        /* HFIX58D: scrubbed full bottom-console printf statement. */
+                    } else {
+                        int r = dec_m2y0_raw(body, k.psize, &m2y0);
+
+                        if (r) {
+                            /* HFIX58D: scrubbed full bottom-console printf statement. */
+
+                            if (have_prev) {
+                                memcpy(frame, prev, fsz);
+                            } else {
+                                memset(frame, 0, fsz);
+                            }
+                        } else {
+                            m2y0_frame_copy(&m2y0_prev, &m2y0);
+                            m2y0_have_prev = true;
+                            hfix51b_direct_present_pending = true;
+                            hfix51c_last_direct_yuv = true;
+                        }
+                    }
+                } else if (k.psize >= 4 &&
+                           body[0] == 'M' &&
+                           body[1] == '1' &&
+                           body[2] == 'P') {
+                    /*
+                        HFIX14 defensive decode:
+                        Start from a sane baseline before applying block
+                        updates. If the decoder leaves any block untouched,
+                        it will show the previous frame instead of stale malloc
+                        data or stale alternate-buffer data.
+                    */
+                    if (have_prev) {
+                        memcpy(frame, prev, fsz);
+                    } else {
+                        memset(frame, 0, fsz);
+                    }
+
+                    int r = 0;
+
+                    /*
+                        HFIX16:
+                        M1P1 is M1P0 plus byte-aligned RLE tokens.
+                        M1P0 remains fully supported.
+                    */
+                    if (body[3] == '1') {
+                        r = dec_m1p1(body, k.psize, frame, prev, have_prev, v.w, v.h);
+                    } else {
+                        r = dec_m1p0(body, k.psize, frame, prev, have_prev, v.w, v.h);
+                    }
+
+                    if (r) {
+                        /* HFIX58D: scrubbed full bottom-console printf statement. */
+
+                        /*
+                            Never present a partially decoded corrupted frame.
+                            Keep playback cadence by presenting the previous
+                            known-good frame or black on the first frame.
+                        */
+                        if (have_prev) {
+                            memcpy(frame, prev, fsz);
+                        } else {
+                            memset(frame, 0, fsz);
+                        }
+                    }
+                }
+
+                got_video = true;
+            } else if (audio.ready && k.sid == audio.sid) {
+                diag_audio_pkts++;
+                /* HFIX24A IA4M decode wrapper */
+                if (memcmp(a.codec, "IA4M", 4) == 0) {
+                    static s16 ia4m_pcm[4096];
+                    int ns = decode_ia4m_packet(body, k.psize, ia4m_pcm, 4096);
+                    if (ns > 0) {
+                        audio_queue((const u8*)ia4m_pcm, (u32)(ns * 2));
+                        if ((k.frame & 31) == 0) {
+                            int amin = ia4m_pcm[0];
+                            int amax = ia4m_pcm[0];
+                            for (int ai = 1; ai < ns; ai++) {
+                                if (ia4m_pcm[ai] < amin) amin = ia4m_pcm[ai];
+                                if (ia4m_pcm[ai] > amax) amax = ia4m_pcm[ai];
+                            }
+                            /* HFIX58D: scrubbed full bottom-console printf statement. */
+
+
+                        }
+                    } else {
+                        /* HFIX58D: scrubbed full bottom-console printf statement. */
+                    }
+                } else {
+                    audio_queue(body, k.psize);
+                }
+            }
+
+            off += k.hsize + k.psize;
+        }
+
+        u64 parse_t1 = svcGetSystemTick();
+        parse_us = ticks_to_us(parse_t1 - parse_t0);
+
+        mivf_stream_release_page(&stream, &page);
+
+        if (got_video) {
+            /*
+            HFIX11 pre-present pacing:
+            Decode work happens before this point. Now wait until the
+            absolute presentation deadline, then blit the frame. This avoids
+            early presentation followed by correction delay.
+        */
+            while (svcGetSystemTick() < next_frame_tick) {
+                gspWaitForVBlank();
+            }
+
+            u64 blit_t0 = svcGetSystemTick();
+            /* HFIX51B: Explicitly Guarded Presentation Pass */
+            if (hfix51b_direct_present_pending &&
+                m2y0.w == TOP_W &&
+                m2y0.h == TOP_H &&
+                m2y0_to_rgb565_y2r_linear(&m2y0)) {
+                /*
+                    HFIX52B:
+                    Y2R hardware path succeeded. Output is linear RGB565,
+                    so use the rotated RGB565 blit path. In the UI master,
+                    blit565_scaled() routes through the unified present finish.
+                */
+                blit565_scaled(g_hfix52a_y2r_rgb565, v.w, v.h);
+            } else if (hfix51b_direct_present_pending &&
+                       m2y0.w == TOP_W &&
+                       m2y0.h == TOP_H) {
+                /*
+                    Fallback: proven HFIX51B CPU direct YUV -> top VRAM path.
+                */
+                m2y0_to_top_rgb565_direct(&m2y0);
+            } else {
+                hfix51c_last_direct_yuv = false;
+                blit565_scaled(frame, v.w, v.h);
+            }
+            u64 blit_t1 = svcGetSystemTick();
+            blit_us = ticks_to_us(blit_t1 - blit_t0);
+
+            u8 *tmp = prev;
+            prev = frame;
+            frame = tmp;
+
+            have_prev = true;
+            shown++;
+
+            #if MIVF_RUNTIME_TELEMETRY
+            if ((shown % 60) == 0) {
+                print_ring_telemetry(&stream, shown);
+            }
+#endif
+
+            /*
+            Absolute pacing:
+            using a persistent next_frame_tick avoids small frame-to-frame
+            timing oscillations caused by basing the target on each loop's
+            start time.
+        */
+            u64 now_tick = svcGetSystemTick();
+
+            if (now_tick > next_frame_tick + frame_ticks_abs * 2) {
+                next_frame_tick = now_tick + frame_ticks_abs;
+            } else {
+                next_frame_tick += frame_ticks_abs;
+            }
+        }
+    }
+
+    g_media_ctl.state = STATE_PLAYING;
+    g_media_ctl.current_frame_idx = 0;
+    g_media_ctl.dummy_seek_state = 0;
+
+    m2y0_frame_free(&m2y0);
+    free(frame);
+    free(prev);
+
+    /*
+        Strict cleanup order:
+        1. Stop/join background stream reader.
+        2. Shut down audio.
+        3. Close FILE* after reader thread is gone.
+    */
+    mivf_stream_close(&stream);
+    hfix52a_y2r_shutdown();
+    audio_shutdown();
+    fclose(f);
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Main                                                                       */
+/* ------------------------------------------------------------------------- */
+
+int main(void) {
+    gfxInitDefault();
+    ptmuInit();
+    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+
+    /* HFIX58D: bottom console disabled; RGB565 fluent UI owns bottom framebuffer. */
+    /* consoleInit(GFX_BOTTOM, NULL); */
+    mivf_log_open();
+    mivf_diag_open();
+
+    /* HFIX58D: scrubbed full bottom-console printf statement. */
+    /* HFIX58D: scrubbed full bottom-console printf statement. */
+
+    while (aptMainLoop()) {
+        /*
+            HFIX58A_R5_BROWSER_BEFORE_PLAY:
+            play() is no-argument on this branch and reads MIVF_PATH.
+            MIVF_PATH is redirected to g_hfix58_selected_media above.
+        */
+        if (!g_hfix58_has_selected_media) {
+            if (!hfix58_file_browser_select(g_hfix58_selected_media, sizeof(g_hfix58_selected_media))) {
+                break;
+            }
+
+            g_hfix58_has_selected_media = true;
+        }
+
+        int r = play();
+
+        if (r == 1) {
+            break;
+        }
+
+        /* HFIX58D: scrubbed full bottom-console printf statement. */
+
+        while (aptMainLoop()) {
+            hidScanInput();
+
+            u32 d = hidKeysDown();
+
+            if (d & KEY_START) {
+                mivf_diag_close();
+                mivf_log_close();
+                ptmuExit();
+    gfxExit();
+                return 0;
+            }
+
+            if (d & KEY_A) {
+                /* HFIX58D: scrubbed full bottom-console printf statement. */
+                /* HFIX58D: scrubbed full bottom-console printf statement. */
+                /* HFIX58D: scrubbed full bottom-console printf statement. */
+                break;
+            }
+
+            gspWaitForVBlank();
+        }
+    }
+
+    mivf_diag_close();
+    mivf_log_close();
+    gfxExit();
+    return 0;
+}
