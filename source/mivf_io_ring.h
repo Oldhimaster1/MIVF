@@ -24,10 +24,15 @@ typedef struct MivfIoRing {
     volatile bool error;
     volatile bool stop;
 
+    /* HFIX61: in-place reseek handshake (avoids thread teardown per seek). */
+    volatile bool reseek_req;
+    volatile long reseek_offset;
+
     FILE *file;
 
     LightEvent can_read;
     LightEvent can_consume;
+    LightEvent reseek_done;
 
     Thread thread;
     RecursiveLock lock;
@@ -36,3 +41,4 @@ typedef struct MivfIoRing {
 bool mivf_io_ring_init(MivfIoRing *r, FILE *file);
 void mivf_io_ring_shutdown(MivfIoRing *r);
 bool mivf_io_read_exact(MivfIoRing *r, void *dst, u32 bytes);
+bool mivf_io_ring_reseek(MivfIoRing *r, long offset);

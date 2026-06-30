@@ -61,7 +61,30 @@ static void mivf_reader_thread(void *arg){
     while(!r->stop){
         RecursiveLock_Lock(&r->lock);
 
+        /* HFIX61: service a pending in-place reseek before anything else. */
+        if(r->reseek_req){
+            fseek(r->file, r->reseek_offset, SEEK_SET);
+            r->read_pos  = 0;
+            r->write_pos = 0;
+            r->fill      = 0;
+            r->eof       = false;
+            r->error     = false;
+            r->reseek_req = false;
+            RecursiveLock_Unlock(&r->lock);
+            LightEvent_Signal(&r->reseek_done);
+            continue;
+        }
+
+        /* HFIX61: on EOF/error, stay alive and wait for a reseek or stop
+           instead of exiting the thread (lets backward seeks reuse it). */
+        if(r->eof || r->error){
+            RecursiveLock_Unlock(&r->lock);
+            LightEvent_Wait(&r->can_read);
+            continue;
+        }
+
         while(!r->stop &&
+              !r->reseek_req &&
               mivf_ring_free_unsafe(r) < MIVF_IO_READ_CHUNK &&
               !r->eof &&
               !r->error){
@@ -70,9 +93,14 @@ static void mivf_reader_thread(void *arg){
             RecursiveLock_Lock(&r->lock);
         }
 
-        if(r->stop || r->eof || r->error){
+        if(r->stop){
             RecursiveLock_Unlock(&r->lock);
             break;
+        }
+
+        if(r->reseek_req || r->eof || r->error){
+            RecursiveLock_Unlock(&r->lock);
+            continue;
         }
 
         RecursiveLock_Unlock(&r->lock);
@@ -80,6 +108,12 @@ static void mivf_reader_thread(void *arg){
         size_t got = fread(tmp, 1, MIVF_IO_READ_CHUNK, r->file);
 
         RecursiveLock_Lock(&r->lock);
+
+        /* HFIX61: a reseek requested during fread invalidates this data. */
+        if(r->reseek_req){
+            RecursiveLock_Unlock(&r->lock);
+            continue;
+        }
 
         if(got > 0){
             u32 written = mivf_ring_write_unsafe(r, tmp, (u32)got);
@@ -116,6 +150,7 @@ bool mivf_io_ring_init(MivfIoRing *r, FILE *file){
     RecursiveLock_Init(&r->lock);
     LightEvent_Init(&r->can_read, RESET_ONESHOT);
     LightEvent_Init(&r->can_consume, RESET_ONESHOT);
+    LightEvent_Init(&r->reseek_done, RESET_ONESHOT);
 
     r->thread = threadCreate(
         mivf_reader_thread,
@@ -181,4 +216,27 @@ bool mivf_io_read_exact(MivfIoRing *r, void *dst, u32 bytes){
     }
 
     return true;
+}
+
+/* HFIX61: reposition the underlying file in place and drain the ring, reusing
+   the existing reader thread + buffer instead of tearing them down per seek.
+   Synchronous: returns only after the reader has repositioned and cleared the
+   ring, so the next read_exact() observes fresh post-seek data. */
+bool mivf_io_ring_reseek(MivfIoRing *r, long offset){
+    if(!r || !r->thread){
+        return false;
+    }
+
+    RecursiveLock_Lock(&r->lock);
+    r->reseek_offset = offset;
+    r->reseek_req = true;
+    RecursiveLock_Unlock(&r->lock);
+
+    /* Wake the reader whether it is blocked on ring space or parked on EOF. */
+    LightEvent_Signal(&r->can_read);
+
+    /* Block until the reader confirms the file is repositioned and drained. */
+    LightEvent_Wait(&r->reseek_done);
+
+    return !r->error;
 }

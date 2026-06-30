@@ -24,6 +24,22 @@ void mivf_stream_close(MivfStream *s){
     s->page_cap = 0;
 }
 
+/* HFIX61: fast in-place seek. Keeps the reader thread + ring buffer alive and
+   just repositions the file, instead of close()+open() per seek. */
+bool mivf_stream_reseek(MivfStream *s, long offset){
+    if(!s){
+        return false;
+    }
+
+    if(!mivf_io_ring_reseek(&s->ring, offset)){
+        return false;
+    }
+
+    s->eof = false;
+    s->error = false;
+    return true;
+}
+
 bool mivf_stream_next_page(MivfStream *s, MivfPageView *out){
     memset(out, 0, sizeof(*out));
 

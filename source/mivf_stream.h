@@ -39,5 +39,7 @@ typedef struct {
 bool mivf_stream_open(MivfStream *s, FILE *f);
 void mivf_stream_close(MivfStream *s);
 
+bool mivf_stream_reseek(MivfStream *s, long offset);
+
 bool mivf_stream_next_page(MivfStream *s, MivfPageView *out);
 void mivf_stream_release_page(MivfStream *s, MivfPageView *page);

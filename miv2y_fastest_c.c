@@ -1,4 +1,3 @@
-/* HFIX54A_LUMA_PRIORITY_ENCODER */
 /* HFIX32_DYNAMIC_QP_ENCODER */
 /*
     miv2y_fastest_c.c
@@ -25,10 +24,10 @@
       - One MIVF page per frame, one video packet per page.
 
     Build:
-      gcc -O3 -std=c11 -Wall -Wextra -o miv2y_ultra_fast_c.exe miv2y_fastest_c.c
+      gcc -O3 -std=c11 -Wall -Wextra -o miv2y_fastest_c.exe miv2y_fastest_c.c
 
     Example:
-      ./miv2y_ultra_fast_c.exe \
+      ./miv2y_fastest_c.exe \
         --input m2y0_raw_256x144_10s.yuv \
         --output native_m2y1_10s.mivf \
         --width 256 \
@@ -53,11 +52,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
-#include <math.h>
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -65,13 +59,6 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int8_t   s8;
 typedef int16_t  s16;
-
-/* Shared transform codec (single source of truth with the player). */
-#include "../source/mivf_transform.h"
-
-/* Kept transform coefficients per 4x4 quadrant for newly written frames.
-   Written into the M2Y1 body header so the player decodes with the same value. */
-static int g_enc_nkeep = MIVF_T_NKEEP_DEFAULT;
 
 enum {
     M_SKIP     = 0,
@@ -92,10 +79,7 @@ enum {
     M_MVQRESP       = 15,
     M_MVTRANSFORMP  = 16,
     M_MVQRESZP      = 17,
-    M_MVTRANSFORMZP = 18,
-    M_GMVCOPY       = 19,
-    M_SET_BASE_DQP = 20,
-    M_GMVCOPY_INTERNAL = 1001
+    M_MVTRANSFORMZP = 18
 };
 
 enum {
@@ -171,7 +155,6 @@ typedef struct {
     double lambda;
     double c_lambda;
     int qp;
-    int c_qp_offset;
 } EncParams;
 
 static void die(const char *msg) {
@@ -338,7 +321,7 @@ static double arg_double(int argc, char **argv, const char *name, double def) {
 static void usage(void) {
     printf(
         "usage:\n"
-        "  miv2y_ultra_fast_c.exe --input in.yuv --output out.mivf --width 256 --height 144 [options]\n"
+        "  miv2y_fastest_c.exe --input in.yuv --output out.mivf --width 256 --height 144 [options]\n"
         "\n"
         "options:\n"
         "  --fps N              default 30\n"
@@ -356,7 +339,7 @@ static void usage(void) {
         "  --c-mv-thresh N      default 1024\n"
         "  --lambda N          RDO lambda, default 4.0; higher = smaller/lossier\n"
         "  --c-lambda N        chroma RDO lambda, default matches luma lambda\n"
-        "  --qp N              transform quantizer, 1..51, default 28\n  --c-qp-offset N     chroma transform QP offset, default 4 in HFIX54A\n"
+        "  --qp N              transform quantizer, 1..51, default 28\n"
     );
 }
 
@@ -996,48 +979,6 @@ static void plane_emit_token(PlaneEnc *e, const u8 *p, int n) {
 /* HFIX28 RDO helpers                                                        */
 /* ------------------------------------------------------------------------- */
 
-
-/* ------------------------------------------------------------------------- */
-/* HFIX38A: Normalized Sum of Squared Differences visual distortion           */
-/*                                                                           */
-/* D = (SSD + 4) >> 3                                                        */
-/*                                                                           */
-/* This keeps the scale near SAD for average per-pixel error around 8, while */
-/* penalizing large visible block cliffs much harder than SAD.                */
-/* ------------------------------------------------------------------------- */
-
-/* ------------------------------------------------------------------------- */
-/* HFIX39A: 8x8 block variance for conservative local transform-QP selection  */
-/* ------------------------------------------------------------------------- */
-static int calculate_block_variance_64(const u8 block[64]) {
-    int sum = 0;
-
-    for (int i = 0; i < 64; i++) {
-        sum += block[i];
-    }
-
-    int mean = sum / 64;
-    int variance_sum = 0;
-
-    for (int i = 0; i < 64; i++) {
-        int diff = (int)block[i] - mean;
-        variance_sum += diff * diff;
-    }
-
-    return variance_sum / 64;
-}
-
-static int rdo_nssd_64(const u8 a[64], const u8 b[64]) {
-    int ssd = 0;
-
-    for (int i = 0; i < 64; i++) {
-        int d = (int)a[i] - (int)b[i];
-        ssd += d * d;
-    }
-
-    return (ssd + 4) >> 3;
-}
-
 static int rdo_sad_64(const u8 a[64], const u8 b[64]) {
     int sad = 0;
 
@@ -1306,14 +1247,91 @@ static int rdo_make_transform_64(
     int mv_mode,
     int mx,
     int my,
-    u8 token[96],
+    u8 token[20],
     u8 recon[64]
 ) {
-    /* Dense transform via the shared codec (keep g_enc_nkeep coeffs/quadrant). */
-    int len = 0;
-    return mivf_t_make(cur, pred, qp, mv_mode, mx, my, 0,
-                       (u8)(mv_mode ? M_MVTRANSFORM : M_TRANSFORM),
-                       token, 96, recon, &len, g_enc_nkeep);
+    /*
+        8x8 block split into four 4x4 transform quadrants.
+
+        Keep four low-frequency coefficients per quadrant:
+            0, 1, 4, 5
+
+        M_TRANSFORM:
+            mode + reserved + 16 coeffs = 18 bytes.
+
+        M_MVTRANSFORM:
+            mode + mx + my + reserved + 16 coeffs = 20 bytes.
+    */
+    static const int keep_idx[4] = {
+        0, 1,
+        4, 5
+    };
+
+    int coeff_base = mv_mode ? 4 : 2;
+
+    if (mv_mode) {
+        token[0] = M_MVTRANSFORM;
+        token[1] = (u8)(s8)mx;
+        token[2] = (u8)(s8)my;
+        token[3] = 0;
+    } else {
+        token[0] = M_TRANSFORM;
+        token[1] = 0;
+    }
+
+    memcpy(recon, pred, 64);
+
+    int out_coeff = 0;
+
+    for (int qy = 0; qy < 2; qy++) {
+        for (int qx = 0; qx < 2; qx++) {
+            int16_t residual[16];
+            int16_t coeff[16];
+            int16_t deq[16];
+            int16_t inv[16];
+
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 4; x++) {
+                    int bx4 = qx * 4 + x;
+                    int by4 = qy * 4 + y;
+                    int idx8 = by4 * 8 + bx4;
+                    int idx4 = y * 4 + x;
+
+                    residual[idx4] = (int16_t)((int)cur[idx8] - (int)pred[idx8]);
+                }
+            }
+
+            transform4_forward(residual, coeff);
+            memset(deq, 0, sizeof(deq));
+
+            for (int k = 0; k < 4; k++) {
+                int ci = keep_idx[k];
+                int qv = quant_coeff_int((int)coeff[ci], qp);
+
+                qv = (int)clamp_s8_coeff(qv);
+
+                token[coeff_base + out_coeff] = (u8)(int8_t)qv;
+                out_coeff++;
+
+                deq[ci] = (int16_t)dequant_coeff_int(qv, qp);
+            }
+
+            transform4_inverse(deq, inv);
+
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 4; x++) {
+                    int bx4 = qx * 4 + x;
+                    int by4 = qy * 4 + y;
+                    int idx8 = by4 * 8 + bx4;
+                    int idx4 = y * 4 + x;
+
+                    recon[idx8] = clamp_u8((int)pred[idx8] + (int)inv[idx4]);
+                }
+            }
+        }
+    }
+
+    return rdo_sad_64(cur, recon);
 }
 
 
@@ -1446,18 +1464,101 @@ static int rdo_make_transformz_64(
     int mv_mode,
     int mx,
     int my,
-    u8 token[96],
+    u8 token[32],
     u8 recon[64],
     int *out_len
 ) {
-    /* Sparse transform via the shared codec (keep g_enc_nkeep coeffs/quadrant). */
-    int sad = mivf_t_make(cur, pred, qp, mv_mode, mx, my, 1,
-                          (u8)(mv_mode ? M_MVTRANSFORMZ : M_TRANSFORMZ),
-                          token, 96, recon, out_len, g_enc_nkeep);
-    if (sad < 0) {
+    static const int keep_idx[4] = {
+        0, 1,
+        4, 5
+    };
+
+    int8_t coeff_out[16];
+    int out_coeff = 0;
+
+    memcpy(recon, pred, 64);
+
+    for (int qy = 0; qy < 2; qy++) {
+        for (int qx = 0; qx < 2; qx++) {
+            int16_t residual[16];
+            int16_t coeff[16];
+            int16_t deq[16];
+            int16_t inv[16];
+
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 4; x++) {
+                    int bx4 = qx * 4 + x;
+                    int by4 = qy * 4 + y;
+                    int idx8 = by4 * 8 + bx4;
+                    int idx4 = y * 4 + x;
+
+                    residual[idx4] =
+                        (int16_t)((int)cur[idx8] - (int)pred[idx8]);
+                }
+            }
+
+            transform4_forward(residual, coeff);
+            memset(deq, 0, sizeof(deq));
+
+            for (int k = 0; k < 4; k++) {
+                int ci = keep_idx[k];
+
+                int qv = quant_coeff_int((int)coeff[ci], qp);
+                qv = (int)clamp_s8_coeff(qv);
+
+                coeff_out[out_coeff++] = (int8_t)qv;
+                deq[ci] = (int16_t)dequant_coeff_int(qv, qp);
+            }
+
+            transform4_inverse(deq, inv);
+
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 4; x++) {
+                    int bx4 = qx * 4 + x;
+                    int by4 = qy * 4 + y;
+                    int idx8 = by4 * 8 + bx4;
+                    int idx4 = y * 4 + x;
+
+                    recon[idx8] = clamp_u8(
+                        (int)pred[idx8] +
+                        (int)inv[idx4]
+                    );
+                }
+            }
+        }
+    }
+
+    int sad = rdo_sad_64(cur, recon);
+
+    int pos = 0;
+
+    if (mv_mode) {
+        token[pos++] = M_MVTRANSFORMZ;
+        token[pos++] = (u8)(s8)mx;
+        token[pos++] = (u8)(s8)my;
+        token[pos++] = 0;
+    } else {
+        token[pos++] = M_TRANSFORMZ;
+        token[pos++] = 0;
+    }
+
+    u16 mask = 0;
+
+    int packed_len = pack_sparse16_le(
+        coeff_out,
+        token + pos,
+        32 - pos,
+        &mask
+    );
+
+    if (packed_len < 0) {
         *out_len = 0;
         return 999999;
     }
+
+    pos += packed_len;
+    *out_len = pos;
+
     return sad;
 }
 
@@ -1472,87 +1573,6 @@ static inline int mv_can_pack4(int mx, int my) {
 
 static inline u8 mv_pack4(int mx, int my) {
     return (u8)(((my + 8) << 4) | ((mx + 8) & 15));
-}
-
-
-/* ------------------------------------------------------------------------- */
-/* HFIX37-REDUX single-block Global Motion Vector estimator                   */
-/* ------------------------------------------------------------------------- */
-
-static void estimate_global_mv_luma(
-    const u8 *cur,
-    const u8 *prev,
-    int w,
-    int h,
-    int mv_range,
-    int *out_mx,
-    int *out_my
-) {
-    int best_mx = 0;
-    int best_my = 0;
-    long long best_sad = 0x7fffffffffffffffLL;
-
-    if (!cur || !prev || w <= 0 || h <= 0) {
-        *out_mx = 0;
-        *out_my = 0;
-        return;
-    }
-
-    if (mv_range < 0) {
-        mv_range = 0;
-    }
-
-    if (mv_range > 8) {
-        mv_range = 8;
-    }
-
-    /*
-        Search only integer-pel vectors. Sample every other 8x8 block to keep
-        encoder cost reasonable while still capturing camera pans.
-    */
-    for (int my = -mv_range; my <= mv_range; my++) {
-        for (int mx = -mv_range; mx <= mv_range; mx++) {
-            long long sad = 0;
-
-            for (int by = 1; by < (h / 8) - 1; by += 2) {
-                for (int bx = 1; bx < (w / 8) - 1; bx += 2) {
-                    int x0 = bx * 8;
-                    int y0 = by * 8;
-
-                    int sx = x0 + mx;
-                    int sy = y0 + my;
-
-                    if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
-                        sad += 4096;
-                        continue;
-                    }
-
-                    for (int yy = 0; yy < 8; yy++) {
-                        const u8 *c = cur  + (y0 + yy) * w + x0;
-                        const u8 *p = prev + (sy + yy) * w + sx;
-
-                        for (int xx = 0; xx < 8; xx++) {
-                            int d = (int)c[xx] - (int)p[xx];
-                            sad += d < 0 ? -d : d;
-                        }
-                    }
-                }
-            }
-
-            if (sad < best_sad) {
-                best_sad = sad;
-                best_mx = mx;
-                best_my = my;
-            }
-        }
-    }
-
-    /*
-        Clamp to HFIX36A packed-vector-safe range. This also keeps chroma
-        scaling deterministic.
-    */
-    *out_mx = clamp_int(best_mx, -8, 7);
-    *out_my = clamp_int(best_my, -8, 7);
 }
 
 static void encode_plane(
@@ -1570,8 +1590,6 @@ static void encode_plane(
     int mv_thresh,
     double lambda,
     int qp,
-    int g_mx,
-    int g_my,
     PlaneEnc *out
 ) {
     /*
@@ -1604,8 +1622,6 @@ static void encode_plane(
         }
 
         buf_put_u8(&out->payload, (u8)qp_byte);
-        buf_put_u8(&out->payload, (u8)(s8)g_mx);
-        buf_put_u8(&out->payload, (u8)(s8)g_my);
     }
 
     int bxcount = w / 8;
@@ -1613,83 +1629,29 @@ static void encode_plane(
 
     u8 b[64];
     u8 pb[64];
-    u8 token_tmp[96];
+    u8 token_tmp[65];
     u8 recon_tmp[64];
 
-    u8 best_token[96];
+    u8 best_token[65];
     u8 best_recon[64];
-
-    /*
-        HFIX39A:
-        Base-relative DQP state. This is not cumulative in the bitstream:
-            active_qp = base_qp + active_dqp
-    */
-    int active_dqp = 0;
 
     for (int by = 0; by < bycount; by++) {
         for (int bx = 0; bx < bxcount; bx++) {
             get_block(cur, w, bx, by, b);
 
-            /*
-                HFIX39A conservative three-state QP ladder:
-                    flat / gradient: QP - 4
-                    normal:          QP
-                    texture:         QP + 4
-            */
-            int block_var_dqp = calculate_block_variance_64(b);
-
-            int block_min_dqp = 255;
-            int block_max_dqp = 0;
-
-            for (int dqp_i = 0; dqp_i < 64; dqp_i++) {
-                int v = (int)b[dqp_i];
-
-                if (v < block_min_dqp) {
-                    block_min_dqp = v;
-                }
-
-                if (v > block_max_dqp) {
-                    block_max_dqp = v;
-                }
-            }
-
-            int block_range_dqp = block_max_dqp - block_min_dqp;
-
-            /*
-                HFIX39B:
-                Flat-only local QP.
-
-                HFIX39A used +4 on high-variance texture blocks, but that
-                over-starved important edge/detail regions. HFIX39B only
-                grants extra precision to smooth/gradient blocks and never
-                makes any block coarser than the base QP.
-            */
-            int target_dqp = 0;
-
-            if (block_var_dqp < 80 && block_range_dqp < 48) {
-                target_dqp = -4;
-            }
-
-            int local_qp = clamp_int(qp + target_dqp, 18, 48);
-            int dqp_rate = (target_dqp != active_dqp) ? 2 : 0;
-
             int best_kind = -1;
             int best_len = 0;
-            int best_dqp = active_dqp;
-            int candidate_dqp = active_dqp;
             double best_cost = 1.0e30;
 
             #define RDO_CONSIDER(kind_value, rate_bytes, token_len, token_ptr, recon_ptr, sad_value) do { \
                 if ((token_len) > 0) { \
-                    int visual_dist = rdo_nssd_64(b, (recon_ptr)); \
-                    double candidate_cost = (double)visual_dist + lambda * (double)(rate_bytes); \
+                    double candidate_cost = (double)(sad_value) + lambda * (double)(rate_bytes); \
                     if (candidate_cost < best_cost) { \
                         best_cost = candidate_cost; \
                         best_kind = (kind_value); \
                         best_len = (token_len); \
                         memcpy(best_token, (token_ptr), (size_t)(token_len)); \
                         memcpy(best_recon, (recon_ptr), 64); \
-                        best_dqp = candidate_dqp; \
                     } \
                 } \
             } while (0)
@@ -1743,16 +1705,14 @@ static void encode_plane(
                 int sad_tr = rdo_make_transform_64(
                     b,
                     pb,
-                    local_qp,
+                    qp,
                     0,
                     0,
                     0,
                     token_tmp,
                     recon_tmp
                 );
-                candidate_dqp = target_dqp;
-                RDO_CONSIDER(M_TRANSFORM, (2 + g_enc_nkeep * 4) + dqp_rate, (2 + g_enc_nkeep * 4), token_tmp, recon_tmp, sad_tr);
-                candidate_dqp = active_dqp;
+                RDO_CONSIDER(M_TRANSFORM, 18, 18, token_tmp, recon_tmp, sad_tr);
 
                 /*
                     TRANSFORMZ sparse frequency residual.
@@ -1761,7 +1721,7 @@ static void encode_plane(
                 int sad_trz = rdo_make_transformz_64(
                     b,
                     pb,
-                    local_qp,
+                    qp,
                     0,
                     0,
                     0,
@@ -1769,9 +1729,7 @@ static void encode_plane(
                     recon_tmp,
                     &trz_len
                 );
-                candidate_dqp = target_dqp;
-                RDO_CONSIDER(M_TRANSFORMZ, trz_len + dqp_rate, trz_len, token_tmp, recon_tmp, sad_trz);
-                candidate_dqp = active_dqp;
+                RDO_CONSIDER(M_TRANSFORMZ, trz_len, trz_len, token_tmp, recon_tmp, sad_trz);
 
                 /*
                     Motion-predicted candidates.
@@ -1797,44 +1755,6 @@ static void encode_plane(
                             pred,
                             &best_mv_sad
                         )) {
-                        /*
-                            HFIX37-REDUX:
-                            Single-block Global Motion Vector copy.
-
-                            This is a normal one-block token. It does not
-                            accumulate runs and never changes decoder traversal.
-                        */
-                        if (prev) {
-                            int g_sx = bx * 8 + g_mx;
-                            int g_sy = by * 8 + g_my;
-
-                            if (g_sx >= 0 && g_sy >= 0 &&
-                                g_sx + 8 <= w && g_sy + 8 <= h) {
-                                u8 gmv_pred[64];
-
-                                for (int yy = 0; yy < 8; yy++) {
-                                    memcpy(
-                                        gmv_pred + yy * 8,
-                                        prev + (g_sy + yy) * w + g_sx,
-                                        8
-                                    );
-                                }
-
-                                int sad_gmv = rdo_sad_64(b, gmv_pred);
-
-                                token_tmp[0] = M_GMVCOPY;
-
-                                RDO_CONSIDER(
-                                    M_GMVCOPY_INTERNAL,
-                                    1,
-                                    1,
-                                    token_tmp,
-                                    gmv_pred,
-                                    sad_gmv
-                                );
-                            }
-                        }
-
                         /*
                             MVCOPY.
                         */
@@ -1884,16 +1804,14 @@ static void encode_plane(
                         int sad_mvtr = rdo_make_transform_64(
                             b,
                             pred,
-                            local_qp,
+                            qp,
                             1,
                             best_mx,
                             best_my,
                             token_tmp,
                             recon_tmp
                         );
-                        candidate_dqp = target_dqp;
-                        RDO_CONSIDER(M_MVTRANSFORM, (4 + g_enc_nkeep * 4) + dqp_rate, (4 + g_enc_nkeep * 4), token_tmp, recon_tmp, sad_mvtr);
-                        candidate_dqp = active_dqp;
+                        RDO_CONSIDER(M_MVTRANSFORM, 20, 20, token_tmp, recon_tmp, sad_mvtr);
 
                         /*
                             MVTRANSFORMZ sparse frequency residual.
@@ -1902,7 +1820,7 @@ static void encode_plane(
                         int sad_mvtrz = rdo_make_transformz_64(
                             b,
                             pred,
-                            local_qp,
+                            qp,
                             1,
                             best_mx,
                             best_my,
@@ -1910,19 +1828,15 @@ static void encode_plane(
                             recon_tmp,
                             &mvtrz_len
                         );
-                        candidate_dqp = target_dqp;
-                        RDO_CONSIDER(M_MVTRANSFORMZ, mvtrz_len + dqp_rate, mvtrz_len, token_tmp, recon_tmp, sad_mvtrz);
-                        candidate_dqp = active_dqp;
+                        RDO_CONSIDER(M_MVTRANSFORMZ, mvtrz_len, mvtrz_len, token_tmp, recon_tmp, sad_mvtrz);
                         if (mv_can_pack4(best_mx, best_my) && mvtrz_len >= 6) {
-                            u8 packed_token[96];
+                            u8 packed_token[64];
                             packed_token[0] = M_MVTRANSFORMZP;
                             packed_token[1] = mv_pack4(best_mx, best_my);
                             packed_token[2] = token_tmp[3]; /* reserved */
                             memcpy(packed_token + 3, token_tmp + 4, (size_t)(mvtrz_len - 4));
                             int packed_len = mvtrz_len - 1;
-                            candidate_dqp = target_dqp;
-                            RDO_CONSIDER(M_MVTRANSFORMZP, packed_len + dqp_rate, packed_len, packed_token, recon_tmp, sad_mvtrz);
-                            candidate_dqp = active_dqp;
+                            RDO_CONSIDER(M_MVTRANSFORMZP, packed_len, packed_len, packed_token, recon_tmp, sad_mvtrz);
                         }
                     }
                 }
@@ -1939,67 +1853,26 @@ static void encode_plane(
             RDO_CONSIDER(M_SOLID, 2, 2, token_tmp, recon_tmp, sad_solid);
 
             /*
-                RAW (HFIX62A: Moflex-Tier Exclusion).
-                Raw blocks are explicitly BANNED on P-Frames to prevent 
-                Rate-Distortion algorithms from hoarding bytes.
+                RAW.
             */
-            if (keyframe) {
-                token_tmp[0] = M_RAW;
-                memcpy(token_tmp + 1, b, 64);
-                RDO_CONSIDER(M_RAW, 65, 65, token_tmp, b, 0);
-            }
+            token_tmp[0] = M_RAW;
+            memcpy(token_tmp + 1, b, 64);
+            RDO_CONSIDER(M_RAW, 65, 65, token_tmp, b, 0);
 
             #undef RDO_CONSIDER
 
             if (best_kind < 0) {
-                if (keyframe) {
-                    best_token[0] = M_RAW;
-                    memcpy(best_token + 1, b, 64);
-                    memcpy(best_recon, b, 64);
-                    best_kind = M_RAW;
-                    best_len = 65;
-                } else {
-                    /* Hard fallback to SKIP if completely stuck on a P-Frame */
-                    best_token[0] = M_SKIP;
-                    memcpy(best_recon, pb, 64);
-                    best_kind = M_SKIP;
-                    best_len = 1;
-                }
+                best_token[0] = M_RAW;
+                memcpy(best_token + 1, b, 64);
+                memcpy(best_recon, b, 64);
+                best_kind = M_RAW;
+                best_len = 65;
             }
 
             if (best_kind == M_SKIP) {
                 plane_emit_skip(out);
                 out->stats.skip++;
-            } else if (best_kind == M_GMVCOPY_INTERNAL) {
-                u8 tok[1];
-
-                tok[0] = M_GMVCOPY;
-
-                plane_emit_token(out, tok, 1);
-
-                out->stats.mv++;
             } else {
-                /*
-                    HFIX39A emit base-relative DQP state token only when a
-                    transform-family mode wins and the target offset differs
-                    from the currently active offset.
-                */
-                if ((best_kind == M_TRANSFORM ||
-                     best_kind == M_MVTRANSFORM ||
-                     best_kind == M_TRANSFORMZ ||
-                     best_kind == M_MVTRANSFORMZ ||
-                     best_kind == M_MVTRANSFORMZP) &&
-                    best_dqp != active_dqp) {
-                    u8 dqp_tok[2];
-
-                    dqp_tok[0] = M_SET_BASE_DQP;
-                    dqp_tok[1] = (u8)(s8)best_dqp;
-
-                    plane_emit_token(out, dqp_tok, 2);
-
-                    active_dqp = best_dqp;
-                }
-
                 plane_emit_token(out, best_token, best_len);
 
                 if (best_kind == M_DELTA) {
@@ -2042,84 +1915,22 @@ static void encode_plane(
 
 static long file_size(FILE *f) {
     long cur = ftell(f);
+
     if (cur < 0) die("ftell failed");
+
     if (fseek(f, 0, SEEK_END)) die("fseek end failed");
+
     long n = ftell(f);
     if (n < 0) die("ftell end failed");
+
     if (fseek(f, cur, SEEK_SET)) die("fseek restore failed");
+
     return n;
 }
 
-static FILE *open_input_stream(const char *path, bool *is_stdin) {
-    FILE *f;
-
-    if (!path || !is_stdin) {
-        die("bad input stream arguments");
-    }
-
-    *is_stdin = false;
-
-    if (strcmp(path, "-") == 0) {
-#ifdef _WIN32
-        _setmode(_fileno(stdin), _O_BINARY);
-#endif
-        *is_stdin = true;
-        return stdin;
-    }
-
-    f = fopen(path, "rb");
-
-    if (!f) {
-        die("failed to open input");
-    }
-
-    return f;
-}
-
-static size_t read_full_frame(FILE *f, u8 *dst, size_t frame_size) {
-    size_t off = 0;
-
-    while (off < frame_size) {
-        size_t got = fread(dst + off, 1, frame_size - off, f);
-
-        if (got == 0) {
-            if (ferror(f)) {
-                die("input read error");
-            }
-
-            break;
-        }
-
-        off += got;
-    }
-
-    return off;
-}
-
-static long long tell_output_pos64(FILE *f) {
-#ifdef _WIN32
-    __int64 p = _ftelli64(f);
-
-    if (p < 0) {
-        die("_ftelli64 output failed");
-    }
-
-    return (long long)p;
-#else
-    long p = ftell(f);
-
-    if (p < 0) {
-        die("ftell output failed");
-    }
-
-    return (long long)p;
-#endif
-}
-
-
 static void print_stats(
     int frames,
-    long long total_bytes,
+    long total_bytes,
     const PlaneStats *ys,
     const PlaneStats *cs,
     int iframes,
@@ -2129,7 +1940,7 @@ static void print_stats(
         "STATS I=%d P=%d "
         "Y_skip=%u Y_delta=%u Y_solid=%u Y_mv=%u Y_mvqres=%u Y_qres=%u Y_tr=%u Y_mvtr=%u Y_qz=%u Y_mvqz=%u Y_trz=%u Y_mvtrz=%u Y_raw=%u Y_run_tokens=%u Y_run_blocks=%u "
         "C_skip=%u C_delta=%u C_solid=%u C_mv=%u C_mvqres=%u C_qres=%u C_tr=%u C_mvtr=%u C_qz=%u C_mvqz=%u C_trz=%u C_mvtrz=%u C_raw=%u C_run_tokens=%u C_run_blocks=%u "
-        "frames=%d total_bytes=%lld\n",
+        "frames=%d total_bytes=%ld\n",
         iframes,
         pframes,
         ys->skip,
@@ -2181,7 +1992,6 @@ int main(int argc, char **argv) {
     ep.h = arg_int(argc, argv, "--height", 0);
     ep.fps = arg_int(argc, argv, "--fps", 30);
     ep.keyint = arg_int(argc, argv, "--keyint", 60);
-    g_enc_nkeep = mivf_t_resolve(arg_int(argc, argv, "--keep", MIVF_T_NKEEP_DEFAULT));
 
     ep.y_skip = arg_int(argc, argv, "--y-skip", 8);
     ep.y_delta = arg_int(argc, argv, "--y-delta", 16);
@@ -2197,12 +2007,10 @@ int main(int argc, char **argv) {
     ep.y_mv_thresh = arg_int(argc, argv, "--y-mv-thresh", 768);
     ep.c_mv_thresh = arg_int(argc, argv, "--c-mv-thresh", 1024);
 
-    ep.lambda = arg_double(argc, argv, "--lambda", 3.35);
-    ep.c_lambda = arg_double(argc, argv, "--c-lambda", ep.lambda * 1.55);
-    ep.qp = arg_int(argc, argv, "--qp", 35);
-        ep.c_qp_offset = arg_int(argc, argv, "--c-qp-offset", 4);
-    u32 start_frame = (u32)arg_int(argc, argv, "--start-frame", 0);
-if (ep.qp < 1) ep.qp = 1;
+    ep.lambda = arg_double(argc, argv, "--lambda", 4.0);
+    ep.c_lambda = arg_double(argc, argv, "--c-lambda", ep.lambda);
+    ep.qp = arg_int(argc, argv, "--qp", 28);
+    if (ep.qp < 1) ep.qp = 1;
     if (ep.qp > 51) ep.qp = 51;
 
     if (ep.w <= 0 || ep.h <= 0 || ep.fps <= 0) {
@@ -2219,33 +2027,23 @@ if (ep.qp < 1) ep.qp = 1;
     int c_size = c_w * c_h;
     int frame_size = y_size + c_size + c_size;
 
-bool input_is_stdin = false;
-    FILE *fin = open_input_stream(in_path, &input_is_stdin);
+    FILE *fin = fopen(in_path, "rb");
+    if (!fin) die("failed to open input");
 
-    long in_bytes = -1;
-    int frame_limit = -1;
-    int frames = 0;
+    long in_bytes = file_size(fin);
 
-    if (!input_is_stdin) {
-        in_bytes = file_size(fin);
-
-        if (in_bytes <= 0 || (in_bytes % frame_size) != 0) {
-            die("input size is not a whole number of yuv420p frames");
-        }
-
-        frame_limit = (int)(in_bytes / frame_size);
+    if (in_bytes <= 0 || (in_bytes % frame_size) != 0) {
+        die("input size is not a whole number of yuv420p frames");
     }
+
+    int frames = (int)(in_bytes / frame_size);
 
     FILE *fout = fopen(out_path, "wb");
     if (!fout) die("failed to open output");
 
-u64 duration = 0;
+    u64 duration = (u64)frames * 30000ull / (u64)ep.fps;
     u64 first = HEADER_SIZE + 48;
 
-    /*
-        Streaming input may not know total frame count at startup.
-        Write placeholder duration now and backpatch the header after encoding.
-    */
     write_header(fout, 1, duration, first);
     write_stream_desc_m2y1(fout, ep.w, ep.h, ep.fps);
 
@@ -2272,22 +2070,11 @@ u64 duration = 0;
     int iframes = 0;
     int pframes = 0;
 
-    /* Closed-loop quality meter: reconstruction vs. source SSE -> PSNR. */
-    unsigned long long psnr_se_y = 0, psnr_se_cb = 0, psnr_se_cr = 0;
-    unsigned long long psnr_np_y = 0, psnr_np_c = 0;
-
-for (int fi = 0; ; ) {
-        if (frame_limit >= 0 && fi >= frame_limit) {
-            break;
-        }
-size_t got = read_full_frame(fin, frame, (size_t)frame_size);
-
-        if (got == 0) {
-            break;
-        }
+    for (int fi = 0; fi < frames; fi++) {
+        size_t got = fread(frame, 1, (size_t)frame_size, fin);
 
         if (got != (size_t)frame_size) {
-            die("short trailing input frame");
+            die("short read");
         }
 
         const u8 *cur_y = frame;
@@ -2295,7 +2082,6 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
         const u8 *cur_cr = frame + y_size + c_size;
 
         bool keyframe = (fi == 0) || (ep.keyint > 0 && (fi % ep.keyint) == 0);
-        u32 abs_frame = start_frame + (u32)fi;
 
         if (keyframe) {
             iframes++;
@@ -2310,13 +2096,6 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
         plane_enc_init(&yenc, (size_t)(y_size + 4096));
         plane_enc_init(&cbenc, (size_t)(c_size + 2048));
         plane_enc_init(&crenc, (size_t)(c_size + 2048));
-
-        int g_mx = 0;
-        int g_my = 0;
-
-        if (!keyframe) {
-            estimate_global_mv_luma(cur_y, prev_y, ep.w, ep.h, 8, &g_mx, &g_my);
-        }
 
         encode_plane(
             cur_y,
@@ -2333,8 +2112,6 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
             ep.y_mv_thresh,
             ep.lambda,
             ep.qp,
-            g_mx,
-            g_my,
             &yenc
         );
 
@@ -2352,9 +2129,7 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
             &mvlist,
             ep.c_mv_thresh,
             ep.c_lambda,
-            clamp_int(ep.qp + ep.c_qp_offset, 1, 51),
-            g_mx / 2,
-            g_my / 2,
+            ep.qp,
             &cbenc
         );
 
@@ -2372,9 +2147,7 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
             &mvlist,
             ep.c_mv_thresh,
             ep.c_lambda,
-            clamp_int(ep.qp + ep.c_qp_offset, 1, 51),
-            g_mx / 2,
-            g_my / 2,
+            ep.qp,
             &crenc
         );
 
@@ -2428,16 +2201,16 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
         wr_u16le(pkt + 2, PACKET_HEADER_SIZE);
         wr_u32le(pkt + 4, 0);
         wr_u32le(pkt + 8, body_size);
-        wr_u32le(pkt + 12, abs_frame);
+        wr_u32le(pkt + 12, (u32)fi);
 
         u8 *body = pkt + PACKET_HEADER_SIZE;
 
         memcpy(body + 0, "M2Y1", 4);
         wr_u16le(body + 4, (u16)ep.w);
         wr_u16le(body + 6, (u16)ep.h);
-        wr_u32le(body + 8, abs_frame);
+        wr_u32le(body + 8, (u32)fi);
         body[12] = keyframe ? 1 : 2;
-        body[13] = (u8)g_enc_nkeep;
+        body[13] = 0;
         wr_u16le(body + 14, 0);
         wr_u32le(body + 16, (u32)yenc.payload.size);
         wr_u32le(body + 20, (u32)cbenc.payload.size);
@@ -2455,27 +2228,13 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
 
         write_page(
             fout,
-            abs_frame,
-            (u64)abs_frame * 30000ull / (u64)ep.fps,
+            (u32)fi,
+            (u64)fi * 30000ull / (u64)ep.fps,
             pkt,
             pkt_size
         );
 
         free(pkt);
-
-        /* Accumulate reconstruction error for the PSNR meter. */
-        for (int pi = 0; pi < y_size; pi++) {
-            int d = (int)cur_y[pi] - (int)recon_y[pi];
-            psnr_se_y += (unsigned long long)(d * d);
-        }
-        for (int pi = 0; pi < c_size; pi++) {
-            int dcb = (int)cur_cb[pi] - (int)recon_cb[pi];
-            int dcr = (int)cur_cr[pi] - (int)recon_cr[pi];
-            psnr_se_cb += (unsigned long long)(dcb * dcb);
-            psnr_se_cr += (unsigned long long)(dcr * dcr);
-        }
-        psnr_np_y += (unsigned long long)y_size;
-        psnr_np_c += (unsigned long long)c_size;
 
         memcpy(prev_y, recon_y, (size_t)y_size);
         memcpy(prev_cb, recon_cb, (size_t)c_size);
@@ -2485,50 +2244,16 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
         plane_enc_free(&cbenc);
         plane_enc_free(&crenc);
 
-frames = fi + 1;
-
-        if (((fi + 1) % 30) == 0 || (frame_limit >= 0 && fi + 1 == frame_limit)) {
-            if (frame_limit >= 0) {
-                printf("encoded %d/%d\n", fi + 1, frame_limit);
-            } else {
-                printf("encoded %d\n", fi + 1);
-            }
-
+        if (((fi + 1) % 30) == 0 || fi + 1 == frames) {
+            printf("encoded %d/%d\n", fi + 1, frames);
             fflush(stdout);
         }
-
-        fi++;
     }
 
-if (frames <= 0) {
-        die("no frames encoded");
-    }
-
-    if (!input_is_stdin) {
-        fclose(fin);
-    }
-
+    fclose(fin);
     fflush(fout);
 
-    long long out_bytes = tell_output_pos64(fout);
-
-    duration = (u64)frames * 30000ull / (u64)ep.fps;
-
-    /*
-        Backpatch final header now that the true frame count/duration is known.
-        Output is seekable even when input was a non-seekable pipe.
-    */
-    if (fseek(fout, 0, SEEK_SET)) {
-        die("failed to seek output for header backpatch");
-    }
-
-    write_header(fout, 1, duration, first);
-
-    if (fseek(fout, 0, SEEK_END)) {
-        die("failed to restore output position after header backpatch");
-    }
-
-    fflush(fout);
+    long out_bytes = ftell(fout);
     fclose(fout);
 
     mvlist_free(&mvlist);
@@ -2542,22 +2267,7 @@ if (frames <= 0) {
     free(recon_cr);
 
     printf("WROTE %s\n", out_path);
-    printf("frames=%d bytes=%lld\n", frames, out_bytes);
-
-    if (psnr_np_y > 0) {
-        double mse_y = (double)psnr_se_y / (double)psnr_np_y;
-        double mse_cb = psnr_np_c ? (double)psnr_se_cb / (double)psnr_np_c : 0.0;
-        double mse_cr = psnr_np_c ? (double)psnr_se_cr / (double)psnr_np_c : 0.0;
-        double psnr_y = mse_y > 0.0 ? 10.0 * log10(255.0 * 255.0 / mse_y) : 99.0;
-        double psnr_cb = mse_cb > 0.0 ? 10.0 * log10(255.0 * 255.0 / mse_cb) : 99.0;
-        double psnr_cr = mse_cr > 0.0 ? 10.0 * log10(255.0 * 255.0 / mse_cr) : 99.0;
-        double se_all = (double)psnr_se_y + (double)psnr_se_cb + (double)psnr_se_cr;
-        double np_all = (double)psnr_np_y + 2.0 * (double)psnr_np_c;
-        double mse_all = np_all > 0.0 ? se_all / np_all : 0.0;
-        double psnr_all = mse_all > 0.0 ? 10.0 * log10(255.0 * 255.0 / mse_all) : 99.0;
-        printf("PSNR Y=%.2f Cb=%.2f Cr=%.2f combined=%.2f dB\n",
-            psnr_y, psnr_cb, psnr_cr, psnr_all);
-    }
+    printf("frames=%d bytes=%ld\n", frames, out_bytes);
 
     print_stats(
         frames,

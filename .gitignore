@@ -1,0 +1,57 @@
+# devkitPro Build Targets
+build/
+*.o
+*.elf
+*.3dsx
+*.smdh
+*.cia
+*.map
+
+# Historical Reference Dumps & Extraction Data
+app_extract/
+ghidra_projects/
+audio_sweep_*/
+sweep_results_*/
+__pycache__/
+
+# Legacy Reference Phases (Kept on disk, ignored by Git)
+MIVF_3DS_Player_*/
+MIVF_Tools*/
+STABLE_HFIX*/
+
+# Random Root Scratch Files & Loose Reference Blocks
+*.sh
+*.shbin
+*.txt
+*.tsv
+*.java
+*.ppm
+*.png
+*.csv
+MANIFEST_*
+
+# Exception: Protect the active tools directory shell launcher
+!tools/encode_mivf.sh
+
+# Block Massive Local Test Video / Audio Buffers
+*.yuv
+*.rgb565
+*.frames
+*.moflex
+*.mkv
+*.mp4
+*.avi
+*.wav
+*.mivf
+
+# --- Release packaging assets (override the broad *.png / *.wav rules above) ---
+!meta/*.png
+!meta/*.wav
+# Generated banner blob (rebuilt by `make cia`)
+meta/banner.bnr
+
+# --- Source / tool backups and scratch (never ship these) ---
+*BACKUP
+*.bak
+*.pre_*
+*_backup
