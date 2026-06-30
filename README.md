@@ -1,6 +1,6 @@
 # MIVF Player for Nintendo 3DS
 
-A homebrew video player for the Nintendo 3DS. MIVF is a custom, page‑based video container with its own software codecs, a native C player that runs on the console, and a standalone encoder that turns ordinary `.mp4` files into `.mivf`.
+A homebrew video player for the Nintendo 3DS. MIVF is a custom, page‑based video container with its own software codecs, a native C player that runs on the console, and a standalone encoder that turns ordinary `.mp4` or `.mkv` files into `.mivf`.
 
 It is built for the real hardware: the codecs are tuned for the ARM11, the player streams pages from the SD card with a background reader, and the whole UI (file browser, transport, settings) is drawn straight into the RGB565 framebuffers.
 
