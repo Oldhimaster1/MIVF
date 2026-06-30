@@ -92,6 +92,9 @@ encode_mivf.exe input.mp4 output.mivf --m2y2
 :: Faster, raw token M2Y1:
 encode_mivf.exe input.mp4 output.mivf
 
+::Best Balanced
+encode_mivf.exe input.mp4 output.mivf --m2y2 --fps 24 --audio-rate 48000 --jobs 6 --seek-preroll 2 --keep 4 --mv-range 1 --qp 38 --lambda 34
+
 ```
 
 **Linux Example:**
