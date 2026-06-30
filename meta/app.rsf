@@ -3,161 +3,115 @@ BasicInfo:
   CompanyCode             : "00"
   ProductCode             : "CTR-P-MIVF"
   ContentType             : Application
-  Logo                    : Homebrew
-
-RomFs:
-  # Leave empty: this app has no RomFS.
-  RootPath                :
+  Logo                    : Nintendo
 
 TitleInfo:
+  UniqueId                : 0xF8001
   Category                : Application
-  UniqueId                : 0xf1f00
 
 Option:
   UseOnSD                 : true
-  FreeProductCode         : true
-  MediaFootPadding        : false
-  EnableCrypt             : false
   EnableCompress          : true
+  FreeProductCode         : true
+  EnableCrypt             : false
+  MediaFootPadding        : false
 
 AccessControlInfo:
-  CoreVersion                   : 2
+  SystemSaveDataId1       : 0x00000000
+  SystemSaveDataId2       : 0x00000000
+  OtherUserSaveDataId1    : 0x00000
+  OtherUserSaveDataId2    : 0x00000
+  OtherUserSaveDataId3    : 0x00000
 
-  # Exheader format version
-  DescVersion                   : 2
-
-  # Minimum required kernel version (4.5.0)
-  ReleaseKernelMajor            : "02"
-  ReleaseKernelMinor            : "33"
-
-  MemoryType                    : Application
-  SystemMode                    : 64MB
-
-  IdealProcessor                : 0
-  AffinityMask                  : 0
-
-  Priority                      : 16
-
-  MaxCpu                        : 0x9E # Default
-
-  DisableDebug                  : false
-  EnableForceDebug              : false
-  CanWriteSharedPage            : true
-  CanUsePrivilegedPriority      : false
-  CanUseNonAlphabetAndNumber    : true
-  PermitMainFunctionArgument    : true
-  CanShareDeviceMemory          : true
-  RunnableOnSleep               : false
-  SpecialMemoryArrange          : true
-
-  # System resources
-  SystemSaveDataId1             : 0x00000000
-  SystemSaveDataId2             : 0x00000000
-  StorageId                     : 0x0000000000000000
-  Accessible Save Data Ids      : []
-
-  # Memory mappings used by most homebrew (GPU/LCD register windows)
-  MemoryMapping:
-    - 1ff00000 - 1ff7ffff : r
-    - 1ff80000 - 1fffffff : rw
-  IORegisterMapping:
-    - 1ec00000 - 1ecfffff
   FileSystemAccess:
-    - CategorySystemApplication
-    - CategoryHardwareCheck
-    - CategoryFileSystemTool
-    - Debug
-    - TwlCardBackup
-    - TwlNandData
-    - Boss
     - DirectSdmc
-    - Core
-    - CtrNandRo
-    - CtrNandRw
-    - CtrNandRoWrite
-    - CategorySystemSettings
-    - CardBoard
-    - ExportImportIvs
-    - DirectSdmcWrite
-    - SwitchCleanup
-    - SaveDataMove
-    - Shop
-    - Shell
-    - CategoryHomeMenu
-  IoAccessControl:
-  InterruptNumbers:
+
+  IdealProcessor          : 0
+  AffinityMask            : 1
+  Priority                : 16
+  MaxCpu                  : 0x9E
+
+  DisableDebug            : false
+  EnableForceDebug        : false
+  CanWriteSharedPage      : false
+  CanUsePrivilegedPriority: false
+  CanUseNonAlphabetAndNumber: false
+  PermitMainFunctionArgument: false
+  CanShareDeviceMemory    : false
+  RunnableOnSleep         : false
+  SpecialMemoryArrange    : false
+  UseOtherVariationSaveData: false
+
+  CoreVersion             : 2
+  DescVersion             : 2
+  MemoryType              : Application
+  SystemMode              : 64MB
+  HandleTableSize         : 512
+
   ServiceAccessControl:
-    - APT:U
-    - ac:u
-    - $hioFIO
-    - $hostio0
-    - $hostio1
-    - boss:U
-    - cam:u
-    - cecd:u
-    - cfg:u
-    - csnd:SND
-    - dlp:FKCL
-    - dlp:SRVR
-    - dsp::DSP
-    - frd:u
     - fs:USER
-    - gsp::Gpu
-    - gsp::Lcd
+    - apt:u
     - hid:USER
-    - http:C
-    - ir:rst
-    - ir:u
-    - ir:USER
-    - mic:u
+    - gsp::Gpu
+    - dsp::DSP
     - ndm:u
-    - news:u
-    - nim:aoc
-    - ns:s
-    - nwm::UDS
-    - ptm:u
-    - ptm:sysm
-    - pxi:dev
-    - qtm:u
+    - cfg:u
     - soc:U
-    - ssl:C
-    - y2r:u
+    - srv:pm
+
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    SetProcessIdealProcessor: 6
+    GetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    Run: 18
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    SignalAndWait: 38
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
 
 SystemControlInfo:
-  SaveDataSize: 0K
-  RemasterVersion: 0
-  StackSize: 0x40000
-
-  # Modules backing the services above. Required so the app loads correctly.
-  Dependency:
-    ac: 0x0004013000002402
-    am: 0x0004013000001502
-    boss: 0x0004013000003402
-    camera: 0x0004013000001602
-    cecd: 0x0004013000002602
-    cfg: 0x0004013000001702
-    codec: 0x0004013000001802
-    csnd: 0x0004013000002702
-    dlp: 0x0004013000002802
-    dsp: 0x0004013000001a02
-    friends: 0x0004013000003202
-    gpio: 0x0004013000001b02
-    gsp: 0x0004013000001c02
-    hid: 0x0004013000001d02
-    http: 0x0004013000002902
-    i2c: 0x0004013000001e02
-    ir: 0x0004013000003302
-    mcu: 0x0004013000001f02
-    mic: 0x0004013000002002
-    ndm: 0x0004013000002b02
-    news: 0x0004013000003502
-    nim: 0x0004013000002c02
-    nwm: 0x0004013000002d02
-    pdn: 0x0004013000002102
-    ps: 0x0004013000003102
-    ptm: 0x0004013000002202
-    qtm: 0x0004013000002e02
-    ro: 0x0004013000003702
-    socket: 0x0004013000002e02
-    spi: 0x0004013000002302
-    ssl: 0x0004013000002f02
+  SaveDataSize            : "0M"
+  RemasterVersion         : 0
+  StackSize               : 0x40000
