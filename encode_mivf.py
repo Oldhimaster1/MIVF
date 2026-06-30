@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from multiprocessing import cpu_count
 from pathlib import Path
@@ -14,6 +15,52 @@ import sys
 import tempfile
 import time
 import zlib
+import json
+
+# MIVF_PROGRESS_HOOK_BEGIN
+import builtins as _mivf_builtins
+import re as _mivf_re
+import sys as _mivf_sys
+
+if not hasattr(_mivf_builtins, "_mivf_orig_print"):
+    _mivf_builtins._mivf_orig_print = _mivf_builtins.print
+
+    def _mivf_progress_print(*args, **kwargs):
+        text = " ".join(str(a) for a in args)
+
+        m = _mivf_re.search(
+            r"Cores Active:\s*(\d+)\s*/\s*(\d+).*?Chunks Done:\s*(\d+).*?Predicted ETA:\s*([0-9:]+)",
+            text
+        )
+
+        if m:
+            active = int(m.group(1))
+            total = max(1, int(m.group(2)))
+            done = int(m.group(3))
+            eta = m.group(4)
+
+            done = max(0, min(done, total))
+            width = 36
+            fill = int(width * done / total)
+            bar = "#" * fill + "-" * (width - fill)
+            pct = 100.0 * done / total
+
+            _mivf_sys.stdout.write(
+                f"\r[{bar}] {pct:6.2f}% | cores {active}/{total} | chunks {done}/{total} | ETA {eta}   "
+            )
+            _mivf_sys.stdout.flush()
+
+            if done >= total:
+                _mivf_sys.stdout.write("\n")
+                _mivf_sys.stdout.flush()
+
+            return
+
+        return _mivf_builtins._mivf_orig_print(*args, **kwargs)
+
+    _mivf_builtins.print = _mivf_progress_print
+# MIVF_PROGRESS_HOOK_END
+
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
@@ -34,6 +81,9 @@ DEFAULT_C_SKIP = 24
 DEFAULT_Y_DELTA = 24
 DEFAULT_C_DELTA = 32
 DEFAULT_MV_RANGE = 4
+DEFAULT_JOBS = min(6, max(1, cpu_count()))
+DEFAULT_SEEK_PREROLL = 2.0
+DEFAULT_ETA_FPS = 286.0
 
 HEADER_SIZE = 64
 STREAM_DESC_SIZE = 32
@@ -80,6 +130,9 @@ class EncodeSettings:
     c_delta: int = DEFAULT_C_DELTA
     mv_range: int = DEFAULT_MV_RANGE
     keep: int = DEFAULT_KEEP
+    jobs: int = DEFAULT_JOBS
+    seek_preroll: float = DEFAULT_SEEK_PREROLL
+    eta_fps: float = DEFAULT_ETA_FPS
 
 
 def resource_dir() -> Path:
@@ -143,13 +196,6 @@ def make_temp_workdir() -> Path:
 
 def mivf_helper_path() -> Path:
     return bundled_path("miv2y_moflex_tier.exe")
-
-
-def copy_helper_binary(workdir: Path) -> Path:
-    helper = mivf_helper_path()
-    target = workdir / helper.name
-    shutil.copy2(helper, target)
-    return target
 
 
 def mivf_ffmpeg_path() -> str:
@@ -218,35 +264,79 @@ def find_ffprobe_path() -> str:
 
 
 def probe_video_frame_count(input_path: Path) -> int:
+    """Instantly extracts video frame count via fast header metadata json query."""
     ffprobe = find_ffprobe_path()
+    
+    # Fast approach: query container-level fields using structured json format
     cmd = [
         ffprobe,
-        "-v",
-        "error",
-        "-count_frames",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=nb_read_frames",
-        "-of",
-        "default=nokey=1:noprint_wrappers=1",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames,duration,r_frame_rate:format=duration",
+        "-of", "json",
         str(input_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    output = result.stdout.strip()
-    if not output:
-        raise SystemExit("Unable to determine total video frame count from input.")
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        
+        # Strategy A: Check stream-level frame count headers directly
+        if "streams" in data and data["streams"]:
+            stream = data["streams"][0]
+            if "nb_frames" in stream:
+                with contextlib.suppress(ValueError):
+                    frames = int(stream["nb_frames"])
+                    if frames > 0:
+                        return frames
 
+        # Strategy B: Compute using absolute container duration and frame rate
+        duration = None
+        if "streams" in data and data["streams"] and "duration" in data["streams"][0]:
+            with contextlib.suppress(ValueError):
+                duration = float(data["streams"][0]["duration"])
+        if duration is None and "format" in data and "duration" in data["format"]:
+            with contextlib.suppress(ValueError):
+                duration = float(data["format"]["duration"])
+
+        fps = 30.0
+        if "streams" in data and data["streams"] and "r_frame_rate" in data["streams"][0]:
+            r_fps = data["streams"][0]["r_frame_rate"]
+            if "/" in r_fps:
+                try:
+                    num, den = map(int, r_fps.split("/"))
+                    if den != 0:
+                        fps = num / den
+                except ValueError:
+                    pass
+
+        if duration is not None and duration > 0:
+            return int(duration * fps)
+
+    except Exception:
+        pass
+
+    # Ultimate ultra-fallback if container headers are completely uncooperative: 
+    # Only run the slow frame decoding count pass as a last resort.
+    cmd_slow = [
+        ffprobe,
+        "-v", "error",
+        "-count_frames",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        str(input_path),
+    ]
+    result_slow = subprocess.run(cmd_slow, capture_output=True, text=True, check=True)
+    output = result_slow.stdout.strip()
     for line in output.splitlines():
         if line.strip():
-            try:
+            with contextlib.suppress(ValueError):
                 frames = int(line.strip())
-            except ValueError:
-                continue
-            if frames > 0:
-                return frames
+                if frames > 0:
+                    return frames
 
-    raise SystemExit("Unable to parse frame count from ffprobe output.")
+    raise SystemExit("Unable to determine total video frame count from input.")
 
 
 def run_ffmpeg_extract_to_stream(input_path: Path, settings: EncodeSettings) -> subprocess.Popen[bytes]:
@@ -347,9 +437,18 @@ def extract_pcm16(source: Path, rate: int, channels: int, workdir: Path) -> Path
     cmd = [
         ffmpeg,
         "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-i",
         str(source),
+        "-map",
+        "0:a:0",
         "-vn",
+        "-sn",
+        "-dn",
+        "-map_chapters",
+        "-1",
         "-ac",
         str(channels),
         "-ar",
@@ -400,8 +499,10 @@ def wr_header(template: bytes, streams: int, first: int) -> bytes:
     return bytes(buf)
 
 
-def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path, settings: EncodeSettings, source_is_raw_yuv: bool) -> None:
-    helper = copy_helper_binary(workdir)
+def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path, settings: EncodeSettings, source_is_raw_yuv: bool, make_m2y2: bool = False) -> None:
+    # Run the helper binary directly from its safe extraction path instead of
+    # copying it into a temp directory where Windows Defender may interfere.
+    helper = mivf_helper_path()
     frame_size = settings.width * settings.height + (settings.width // 2) * (settings.height // 2) * 2
 
     if source_is_raw_yuv:
@@ -411,7 +512,8 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
         print("Parallel Engine: Probing source video frame count...")
         total_frames = probe_video_frame_count(source_path)
 
-    cores = cpu_count()
+    # Parallel mode restored: cap at 8 workers.
+    cores = min(max(1, settings.jobs), cpu_count(), total_frames if total_frames > 0 else 1)
     print(f"Parallel Engine: Slicing raw data across {cores} CPU Core Clusters...")
 
     frames_per_core = total_frames // cores if cores else total_frames
@@ -476,8 +578,16 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
             ]
             processes.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=workdir))
     else:
-        print("Parallel Engine: Launching direct raw video stream into compression instances...")
+        print("Parallel Engine: Launching true parallel ffmpeg slice workers...")
+        ffmpeg_processes = []
+
+        start_frame = 0
         for idx, chunk_mivf in enumerate(chunk_outputs):
+            num_frames = chunk_frame_counts[idx]
+            start_time_sec = start_frame / float(settings.fps)
+            duration_sec = num_frames / float(settings.fps)
+            start_frame += num_frames
+
             cmd = [
                 str(helper),
                 "--input",
@@ -511,49 +621,70 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
                 "--keep",
                 str(settings.keep),
             ]
-            processes.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=workdir))
 
-        ffmpeg_proc = run_ffmpeg_extract_to_stream(source_path, settings)
-        if ffmpeg_proc.stdout is None:
-            raise SystemExit("FFmpeg streaming output was not available.")
+            helper_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=workdir,
+            )
+            processes.append(helper_proc)
 
-        try:
-            current_chunk = 0
-            remaining_frames = chunk_frame_counts[current_chunk]
-            current_stdin = processes[current_chunk].stdin
-            frame_buffer = bytearray(frame_size)
+            ffmpeg = mivf_ffmpeg_path()
+            # Hybrid fast+accurate slicing:
+            # 1. Input-side -ss seeks near the slice quickly.
+            # 2. trim=start=... accurately removes the pre-roll frames.
+            # This avoids decoding from the beginning of the movie for later slices.
+            seek_preroll = float(settings.seek_preroll)
+            seek_start_sec = max(0.0, start_time_sec - seek_preroll)
+            trim_start_sec = start_time_sec - seek_start_sec
 
-            while remaining_frames > 0:
-                view = memoryview(frame_buffer)
-                read_offset = 0
-                while read_offset < frame_size:
-                    chunk = ffmpeg_proc.stdout.read(frame_size - read_offset)
-                    if not chunk:
-                        break
-                    view[read_offset:read_offset + len(chunk)] = chunk
-                    read_offset += len(chunk)
+            vf_expr = (
+                f"trim=start={trim_start_sec:.6f},"
+                f"setpts=PTS-STARTPTS,"
+                f"scale={settings.width}:{settings.height},"
+                f"format=yuv420p"
+            )
 
-                if read_offset == 0:
-                    break
-                if read_offset != frame_size:
-                    raise SystemExit("Short raw video frame read from ffmpeg stream.")
+            ffmpeg_cmd = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-threads",
+                "1",
+                "-ss",
+                f"{seek_start_sec:.6f}",
+                "-i",
+                str(source_path),
+                "-an",
+                "-sn",
+                "-dn",
+                "-vf",
+                vf_expr,
+                "-vsync",
+                "0",
+                "-frames:v",
+                str(num_frames),
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ]
 
-                assert current_stdin is not None
-                current_stdin.write(frame_buffer)
-                remaining_frames -= 1
+            if helper_proc.stdin is None:
+                raise SystemExit("Helper stdin unavailable.")
 
-                if remaining_frames == 0:
-                    current_stdin.close()
-                    current_chunk += 1
-                    if current_chunk < len(chunk_frame_counts):
-                        remaining_frames = chunk_frame_counts[current_chunk]
-                        current_stdin = processes[current_chunk].stdin
+            ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=helper_proc.stdin,
+                stderr=subprocess.DEVNULL,
+            )
 
-            ffmpeg_proc.wait()
-            if ffmpeg_proc.returncode != 0:
-                raise SystemExit("FFmpeg failed during raw video streaming.")
-        except BrokenPipeError:
-            raise SystemExit("Encoder helper closed unexpectedly while streaming raw frames.")
+            # Parent must close its copy so helper sees EOF when ffmpeg exits.
+            helper_proc.stdin.close()
+            ffmpeg_processes.append(ffmpeg_proc)
 
     print(f"Parallel Engine: Launching {len(processes)} concurrent compression instances at full throttle...")
     start_time = time.time()
@@ -564,9 +695,34 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
         done_count = len(processes) - active_count
         elapsed = time.time() - start_time
 
-        eta_str = fmt_time((len(processes) - done_count) * (elapsed / done_count)) if done_count > 0 else "Calculating..."
+        total_jobs = max(1, len(processes))
+
+        # Smooth non-chunk ETA. Before any chunk finishes, estimate progress
+        # from benchmark FPS instead of showing "Calculating..." forever.
+        if done_count > 0:
+            est_total_time = elapsed * total_jobs / max(1, done_count)
+            smooth_pct = min(99.9, 100.0 * elapsed / max(0.001, est_total_time))
+        else:
+            eta_fps = max(1.0, float(getattr(settings, "eta_fps", 286.0)))
+            est_total_time = max(0.001, total_frames / eta_fps)
+            smooth_pct = min(99.0, 100.0 * elapsed / est_total_time)
+
+        if active_count == 0:
+            smooth_pct = 100.0
+            eta_str = "00:00"
+        else:
+            eta_left = max(0.0, est_total_time - elapsed)
+            eta_str = fmt_time(eta_left)
+
+        est_frames = min(total_frames, int(total_frames * smooth_pct / 100.0))
+        bar_w = 28
+        fill = int(bar_w * smooth_pct / 100.0)
+        bar = "#" * fill + "-" * (bar_w - fill)
+
         sys.stdout.write(
-            f"\r[Time: {fmt_time(elapsed)}] | Cores Active: {active_count}/{len(processes)} | Chunks Done: {done_count} | Predicted ETA: {eta_str}"
+            f"\r[Time: {fmt_time(elapsed)}] [{bar}] {smooth_pct:5.1f}% | "
+            f"~frames {est_frames}/{total_frames} | active {active_count}/{len(processes)} | "
+            f"chunks {done_count}/{len(processes)} | ETA {eta_str}                    "
         )
         sys.stdout.flush()
 
@@ -574,38 +730,110 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
             break
         time.sleep(1)
 
+    if "ffmpeg_processes" in locals():
+        for _i, _fp in enumerate(ffmpeg_processes):
+            _rc = _fp.wait()
+            if _rc != 0:
+                raise SystemExit(f"FFmpeg slice worker {_i} failed with exit code {_rc}.")
     final_time = time.time() - start_time
     print("\n============================================================")
     print(f"TOTAL ENCODER RUNTIME: {fmt_time(final_time)} | Speed: {total_frames / final_time:.1f} fps")
     print("============================================================")
 
+
+    if make_m2y2:
+        print()
+        print("============================================================")
+        print("Parallel Engine: Range-coding video slices to M2Y2 in parallel")
+        print("============================================================")
+
+        def _m2y2_one(pair):
+            idx, src_path = pair
+            dst_path = src_path.with_name(src_path.stem + ".m2y2slice")
+            transcode_to_m2y2(src_path, dst_path)
+            src_path.unlink(missing_ok=True)
+            return idx, dst_path
+
+        new_chunk_outputs = [None] * len(chunk_outputs)
+        m2_start = time.time()
+        max_m2_jobs = min(len(chunk_outputs), max(1, getattr(settings, "jobs", len(chunk_outputs))))
+
+        with ThreadPoolExecutor(max_workers=max_m2_jobs) as pool:
+            futures = [pool.submit(_m2y2_one, (idx, path)) for idx, path in enumerate(chunk_outputs)]
+            done = 0
+            for fut in as_completed(futures):
+                idx, dst_path = fut.result()
+                new_chunk_outputs[idx] = dst_path
+                done += 1
+                elapsed_m2 = time.time() - m2_start
+                print(f"M2Y2 slice {done}/{len(chunk_outputs)} done in {fmt_time(elapsed_m2)}", flush=True)
+
+        chunk_outputs = new_chunk_outputs
+        print(f"Parallel Engine: Parallel slice M2Y2 complete in {fmt_time(time.time() - m2_start)}.")
+
     print("Parallel Engine: Patching headers and reconstructing container streams...")
+
+    def _mivf_first_page_offset(blob: bytes) -> int:
+        if len(blob) < 44 or blob[:4] != b"MIVF":
+            raise SystemExit("Bad MIVF chunk: missing header.")
+        first = le64(blob, 36)
+        if first < 64 or first > len(blob):
+            raise SystemExit(f"Bad MIVF chunk: invalid first-page offset {first}.")
+        return first
+
     with temp_video_only.open("wb") as out_file:
         first_chunk = chunk_outputs[0].read_bytes()
-        header = bytearray(first_chunk[:96])
+        first_payload_offset = _mivf_first_page_offset(first_chunk)
 
-        chunk_duration = (total_frames // cores) * 30000 // settings.fps
+        # Copy the actual header + stream descriptors.
+        header = bytearray(first_chunk[:first_payload_offset])
+
+        # Patch duration-looking u64 fields from first chunk duration to full duration.
+        first_chunk_frames = chunk_frame_counts[0] if chunk_frame_counts else total_frames
+        chunk_duration = first_chunk_frames * 30000 // settings.fps
         total_duration = total_frames * 30000 // settings.fps
         chunk_dur_bytes = struct.pack("<Q", chunk_duration)
         total_dur_bytes = struct.pack("<Q", total_duration)
-        idx = header.find(chunk_dur_bytes)
-        if idx != -1:
+
+        search_pos = 0
+        patches = 0
+        while True:
+            idx = header.find(chunk_dur_bytes, search_pos)
+            if idx == -1:
+                break
             header[idx:idx + 8] = total_dur_bytes
+            search_pos = idx + 8
+            patches += 1
+
         out_file.write(header)
 
         running_frame_idx = 0
-        for chunk_mivf in chunk_outputs:
+
+        for chunk_index, chunk_mivf in enumerate(chunk_outputs):
             data = chunk_mivf.read_bytes()
-            offset = 96
+            offset = _mivf_first_page_offset(data)
             file_len = len(data)
 
-            while offset < file_len:
+            while offset + 32 <= file_len:
+                if data[offset:offset + 2] != b"MP":
+                    break
+
                 page_header = bytearray(data[offset:offset + 32])
                 payload_size = struct.unpack_from("<I", page_header, 16)[0]
+
+                if offset + 32 + payload_size > file_len:
+                    raise SystemExit(
+                        f"Bad MIVF page while merging chunk {chunk_index}: "
+                        f"offset={offset} payload={payload_size} file_len={file_len}"
+                    )
+
+                # Rewrite each chunk-local page/frame timestamp into one global timeline.
                 wr_u32le(page_header, 4, running_frame_idx)
                 wr_u64le(page_header, 8, running_frame_idx * 30000 // settings.fps)
+
                 out_file.write(page_header)
                 out_file.write(data[offset + 32:offset + 32 + payload_size])
+
                 offset += 32 + payload_size
                 running_frame_idx += 1
 
@@ -613,6 +841,9 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
         chunk_mivf.unlink(missing_ok=True)
 
     print(f"Parallel Engine: Master container unified with {running_frame_idx} sequential frames.")
+
+    if running_frame_idx != total_frames:
+        print(f"WARNING: merged frame count {running_frame_idx} != expected {total_frames}")
 
 
 def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate: int, channels: int, workdir: Path) -> None:
@@ -715,13 +946,7 @@ def find_m2y2_transcoder() -> Path | None:
 
 
 def transcode_to_m2y2(src: Path, dst: Path) -> None:
-    """Losslessly range-code an M2Y1 .mivf into the smaller M2Y2 codec.
-
-    Reuses the self-verifying native transcoder (tools/m2y2_transcode.c). It
-    checks every converted packet byte-for-byte against the original and exits
-    non-zero on any mismatch, so a clean exit guarantees identical decoded
-    quality with a smaller file.
-    """
+    """Losslessly range-code an M2Y1 .mivf into the smaller M2Y2 codec."""
     exe = find_m2y2_transcoder()
     if exe is None:
         raise SystemExit(
@@ -741,6 +966,10 @@ def transcode_to_m2y2(src: Path, dst: Path) -> None:
             sys.stderr.write(result.stderr)
         raise SystemExit(f"M2Y2 transcode failed (exit code {result.returncode}).")
 
+
+
+def deploy_output(output_path):
+    print(f"Deploy skipped: {output_path}")
 
 def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, deploy_sd: bool, make_m2y2: bool = False) -> None:
     workdir = make_temp_workdir()
@@ -762,7 +991,7 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
         print("============================================================")
         print("2. Splitting and Compressing Video Streams (Multi-Core Cluster Engine)")
         print("============================================================")
-        build_parallel_mivf(workdir, source_path, temp_video_only, settings, source_is_raw_yuv)
+        build_parallel_mivf(workdir, source_path, temp_video_only, settings, source_is_raw_yuv, make_m2y2=make_m2y2)
 
         print()
         print("============================================================")
@@ -770,7 +999,7 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
         print("============================================================")
         mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir)
 
-        if make_m2y2:
+        if make_m2y2 and False:
             print()
             print("============================================================")
             print("4. Range-coding video to M2Y2 (lossless, smaller file)")
@@ -824,6 +1053,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--c-delta", type=int, default=DEFAULT_C_DELTA)
     parser.add_argument("--mv-range", type=int, default=DEFAULT_MV_RANGE)
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, choices=[4, 8, 16], help="transform coefficients kept per 4x4 quadrant: 16=HD detail (default), 4=small legacy files")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel slice workers, default {DEFAULT_JOBS}")
+    parser.add_argument("--seek-preroll", type=float, default=DEFAULT_SEEK_PREROLL, help=f"seconds before each slice to seek for hybrid accurate slicing, default {DEFAULT_SEEK_PREROLL}")
+    parser.add_argument("--eta-fps", type=float, default=DEFAULT_ETA_FPS, help=f"smooth ETA estimated encode fps, default {DEFAULT_ETA_FPS}")
     parser.add_argument("--no-deploy", action="store_true", help="skip SD card deployment")
     parser.add_argument("--m2y2", action="store_true", help="range-code video to the smaller M2Y2 codec (lossless, approximately 20 percent smaller)")
     return parser
@@ -849,6 +1081,9 @@ def main() -> None:
         c_delta=args.c_delta,
         mv_range=args.mv_range,
         keep=args.keep,
+        jobs=args.jobs,
+        seek_preroll=args.seek_preroll,
+        eta_fps=args.eta_fps,
     )
 
     input_path = Path(args.input)
