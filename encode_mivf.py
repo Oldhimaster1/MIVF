@@ -186,6 +186,37 @@ def fmt_time(secs: float) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def read_mivf_first_page_offset(path: Path | str) -> int:
+    with Path(path).open("rb") as handle:
+        header = handle.read(64)
+    if len(header) < 64 or header[:4] != b"MIVF":
+        raise SystemExit(f"Bad MIVF header in {path}")
+    first = struct.unpack_from("<Q", header, 36)[0]
+    if first < 64 or first > 1 << 30:
+        raise SystemExit(f"Bad MIVF first-page offset {first} in {path}")
+    return int(first)
+
+
+def count_mivf_frames(path: Path | str) -> int:
+    path = Path(path)
+    first_page_offset = read_mivf_first_page_offset(path)
+    count = 0
+    with path.open("rb") as handle:
+        handle.seek(first_page_offset)
+        while True:
+            page_header = handle.read(PAGE_HEADER_SIZE)
+            if not page_header:
+                break
+            if len(page_header) < PAGE_HEADER_SIZE:
+                raise SystemExit(f"Truncated MIVF page header in {path}")
+            if page_header[:2] != b"MP":
+                break
+            payload_size = struct.unpack_from("<I", page_header, 16)[0]
+            handle.seek(payload_size, os.SEEK_CUR)
+            count += 1
+    return count
+
+
 def clamp_s16(value: int) -> int:
     return max(-32768, min(32767, int(value)))
 
@@ -499,7 +530,7 @@ def wr_header(template: bytes, streams: int, first: int) -> bytes:
     return bytes(buf)
 
 
-def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path, settings: EncodeSettings, source_is_raw_yuv: bool, make_m2y2: bool = False) -> None:
+def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path, settings: EncodeSettings, source_is_raw_yuv: bool, make_m2y2: bool = False, inline_m2y2: bool = True) -> tuple[int, float, float, float]:
     # Run the helper binary directly from its safe extraction path instead of
     # copying it into a temp directory where Windows Defender may interfere.
     helper = mivf_helper_path()
@@ -512,7 +543,6 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
         print("Parallel Engine: Probing source video frame count...")
         total_frames = probe_video_frame_count(source_path)
 
-    # Parallel mode restored: cap at 8 workers.
     cores = min(max(1, settings.jobs), cpu_count(), total_frames if total_frames > 0 else 1)
     print(f"Parallel Engine: Slicing raw data across {cores} CPU Core Clusters...")
 
@@ -585,7 +615,6 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
         for idx, chunk_mivf in enumerate(chunk_outputs):
             num_frames = chunk_frame_counts[idx]
             start_time_sec = start_frame / float(settings.fps)
-            duration_sec = num_frames / float(settings.fps)
             start_frame += num_frames
 
             cmd = [
@@ -632,10 +661,6 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
             processes.append(helper_proc)
 
             ffmpeg = mivf_ffmpeg_path()
-            # Hybrid fast+accurate slicing:
-            # 1. Input-side -ss seeks near the slice quickly.
-            # 2. trim=start=... accurately removes the pre-roll frames.
-            # This avoids decoding from the beginning of the movie for later slices.
             seek_preroll = float(settings.seek_preroll)
             seek_start_sec = max(0.0, start_time_sec - seek_preroll)
             trim_start_sec = start_time_sec - seek_start_sec
@@ -682,47 +707,47 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
                 stderr=subprocess.DEVNULL,
             )
 
-            # Parent must close its copy so helper sees EOF when ffmpeg exits.
             helper_proc.stdin.close()
             ffmpeg_processes.append(ffmpeg_proc)
 
     print(f"Parallel Engine: Launching {len(processes)} concurrent compression instances at full throttle...")
-    start_time = time.time()
+    encode_start = time.perf_counter()
+    progress_pct = 0.0
 
     while True:
         active = [proc for proc in processes if proc.poll() is None]
         active_count = len(active)
         done_count = len(processes) - active_count
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - encode_start
 
         total_jobs = max(1, len(processes))
-
-        # Smooth non-chunk ETA. Before any chunk finishes, estimate progress
-        # from benchmark FPS instead of showing "Calculating..." forever.
         if done_count > 0:
             est_total_time = elapsed * total_jobs / max(1, done_count)
-            smooth_pct = min(99.9, 100.0 * elapsed / max(0.001, est_total_time))
+            est_pct = min(85.0, 100.0 * elapsed / max(0.001, est_total_time))
+            real_pct = 100.0 * done_count / total_jobs
+            display_pct = max(progress_pct, real_pct if done_count > 0 else est_pct)
         else:
             eta_fps = max(1.0, float(getattr(settings, "eta_fps", 286.0)))
             est_total_time = max(0.001, total_frames / eta_fps)
-            smooth_pct = min(99.0, 100.0 * elapsed / est_total_time)
+            est_pct = min(85.0, 100.0 * elapsed / est_total_time)
+            display_pct = max(progress_pct, est_pct)
+
+        progress_pct = display_pct
 
         if active_count == 0:
-            smooth_pct = 100.0
+            display_pct = 100.0
             eta_str = "00:00"
         else:
             eta_left = max(0.0, est_total_time - elapsed)
             eta_str = fmt_time(eta_left)
 
-        est_frames = min(total_frames, int(total_frames * smooth_pct / 100.0))
         bar_w = 28
-        fill = int(bar_w * smooth_pct / 100.0)
+        fill = int(bar_w * display_pct / 100.0)
         bar = "#" * fill + "-" * (bar_w - fill)
 
         sys.stdout.write(
-            f"\r[Time: {fmt_time(elapsed)}] [{bar}] {smooth_pct:5.1f}% | "
-            f"~frames {est_frames}/{total_frames} | active {active_count}/{len(processes)} | "
-            f"chunks {done_count}/{len(processes)} | ETA {eta_str}                    "
+            f"\r[Time: {fmt_time(elapsed)}] [{bar}] est {display_pct:5.1f}% | "
+            f"chunks {done_count}/{len(processes)} | workers {active_count}/{len(processes)} | ETA {eta_str}                    "
         )
         sys.stdout.flush()
 
@@ -735,13 +760,13 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
             _rc = _fp.wait()
             if _rc != 0:
                 raise SystemExit(f"FFmpeg slice worker {_i} failed with exit code {_rc}.")
-    final_time = time.time() - start_time
+
+    encode_elapsed = time.perf_counter() - encode_start
     print("\n============================================================")
-    print(f"TOTAL ENCODER RUNTIME: {fmt_time(final_time)} | Speed: {total_frames / final_time:.1f} fps")
+    print(f"TOTAL ENCODER RUNTIME: {fmt_time(encode_elapsed)} | Speed: {total_frames / max(encode_elapsed, 0.001):.1f} fps")
     print("============================================================")
 
-
-    if make_m2y2:
+    if make_m2y2 and inline_m2y2:
         print()
         print("============================================================")
         print("Parallel Engine: Range-coding video slices to M2Y2 in parallel")
@@ -755,7 +780,7 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
             return idx, dst_path
 
         new_chunk_outputs = [None] * len(chunk_outputs)
-        m2_start = time.time()
+        m2_start = time.perf_counter()
         max_m2_jobs = min(len(chunk_outputs), max(1, getattr(settings, "jobs", len(chunk_outputs))))
 
         with ThreadPoolExecutor(max_workers=max_m2_jobs) as pool:
@@ -765,30 +790,26 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
                 idx, dst_path = fut.result()
                 new_chunk_outputs[idx] = dst_path
                 done += 1
-                elapsed_m2 = time.time() - m2_start
+                elapsed_m2 = time.perf_counter() - m2_start
                 print(f"M2Y2 slice {done}/{len(chunk_outputs)} done in {fmt_time(elapsed_m2)}", flush=True)
 
         chunk_outputs = new_chunk_outputs
-        print(f"Parallel Engine: Parallel slice M2Y2 complete in {fmt_time(time.time() - m2_start)}.")
+        m2y2_elapsed = time.perf_counter() - m2_start
+        print(f"Parallel Engine: Parallel slice M2Y2 complete in {fmt_time(m2y2_elapsed)}.")
+    else:
+        m2y2_elapsed = 0.0
+        if make_m2y2:
+            print("Parallel Engine: Inline M2Y2 disabled; running the final full-file M2Y2 pass later.")
 
     print("Parallel Engine: Patching headers and reconstructing container streams...")
-
-    def _mivf_first_page_offset(blob: bytes) -> int:
-        if len(blob) < 44 or blob[:4] != b"MIVF":
-            raise SystemExit("Bad MIVF chunk: missing header.")
-        first = le64(blob, 36)
-        if first < 64 or first > len(blob):
-            raise SystemExit(f"Bad MIVF chunk: invalid first-page offset {first}.")
-        return first
+    merge_start = time.perf_counter()
 
     with temp_video_only.open("wb") as out_file:
-        first_chunk = chunk_outputs[0].read_bytes()
-        first_payload_offset = _mivf_first_page_offset(first_chunk)
+        first_chunk_path = chunk_outputs[0]
+        first_payload_offset = read_mivf_first_page_offset(first_chunk_path)
+        with first_chunk_path.open("rb") as first_chunk:
+            header = bytearray(first_chunk.read(first_payload_offset))
 
-        # Copy the actual header + stream descriptors.
-        header = bytearray(first_chunk[:first_payload_offset])
-
-        # Patch duration-looking u64 fields from first chunk duration to full duration.
         first_chunk_frames = chunk_frame_counts[0] if chunk_frame_counts else total_frames
         chunk_duration = first_chunk_frames * 30000 // settings.fps
         total_duration = total_frames * 30000 // settings.fps
@@ -796,132 +817,132 @@ def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path,
         total_dur_bytes = struct.pack("<Q", total_duration)
 
         search_pos = 0
-        patches = 0
         while True:
             idx = header.find(chunk_dur_bytes, search_pos)
             if idx == -1:
                 break
             header[idx:idx + 8] = total_dur_bytes
             search_pos = idx + 8
-            patches += 1
 
         out_file.write(header)
 
         running_frame_idx = 0
-
         for chunk_index, chunk_mivf in enumerate(chunk_outputs):
-            data = chunk_mivf.read_bytes()
-            offset = _mivf_first_page_offset(data)
-            file_len = len(data)
+            with chunk_mivf.open("rb") as handle:
+                handle.seek(first_payload_offset)
+                while True:
+                    page_header = handle.read(PAGE_HEADER_SIZE)
+                    if not page_header:
+                        break
+                    if len(page_header) < PAGE_HEADER_SIZE:
+                        raise SystemExit(f"Truncated MIVF page header in {chunk_mivf}")
+                    if page_header[:2] != b"MP":
+                        break
 
-            while offset + 32 <= file_len:
-                if data[offset:offset + 2] != b"MP":
-                    break
+                    payload_size = struct.unpack_from("<I", page_header, 16)[0]
+                    page_payload = handle.read(payload_size)
+                    if len(page_payload) != payload_size:
+                        raise SystemExit(
+                            f"Bad MIVF page while merging chunk {chunk_index}: "
+                            f"offset={handle.tell()} payload={payload_size} file_len={chunk_mivf.stat().st_size}"
+                        )
 
-                page_header = bytearray(data[offset:offset + 32])
-                payload_size = struct.unpack_from("<I", page_header, 16)[0]
-
-                if offset + 32 + payload_size > file_len:
-                    raise SystemExit(
-                        f"Bad MIVF page while merging chunk {chunk_index}: "
-                        f"offset={offset} payload={payload_size} file_len={file_len}"
-                    )
-
-                # Rewrite each chunk-local page/frame timestamp into one global timeline.
-                wr_u32le(page_header, 4, running_frame_idx)
-                wr_u64le(page_header, 8, running_frame_idx * 30000 // settings.fps)
-
-                out_file.write(page_header)
-                out_file.write(data[offset + 32:offset + 32 + payload_size])
-
-                offset += 32 + payload_size
-                running_frame_idx += 1
+                    page_header = bytearray(page_header)
+                    wr_u32le(page_header, 4, running_frame_idx)
+                    wr_u64le(page_header, 8, running_frame_idx * 30000 // settings.fps)
+                    out_file.write(page_header)
+                    out_file.write(page_payload)
+                    running_frame_idx += 1
 
     for chunk_mivf in chunk_outputs:
         chunk_mivf.unlink(missing_ok=True)
 
+    merge_elapsed = time.perf_counter() - merge_start
     print(f"Parallel Engine: Master container unified with {running_frame_idx} sequential frames.")
 
     if running_frame_idx != total_frames:
         print(f"WARNING: merged frame count {running_frame_idx} != expected {total_frames}")
+
+    return total_frames, encode_elapsed, merge_elapsed, m2y2_elapsed
 
 
 def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate: int, channels: int, workdir: Path) -> None:
     if channels != 1:
         raise SystemExit("IA4M mux currently supports mono only")
 
-    data = video_mivf.read_bytes()
-    if data[:4] != b"MIVF":
-        raise SystemExit("not MIVF")
+    with video_mivf.open("rb") as handle:
+        header = handle.read(64)
+        if header[:4] != b"MIVF":
+            raise SystemExit("not MIVF")
 
-    streams = le32(data, 28)
-    first_old = le64(data, 36)
-    if streams != 1:
-        raise SystemExit(f"expected video-only MIVF with 1 stream, got {streams}")
+        streams = le32(header, 28)
+        first_old = le64(header, 36)
+        if streams != 1:
+            raise SystemExit(f"expected video-only MIVF with 1 stream, got {streams}")
 
-    desc0 = data[64:first_old]
-    fpsn = le16(desc0, 20) or DEFAULT_FPS
-    fpsd = le16(desc0, 22) or 1
-    samples_per_frame = rate * fpsd // fpsn
+        desc0 = handle.read(first_old - 64)
+        fpsn = le16(desc0, 20) or DEFAULT_FPS
+        fpsd = le16(desc0, 22) or 1
+        samples_per_frame = rate * fpsd // fpsn
 
-    extra = b"IA4M" + struct.pack("<IHHI", rate, channels, samples_per_frame, 0)
-    if len(extra) != 16:
-        raise AssertionError(len(extra))
+        extra = b"IA4M" + struct.pack("<IHHI", rate, channels, samples_per_frame, 0)
+        if len(extra) != 16:
+            raise AssertionError(len(extra))
 
-    desc1 = make_stream_desc(1, 2, b"IA4M", rate, channels, samples_per_frame, 1, extra)
-    first_new = HEADER_SIZE + len(desc0) + len(desc1)
+        desc1 = make_stream_desc(1, 2, b"IA4M", rate, channels, samples_per_frame, 1, extra)
+        first_new = HEADER_SIZE + len(desc0) + len(desc1)
 
-    pcm_path = extract_pcm16(audio_src, rate, channels, workdir)
-    pcm = read_pcm16(pcm_path)
+        pcm_path = extract_pcm16(audio_src, rate, channels, workdir)
+        pcm = read_pcm16(pcm_path)
 
-    pages = bytearray()
-    offset = first_old
-    frame_no = 0
+        with out_path.open("wb") as out_handle:
+            out_handle.write(wr_header(header, 2, first_new))
+            out_handle.write(desc0)
+            out_handle.write(desc1)
 
-    while offset + PAGE_HEADER_SIZE <= len(data):
-        if data[offset:offset + 2] != b"MP":
-            break
+            frame_no = 0
+            while True:
+                page_header = handle.read(PAGE_HEADER_SIZE)
+                if not page_header:
+                    break
+                if len(page_header) < PAGE_HEADER_SIZE:
+                    raise SystemExit(f"truncated MIVF page header in {video_mivf}")
+                if page_header[:2] != b"MP":
+                    break
 
-        page_flags = data[offset + 3]
-        page_seq = le32(data, offset + 4)
-        page_pts = le64(data, offset + 8)
-        payload_size = le32(data, offset + 16)
-        packets = le16(data, offset + 20)
-        reserved = le16(data, offset + 22)
-        payload = data[offset + PAGE_HEADER_SIZE:offset + PAGE_HEADER_SIZE + payload_size]
+                payload_size = le32(page_header, 16)
+                payload = handle.read(payload_size)
+                if len(payload) != payload_size:
+                    raise SystemExit(f"truncated MIVF page payload in {video_mivf}")
 
-        start = frame_no * samples_per_frame
-        end = start + samples_per_frame
-        samples = pcm[start:end]
-        if len(samples) < samples_per_frame:
-            samples += [0] * (samples_per_frame - len(samples))
+                start = frame_no * samples_per_frame
+                end = start + samples_per_frame
+                samples = pcm[start:end]
+                if len(samples) < samples_per_frame:
+                    samples += [0] * (samples_per_frame - len(samples))
 
-        abody = encode_ia4m_packet(samples, frame_no)
-        apkt = struct.pack("<BBHIII", 1, 0, PACKET_HEADER_SIZE, 0, len(abody), frame_no) + abody
+                abody = encode_ia4m_packet(samples, frame_no)
+                apkt = struct.pack("<BBHIII", 1, 0, PACKET_HEADER_SIZE, 0, len(abody), frame_no) + abody
+                new_payload = payload + apkt
+                crc = zlib.crc32(new_payload) & 0xFFFFFFFF
 
-        new_payload = payload + apkt
-        crc = zlib.crc32(new_payload) & 0xFFFFFFFF
+                page = struct.pack(
+                    "<2sBBIQIHHII",
+                    b"MP",
+                    PAGE_HEADER_SIZE,
+                    page_header[3],
+                    le32(page_header, 4),
+                    le64(page_header, 8),
+                    len(new_payload),
+                    le16(page_header, 20) + 1,
+                    le16(page_header, 22),
+                    crc,
+                    0,
+                )
 
-        page = struct.pack(
-            "<2sBBIQIHHII",
-            b"MP",
-            PAGE_HEADER_SIZE,
-            page_flags,
-            page_seq,
-            page_pts,
-            len(new_payload),
-            packets + 1,
-            reserved,
-            crc,
-            0,
-        )
-
-        pages += page + new_payload
-        offset += PAGE_HEADER_SIZE + payload_size
-        frame_no += 1
-
-    header = wr_header(data[:64], 2, first_new)
-    out_path.write_bytes(header + desc0 + desc1 + pages)
+                out_handle.write(page)
+                out_handle.write(new_payload)
+                frame_no += 1
 
     print(f"WROTE {out_path}")
     print(f"frames={frame_no} audio={rate}Hz channels={channels} samples/frame={samples_per_frame} bytes={out_path.stat().st_size}")
@@ -971,7 +992,7 @@ def transcode_to_m2y2(src: Path, dst: Path) -> None:
 def deploy_output(output_path):
     print(f"Deploy skipped: {output_path}")
 
-def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, deploy_sd: bool, make_m2y2: bool = False) -> None:
+def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, deploy_sd: bool, make_m2y2: bool = False, inline_m2y2: bool = True) -> None:
     workdir = make_temp_workdir()
     try:
         temp_video_only = workdir / "temp_video_only.mivf"
@@ -991,22 +1012,58 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
         print("============================================================")
         print("2. Splitting and Compressing Video Streams (Multi-Core Cluster Engine)")
         print("============================================================")
-        build_parallel_mivf(workdir, source_path, temp_video_only, settings, source_is_raw_yuv, make_m2y2=make_m2y2)
+        video_start = time.perf_counter()
+        total_frames, video_encode_time, merge_time, m2y2_time = build_parallel_mivf(
+            workdir,
+            source_path,
+            temp_video_only,
+            settings,
+            source_is_raw_yuv,
+            make_m2y2=make_m2y2,
+            inline_m2y2=inline_m2y2,
+        )
+        video_total_time = time.perf_counter() - video_start
 
         print()
         print("============================================================")
         print("3. Multiplexing Compressed 4-bit Audio (mivf_ia4m_mux.py)")
         print("============================================================")
+        audio_start = time.perf_counter()
         mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir)
+        audio_time = time.perf_counter() - audio_start
 
-        if make_m2y2 and False:
+        if make_m2y2 and not inline_m2y2:
             print()
             print("============================================================")
             print("4. Range-coding video to M2Y2 (lossless, smaller file)")
             print("============================================================")
             tmp_m2y2 = output_path.with_name(output_path.stem + ".m2y2tmp")
+            m2y2_start = time.perf_counter()
             transcode_to_m2y2(output_path, tmp_m2y2)
             os.replace(tmp_m2y2, output_path)
+            m2y2_time = time.perf_counter() - m2y2_start
+
+        final_frame_count = count_mivf_frames(output_path)
+        if abs(final_frame_count - total_frames) > 4:
+            raise SystemExit(
+                f"FRAME COUNT DRIFT: expected {total_frames} frames but output has {final_frame_count}"
+            )
+        if final_frame_count != total_frames:
+            print(
+                f"WARNING: final frame count differs by {abs(final_frame_count - total_frames)} frame(s)"
+            )
+
+        print()
+        print("============================================================")
+        print("Pipeline timing summary")
+        print("============================================================")
+        print(f"video encode time : {fmt_time(video_encode_time)}")
+        print(f"merge time        : {fmt_time(merge_time)}")
+        print(f"audio mux time    : {fmt_time(audio_time)}")
+        print(f"M2Y2 time         : {fmt_time(m2y2_time)}")
+        print(f"total pipeline    : {fmt_time(video_encode_time + merge_time + audio_time + m2y2_time)}")
+        print(f"output size       : {output_path.stat().st_size / (1024 * 1024):.2f} MiB")
+        print(f"final frame count : {final_frame_count}")
 
         if deploy_sd:
             deploy_output(output_path)
@@ -1014,7 +1071,7 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def encode_folder(input_dir: Path, output_dir: Path, settings: EncodeSettings, make_m2y2: bool = False) -> None:
+def encode_folder(input_dir: Path, output_dir: Path, settings: EncodeSettings, make_m2y2: bool = False, inline_m2y2: bool = True) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     files = sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
 
@@ -1028,7 +1085,7 @@ def encode_folder(input_dir: Path, output_dir: Path, settings: EncodeSettings, m
         print(f"Encoding: {source}")
         print(f"Output:   {target}")
         print("============================================================")
-        encode_one(source, target, settings, deploy_sd=False, make_m2y2=make_m2y2)
+        encode_one(source, target, settings, deploy_sd=False, make_m2y2=make_m2y2, inline_m2y2=inline_m2y2)
 
     print()
     print(f"Batch encode complete. Outputs are in: {output_dir}")
@@ -1058,6 +1115,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eta-fps", type=float, default=DEFAULT_ETA_FPS, help=f"smooth ETA estimated encode fps, default {DEFAULT_ETA_FPS}")
     parser.add_argument("--no-deploy", action="store_true", help="skip SD card deployment")
     parser.add_argument("--m2y2", action="store_true", help="range-code video to the smaller M2Y2 codec (lossless, approximately 20 percent smaller)")
+    parser.add_argument("--inline-m2y2", dest="inline_m2y2", action="store_true", help="use the per-slice inline M2Y2 path when --m2y2 is enabled")
+    parser.add_argument("--no-inline-m2y2", dest="inline_m2y2", action="store_false", help="skip the per-slice inline M2Y2 path and use a final full-file pass instead")
+    parser.set_defaults(inline_m2y2=True)
     return parser
 
 
@@ -1090,13 +1150,13 @@ def main() -> None:
     output_path = Path(args.output)
 
     if input_path.is_dir():
-        encode_folder(input_path, output_path, settings, make_m2y2=args.m2y2)
+        encode_folder(input_path, output_path, settings, make_m2y2=args.m2y2, inline_m2y2=args.inline_m2y2 and args.m2y2)
         return
 
     if not input_path.exists():
         raise SystemExit(f"Input file not found: {input_path}")
 
-    encode_one(input_path, output_path, settings, deploy_sd=not args.no_deploy, make_m2y2=args.m2y2)
+    encode_one(input_path, output_path, settings, deploy_sd=not args.no_deploy, make_m2y2=args.m2y2, inline_m2y2=args.inline_m2y2 and args.m2y2)
 
 
 if __name__ == "__main__":
