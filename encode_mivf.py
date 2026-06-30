@@ -196,6 +196,80 @@ def run_ffmpeg_extract(input_path: Path, output_path: Path, settings: EncodeSett
     subprocess.run(ffmpeg_cmd, check=True)
 
 
+def find_ffprobe_path() -> str:
+    candidates = [
+        resource_dir() / "ffprobe.exe",
+        resource_dir() / "ffprobe",
+        Path(sys.executable).resolve().parent / "ffprobe.exe",
+        Path(sys.executable).resolve().parent / "ffprobe",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    found = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
+    if found:
+        return found
+
+    raise FileNotFoundError(
+        "FFprobe was not found. Install ffprobe, add it to PATH, or place ffprobe.exe next to encode_mivf.exe / encode_mivf.py."
+    )
+
+
+def probe_video_frame_count(input_path: Path) -> int:
+    ffprobe = find_ffprobe_path()
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-count_frames",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_read_frames",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        str(input_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    output = result.stdout.strip()
+    if not output:
+        raise SystemExit("Unable to determine total video frame count from input.")
+
+    for line in output.splitlines():
+        if line.strip():
+            try:
+                frames = int(line.strip())
+            except ValueError:
+                continue
+            if frames > 0:
+                return frames
+
+    raise SystemExit("Unable to parse frame count from ffprobe output.")
+
+
+def run_ffmpeg_extract_to_stream(input_path: Path, settings: EncodeSettings) -> subprocess.Popen[bytes]:
+    ffmpeg = mivf_ffmpeg_path()
+    ffmpeg_cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"scale={settings.width}:{settings.height},format=yuv420p",
+        "-vsync",
+        "0",
+        "-f",
+        "rawvideo",
+        "pipe:1",
+    ]
+    return subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
 def ima_encode_nibble(sample: int, predictor: int, index: int) -> tuple[int, int, int]:
     step = IMA_STEP_TABLE[index]
     diff = int(sample) - predictor
@@ -326,12 +400,16 @@ def wr_header(template: bytes, streams: int, first: int) -> bytes:
     return bytes(buf)
 
 
-def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: Path, settings: EncodeSettings) -> None:
+def build_parallel_mivf(workdir: Path, source_path: Path, temp_video_only: Path, settings: EncodeSettings, source_is_raw_yuv: bool) -> None:
     helper = copy_helper_binary(workdir)
-
-    total_bytes = temp_master_yuv.stat().st_size
     frame_size = settings.width * settings.height + (settings.width // 2) * (settings.height // 2) * 2
-    total_frames = total_bytes // frame_size
+
+    if source_is_raw_yuv:
+        total_bytes = source_path.stat().st_size
+        total_frames = total_bytes // frame_size
+    else:
+        print("Parallel Engine: Probing source video frame count...")
+        total_frames = probe_video_frame_count(source_path)
 
     cores = cpu_count()
     print(f"Parallel Engine: Slicing raw data across {cores} CPU Core Clusters...")
@@ -341,63 +419,144 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
         cores = 1
         frames_per_core = total_frames
 
-    chunk_files: list[Path] = []
     chunk_outputs: list[Path] = []
     processes: list[subprocess.Popen[bytes]] = []
+    chunk_frame_counts: list[int] = []
 
-    with temp_master_yuv.open("rb") as source:
-        for idx in range(cores):
-            num_frames = frames_per_core if idx < cores - 1 else total_frames - (frames_per_core * idx)
-            if num_frames <= 0:
-                break
+    for idx in range(cores):
+        num_frames = frames_per_core if idx < cores - 1 else total_frames - (frames_per_core * idx)
+        if num_frames <= 0:
+            break
+        chunk_frame_counts.append(num_frames)
+        chunk_outputs.append(workdir / f"temp_slice_{idx}.mivf")
 
+    if source_is_raw_yuv:
+        with source_path.open("rb") as source:
+            for idx, num_frames in enumerate(chunk_frame_counts):
+                chunk_yuv = workdir / f"temp_slice_{idx}.yuv"
+                chunk_yuv.write_bytes(source.read(num_frames * frame_size))
+
+        print("Parallel Engine: Master raw cache split successfully. Flushing temporary disk space...")
+        source_path.unlink(missing_ok=True)
+
+        for idx in range(len(chunk_frame_counts)):
             chunk_yuv = workdir / f"temp_slice_{idx}.yuv"
-            chunk_mivf = workdir / f"temp_slice_{idx}.mivf"
-            chunk_files.append(chunk_yuv)
-            chunk_outputs.append(chunk_mivf)
-            chunk_yuv.write_bytes(source.read(num_frames * frame_size))
+            cmd = [
+                str(helper),
+                "--input",
+                str(chunk_yuv),
+                "--output",
+                str(chunk_outputs[idx]),
+                "--width",
+                str(settings.width),
+                "--height",
+                str(settings.height),
+                "--fps",
+                str(settings.fps),
+                "--keyint",
+                str(settings.keyint),
+                "--qp",
+                str(settings.qp),
+                "--c-qp-offset",
+                str(settings.c_qp_offset),
+                "--lambda",
+                str(settings.lambda_value),
+                "--y-skip",
+                str(settings.y_skip),
+                "--c-skip",
+                str(settings.c_skip),
+                "--y-delta",
+                str(settings.y_delta),
+                "--c-delta",
+                str(settings.c_delta),
+                "--mv-range",
+                str(settings.mv_range),
+                "--keep",
+                str(settings.keep),
+            ]
+            processes.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=workdir))
+    else:
+        print("Parallel Engine: Launching direct raw video stream into compression instances...")
+        for idx, chunk_mivf in enumerate(chunk_outputs):
+            cmd = [
+                str(helper),
+                "--input",
+                "-",
+                "--output",
+                str(chunk_mivf),
+                "--width",
+                str(settings.width),
+                "--height",
+                str(settings.height),
+                "--fps",
+                str(settings.fps),
+                "--keyint",
+                str(settings.keyint),
+                "--qp",
+                str(settings.qp),
+                "--c-qp-offset",
+                str(settings.c_qp_offset),
+                "--lambda",
+                str(settings.lambda_value),
+                "--y-skip",
+                str(settings.y_skip),
+                "--c-skip",
+                str(settings.c_skip),
+                "--y-delta",
+                str(settings.y_delta),
+                "--c-delta",
+                str(settings.c_delta),
+                "--mv-range",
+                str(settings.mv_range),
+                "--keep",
+                str(settings.keep),
+            ]
+            processes.append(subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=workdir))
 
-    print("Parallel Engine: Master raw cache split successfully. Flushing temporary disk space...")
-    temp_master_yuv.unlink(missing_ok=True)
+        ffmpeg_proc = run_ffmpeg_extract_to_stream(source_path, settings)
+        if ffmpeg_proc.stdout is None:
+            raise SystemExit("FFmpeg streaming output was not available.")
 
-    print(f"Parallel Engine: Launching {len(chunk_files)} concurrent compression instances at full throttle...")
+        try:
+            current_chunk = 0
+            remaining_frames = chunk_frame_counts[current_chunk]
+            current_stdin = processes[current_chunk].stdin
+            frame_buffer = bytearray(frame_size)
+
+            while remaining_frames > 0:
+                view = memoryview(frame_buffer)
+                read_offset = 0
+                while read_offset < frame_size:
+                    chunk = ffmpeg_proc.stdout.read(frame_size - read_offset)
+                    if not chunk:
+                        break
+                    view[read_offset:read_offset + len(chunk)] = chunk
+                    read_offset += len(chunk)
+
+                if read_offset == 0:
+                    break
+                if read_offset != frame_size:
+                    raise SystemExit("Short raw video frame read from ffmpeg stream.")
+
+                assert current_stdin is not None
+                current_stdin.write(frame_buffer)
+                remaining_frames -= 1
+
+                if remaining_frames == 0:
+                    current_stdin.close()
+                    current_chunk += 1
+                    if current_chunk < len(chunk_frame_counts):
+                        remaining_frames = chunk_frame_counts[current_chunk]
+                        current_stdin = processes[current_chunk].stdin
+
+            ffmpeg_proc.wait()
+            if ffmpeg_proc.returncode != 0:
+                raise SystemExit("FFmpeg failed during raw video streaming.")
+        except BrokenPipeError:
+            raise SystemExit("Encoder helper closed unexpectedly while streaming raw frames.")
+
+    print(f"Parallel Engine: Launching {len(processes)} concurrent compression instances at full throttle...")
     start_time = time.time()
-
-    for idx, chunk_file in enumerate(chunk_files):
-        cmd = [
-            str(helper),
-            "--input",
-            str(chunk_file),
-            "--output",
-            str(chunk_outputs[idx]),
-            "--width",
-            str(settings.width),
-            "--height",
-            str(settings.height),
-            "--fps",
-            str(settings.fps),
-            "--keyint",
-            str(settings.keyint),
-            "--qp",
-            str(settings.qp),
-            "--c-qp-offset",
-            str(settings.c_qp_offset),
-            "--lambda",
-            str(settings.lambda_value),
-            "--y-skip",
-            str(settings.y_skip),
-            "--c-skip",
-            str(settings.c_skip),
-            "--y-delta",
-            str(settings.y_delta),
-            "--c-delta",
-            str(settings.c_delta),
-            "--mv-range",
-            str(settings.mv_range),
-            "--keep",
-            str(settings.keep),
-        ]
-        processes.append(subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=workdir))
 
     while True:
         active = [proc for proc in processes if proc.poll() is None]
@@ -450,8 +609,7 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
                 offset += 32 + payload_size
                 running_frame_idx += 1
 
-    for chunk_file, chunk_mivf in zip(chunk_files, chunk_outputs):
-        chunk_file.unlink(missing_ok=True)
+    for chunk_mivf in chunk_outputs:
         chunk_mivf.unlink(missing_ok=True)
 
     print(f"Parallel Engine: Master container unified with {running_frame_idx} sequential frames.")
@@ -538,30 +696,6 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
     print(f"frames={frame_no} audio={rate}Hz channels={channels} samples/frame={samples_per_frame} bytes={out_path.stat().st_size}")
 
 
-def deploy_output(output_path: Path) -> None:
-    sd_card = Path("/d")
-
-    print()
-    print("============================================================")
-    print("Deploying Package to SD Card")
-    print("============================================================")
-
-    if not sd_card.exists():
-        print(f"WARNING: SD Card volume '{sd_card}' not found!")
-        print(f"Your completed file is safe locally at: {output_path}")
-        return
-
-    target_dir = sd_card / "3ds" / "mivf_player_3ds"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    player_3dsx = resource_dir() / "mivf_player_3ds.3dsx"
-    if player_3dsx.exists():
-        shutil.copy2(player_3dsx, target_dir / "mivf_player_3ds.3dsx")
-    else:
-        print(f"WARNING: Bundled 3DS payload not found at {player_3dsx}; skipping 3DS copy.")
-    shutil.copy2(output_path, sd_card / output_path.name)
-    print("DEPLOY SUCCESSFUL!")
-
-
 def find_m2y2_transcoder() -> Path | None:
     """Locate the native m2y2_transcode helper (script or frozen layouts)."""
     here = Path(__file__).resolve().parent
@@ -611,19 +745,24 @@ def transcode_to_m2y2(src: Path, dst: Path) -> None:
 def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, deploy_sd: bool, make_m2y2: bool = False) -> None:
     workdir = make_temp_workdir()
     try:
-        temp_master_yuv = workdir / "temp_master_raw.yuv"
         temp_video_only = workdir / "temp_video_only.mivf"
+        source_is_raw_yuv = input_path.suffix.lower() == ".yuv"
 
         print("============================================================")
-        print("1. Extracting Raw Master Frame Buffer (Clean Demux)")
+        print("1. Preparing Raw Master Frame Buffer")
         print("============================================================")
-        run_ffmpeg_extract(input_path, temp_master_yuv, settings)
+        if source_is_raw_yuv:
+            temp_raw = workdir / "temp_master_raw.yuv"
+            shutil.copy2(input_path, temp_raw)
+            source_path = temp_raw
+        else:
+            source_path = input_path
 
         print()
         print("============================================================")
         print("2. Splitting and Compressing Video Streams (Multi-Core Cluster Engine)")
         print("============================================================")
-        build_parallel_mivf(workdir, temp_master_yuv, temp_video_only, settings)
+        build_parallel_mivf(workdir, source_path, temp_video_only, settings, source_is_raw_yuv)
 
         print()
         print("============================================================")
