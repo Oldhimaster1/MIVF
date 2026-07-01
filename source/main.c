@@ -107,6 +107,8 @@ static const char g_hfix58s_subtitle_version_tag[] __attribute__((used)) =
 #define MIVF_HEADER_SIZE        64
 #define MIVF_STREAM_HEADER_SIZE 64
 
+static u32 g_mivf_stream_stride = MIVF_STREAM_HEADER_SIZE;
+
 #define TOP_W 400
 #define TOP_H 240
 
@@ -250,6 +252,7 @@ typedef struct {
 
 typedef struct {
     bool ready;
+    bool ndsp_ready;
 
     u8 sid;
     u32 rate;
@@ -265,6 +268,85 @@ typedef struct {
 } AudioState;
 
 static AudioState audio;
+
+static u32 g_audio_submit = 0;
+static u32 g_audio_drop = 0;
+static u32 g_last_audio_bytes = 0;
+static u32 g_last_audio_samples = 0;
+static bool g_ndsp_ready = false;
+static bool g_ndsp_init_attempted = false;
+
+#ifndef MIVF_DISABLE_AUDIO
+#define MIVF_DISABLE_AUDIO 0
+#endif
+
+static bool app_audio_system_init(void);
+static void app_audio_system_shutdown(void);
+static void audio_shutdown(void);
+
+static bool audio_can_use_ndsp(void) {
+    return g_ndsp_ready && audio.ready;
+}
+
+static bool audio_dspfirm_available(void) {
+    FILE *f = fopen("sdmc:/3ds/dspfirm.cdc", "rb");
+
+    if (!f) {
+        return false;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    long size = ftell(f);
+    fclose(f);
+    return size > 0;
+}
+
+static bool app_audio_system_init(void) {
+    if (g_ndsp_init_attempted) {
+        return g_ndsp_ready;
+    }
+
+    g_ndsp_init_attempted = true;
+
+#if MIVF_DISABLE_AUDIO
+    printf("app audio: disabled by build flag\n");
+    g_ndsp_ready = false;
+    return false;
+#else
+    printf("app audio: checking DSP firmware\n");
+
+    if (!audio_dspfirm_available()) {
+        printf("app audio: dspfirm.cdc missing or empty\n");
+        printf("audio disabled\n");
+        g_ndsp_ready = false;
+        return false;
+    }
+
+    Result rc = ndspInit();
+
+    if (R_FAILED(rc)) {
+        printf("app audio: ndspInit failed: 0x%08lx\n", (unsigned long)rc);
+        printf("audio disabled\n");
+        g_ndsp_ready = false;
+        return false;
+    }
+
+    g_ndsp_ready = true;
+    printf("app audio: ndspInit ok\n");
+    return true;
+#endif
+}
+
+static void app_audio_system_shutdown(void) {
+    if (g_ndsp_ready) {
+        ndspExit();
+        g_ndsp_ready = false;
+    }
+}
 
 /* HFIX33 display-only deblocking state. */
 static int g_m2y1_display_qp = 28;
@@ -298,65 +380,15 @@ static void mivf_diag_close(void) {
     }
 }
 
-static void mivf_diag_frame(
-    u32 frame,
-    u32 page_no,
-    u32 page_payload,
-    u16 page_packets,
-    u32 ring_kb,
-    u64 page_wait_us,
-    u64 parse_us,
-    u64 blit_us,
-    u64 total_us,
-    u32 video_pkts,
-    u32 audio_pkts,
-    u32 last_audio_bytes,
-    u32 last_audio_samples,
-    u32 audio_submit,
-    u32 audio_drop
-) {
-    if (!g_mivf_diag) {
-        return;
-    }
-
-    fprintf(g_mivf_diag,
-        "%lu,%lu,%lu,%u,%lu,%llu,%llu,%llu,%llu,%lu,%lu,%lu,%lu,%lu,%lu\n",
-        (unsigned long)frame,
-        (unsigned long)page_no,
-        (unsigned long)page_payload,
-        page_packets,
-        (unsigned long)ring_kb,
-        (unsigned long long)page_wait_us,
-        (unsigned long long)parse_us,
-        (unsigned long long)blit_us,
-        (unsigned long long)total_us,
-        (unsigned long)video_pkts,
-        (unsigned long)audio_pkts,
-        (unsigned long)last_audio_bytes,
-        (unsigned long)last_audio_samples,
-        (unsigned long)audio_submit,
-        (unsigned long)audio_drop);
-
-    fflush(g_mivf_diag);
-}
-
-static u32 g_audio_submit = 0;
-static u32 g_audio_drop = 0;
-static u32 g_last_audio_bytes = 0;
-static u32 g_last_audio_samples = 0;
-
-
-static u32 g_mivf_stream_stride = MIVF_STREAM_HEADER_SIZE;
-
-static inline u16 le16(const u8 *p) {
-    return (u16)p[0] | ((u16)p[1] << 8);
-}
-
 static inline u32 le32(const u8 *p) {
     return (u32)p[0] |
            ((u32)p[1] << 8) |
            ((u32)p[2] << 16) |
            ((u32)p[3] << 24);
+}
+
+static inline u16 le16(const u8 *p) {
+    return (u16)p[0] | ((u16)p[1] << 8);
 }
 
 static inline u64 le64(const u8 *p) {
@@ -2462,7 +2494,7 @@ static void hfix59r3_set_settings_open(bool open) {
             g_hfix59r3_resume_after_settings = (g_media_ctl.state == STATE_PLAYING);
             if (g_media_ctl.state == STATE_PLAYING) {
                 g_media_ctl.state = STATE_PAUSED;
-                if (audio.ready) {
+                if (audio_can_use_ndsp()) {
                     ndspChnSetPaused(0, true);
                 }
             }
@@ -2475,7 +2507,7 @@ static void hfix59r3_set_settings_open(bool open) {
         g_hfix59r3_settings_visible = false;
         if (g_hfix59r3_resume_after_settings) {
             g_media_ctl.state = STATE_PLAYING;
-            if (audio.ready) {
+            if (audio_can_use_ndsp()) {
                 ndspChnSetPaused(0, false);
             }
         }
@@ -2516,7 +2548,7 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
             if (g_media_ctl.state == STATE_PLAYING) {
                 g_media_ctl.state = STATE_PAUSED;
                 g_mivf_park_resume_audio = true;
-                if (audio.ready) {
+                if (audio_can_use_ndsp()) {
                     ndspChnSetPaused(0, true);
                 }
             }
@@ -2530,7 +2562,7 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
             if (g_mivf_park_resume_audio) {
                 g_mivf_park_resume_audio = false;
                 g_media_ctl.state = STATE_PLAYING;
-                if (audio.ready) {
+                if (audio_can_use_ndsp()) {
                     ndspChnSetPaused(0, false);
                 }
             }
@@ -2706,7 +2738,7 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
                     (g_mivf_settings.playback_speed_idx + 1u) % (u32)MIVF_SPEED_COUNT;
             }
             pct = mivf_speed_pct();
-            if (audio.ready) {
+            if (audio_can_use_ndsp()) {
                 ndspChnSetRate(0, (float)audio.rate * (float)pct / 100.0f);
             }
             snprintf(value, sizeof(value), "SPEED %lu.%02lux",
@@ -7110,63 +7142,88 @@ static bool audio_parse_stream(const Stream *s) {
     return true;
 }
 
+static void audio_shutdown(void);
+
 static bool audio_init_from_stream(const Stream *s) {
+    if (!s) {
+        return false;
+    }
+
+    audio_shutdown();
+
     if (!audio_parse_stream(s)) {
         return false;
     }
 
-    Result rc = ndspInit();
+    printf("audio stream present\n");
+    printf("audio configured: rate/channels/samples_per_frame=%lu/%u/%lu\n",
+        (unsigned long)audio.rate,
+        (unsigned int)audio.channels,
+        (unsigned long)audio.samples_per_frame);
 
-    if (R_FAILED(rc)) {
-        printf("ndspInit failed: 0x%08lx\n", (unsigned long)rc);
+#if MIVF_DISABLE_AUDIO
+    printf("audio disabled: NDSP unavailable, video-only mode\n");
+    audio.ready = false;
+    audio.ndsp_ready = false;
+    return false;
+#else
+    if (!g_ndsp_ready) {
+        printf("audio disabled: NDSP unavailable, video-only mode\n");
         audio.ready = false;
-        return false;
+        audio.ndsp_ready = false;
+        return true;
     }
 
-    ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
-
-    ndspChnReset(0);
-    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
-    ndspChnSetRate(0, (float)audio.rate * (float)mivf_speed_pct() / 100.0f);
-    ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
-
-    float mix[12];
-    memset(mix, 0, sizeof(mix));
-    mix[0] = 1.0f;
-    mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
-
-    ndspChnSetMix(0, mix);
+    printf("audio_init: codec=%c%c%c%c rate=%lu ch=%u samples/frame=%lu\n",
+        s->codec[0], s->codec[1], s->codec[2], s->codec[3],
+        (unsigned long)audio.rate,
+        (unsigned int)audio.channels,
+        (unsigned long)audio.samples_per_frame);
 
     for (int i = 0; i < AUDIO_BUFS; i++) {
         audio.buf[i] = (u8*)linearAlloc(AUDIO_MAX_PACKET);
 
         if (!audio.buf[i]) {
-            printf("audio linearAlloc fail\n");
+            printf("audio_init: linearAlloc fail\n");
+            audio_shutdown();
             return false;
         }
 
         memset(&audio.wb[i], 0, sizeof(ndspWaveBuf));
-
         audio.wb[i].data_pcm16 = (s16*)audio.buf[i];
         audio.wb[i].nsamples = audio.samples_per_frame;
         audio.wb[i].looping = false;
     }
 
+    if (audio_can_use_ndsp()) {
+        ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
+        ndspChnReset(0);
+        ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+        ndspChnSetRate(0, (float)audio.rate * (float)mivf_speed_pct() / 100.0f);
+        ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
+
+        float mix[12];
+        memset(mix, 0, sizeof(mix));
+        mix[0] = 1.0f;
+        mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
+        ndspChnSetMix(0, mix);
+    }
+
     audio.ready = true;
     audio.next = 0;
+    audio.ndsp_ready = true;
 
-    printf("audio %c%c%c%c %luHz ch=%u samples/frame=%lu\n", s->codec[0], s->codec[1], s->codec[2], s->codec[3],
-        (unsigned long)audio.rate,
-        audio.channels,
-        (unsigned long)audio.samples_per_frame);
+    printf("audio_init: success\n");
 
     return true;
+#endif
 }
 
 static void audio_shutdown(void) {
-    if (audio.ready) {
+    printf("audio_shutdown: start ndsp_ready=%s\n", g_ndsp_ready ? "yes" : "no");
+
+    if (audio_can_use_ndsp()) {
         ndspChnReset(0);
-        ndspExit();
     }
 
     for (int i = 0; i < AUDIO_BUFS; i++) {
@@ -7177,6 +7234,8 @@ static void audio_shutdown(void) {
     }
 
     memset(&audio, 0, sizeof(audio));
+    audio.ndsp_ready = false;
+    printf("audio_shutdown: complete\n");
 }
 
 
@@ -7230,7 +7289,7 @@ static int decode_ia4m_packet(const u8 *p, size_t n, s16 *out, int out_cap) {
 }
 
 static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
-    if (!audio.ready || !data) {
+    if (!audio_can_use_ndsp() || !data || size == 0) {
         return;
     }
 
@@ -7238,6 +7297,10 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
 
     for (int tries = 0; tries < AUDIO_BUFS; tries++) {
         int i = (start + tries) % AUDIO_BUFS;
+
+        if (!audio.buf[i]) {
+            continue;
+        }
 
         if (audio.wb[i].status == NDSP_WBUF_FREE ||
             audio.wb[i].status == NDSP_WBUF_DONE) {
@@ -8344,7 +8407,7 @@ static void hfix58f_request_relative_seek(int delta_frames) {
 }
 
 static void hfix58f_audio_flush_for_seek(void) {
-    if (!audio.ready) {
+    if (!audio_can_use_ndsp()) {
         return;
     }
 
@@ -8886,7 +8949,7 @@ static int play(void) {
             g_mivf_sleep_fired = true;
             g_mivf_sleep_deadline_tick = 0;
             g_media_ctl.state = STATE_PAUSED;
-            if (audio.ready) {
+            if (audio_can_use_ndsp()) {
                 ndspChnSetPaused(0, true);
             }
             hfix58_alert_set("SLEEP TIMER - PRESS KEY", 3);
@@ -8897,7 +8960,7 @@ static int play(void) {
             if (!(h_keys_down & KEY_START)) {
                 g_mivf_sleep_fired = false;
                 g_media_ctl.state = STATE_PLAYING;
-                if (audio.ready) {
+                if (audio_can_use_ndsp()) {
                     ndspChnSetPaused(0, false);
                 }
                 hfix58_alert_set("RESUMED", 1);
@@ -9000,7 +9063,7 @@ static int play(void) {
                 if (frame_ticks_abs == 0) frame_ticks_abs = 1;
                 next_frame_tick = svcGetSystemTick() + frame_ticks_abs;
 
-                if (audio.ready) {
+                if (audio_can_use_ndsp()) {
                     ndspChnSetRate(0, (float)audio.rate * (float)pct / 100.0f);
                 }
 
@@ -9083,14 +9146,14 @@ static int play(void) {
                     g_media_ctl.state = STATE_PAUSED;
                     hfix58_alert_set("PAUSED", 2);
 
-                    if (audio.ready) {
+                    if (audio_can_use_ndsp()) {
                         ndspChnSetPaused(0, true);
                     }
                 } else {
                     g_media_ctl.state = STATE_PLAYING;
                     hfix58_alert_set("PLAYING", 1);
 
-                    if (audio.ready) {
+                    if (audio_can_use_ndsp()) {
                         ndspChnSetPaused(0, false);
                     }
                 }
@@ -9497,6 +9560,8 @@ int main(void) {
     mivf_log_open();
     mivf_diag_open();
 
+    app_audio_system_init();
+
     MIVF_SettingsInit(&g_mivf_settings);
     MIVF_SettingsLoad(&g_mivf_settings);
     MIVF_SettingsClamp(&g_mivf_settings);
@@ -9552,6 +9617,8 @@ int main(void) {
     }
 
     MIVF_SettingsSave(&g_mivf_settings);
+    audio_shutdown();
+    app_audio_system_shutdown();
     gspLcdExit();
     aptExit();
     ptmuExit();
