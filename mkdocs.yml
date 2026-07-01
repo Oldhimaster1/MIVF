@@ -1,0 +1,26 @@
+site_name: MIVF Player
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Encoding: encoding.md
+  - CLI Reference: cli-reference.md
+  - Player Usage: player-usage.md
+  - Building: building.md
+  - MIVF Format: mivf-format.md
+  - Encoder Internals: encoder-internals.md
+  - Tools: tools.md
+  - Testing & CI: testing-ci.md
+  - Releases: releases.md
+  - Troubleshooting: troubleshooting.md
+  - FAQ: faq.md
+  - Contributing: contributing.md
+  - Changelog: changelog.md
+
+theme:
+  name: material
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
