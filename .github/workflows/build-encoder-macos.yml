@@ -28,14 +28,16 @@ jobs:
           gcc tools/miv2y_moflex_tier.c -O3 -o tools/miv2y_moflex_tier -lm
           gcc tools/m2y2_transcode.c -O3 -o tools/m2y2_transcode -lm
 
-      - name: Get FFmpeg path
+      - name: Get FFmpeg path and verify binaries
         id: ffmpeg_path
         run: |
           FFMPEG_PATH=$(brew --prefix ffmpeg)/bin/ffmpeg
           echo "ffmpeg_path=$FFMPEG_PATH" >> $GITHUB_OUTPUT
-          echo "FFmpeg path: $FFMPEG_PATH"
+          echo "=== FFmpeg Info ==="
           file "$FFMPEG_PATH"
           ls -lh "$FFMPEG_PATH"
+          echo "=== Native tools ==="
+          ls -lh tools/miv2y_moflex_tier tools/m2y2_transcode
 
       - name: Build macOS encoder
         run: |
@@ -46,13 +48,12 @@ jobs:
             --name "encode_mivf_macos" \
             encode_mivf.py
 
-      - name: Verify binary contents
+      - name: Verify binary
         run: |
           file dist/encode_mivf_macos
           ls -lh dist/encode_mivf_macos
           chmod +x dist/encode_mivf_macos
-          # Check if ffmpeg is bundled by testing the help output
-          dist/encode_mivf_macos --help || true
+          dist/encode_mivf_macos --help
 
       - name: Generate checksums
         run: |
