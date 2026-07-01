@@ -11,7 +11,18 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-15-arm64
+    name: Build macOS ${{ matrix.artifact_suffix }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_suffix: macos_x64
+            runner: macos-13
+
+          - artifact_suffix: macos_arm64
+            runner: macos-15-arm64
 
     steps:
       - name: Checkout repository
@@ -22,7 +33,7 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install FFmpeg and Python build tools
+      - name: Install Python build tools and FFmpeg
         run: |
           brew update
           brew install ffmpeg
@@ -30,26 +41,38 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
 
-          echo "FFmpeg path:"
+          echo "System info:"
+          uname -a
+          sw_vers
+
+          echo "Python:"
+          python --version
+
+          echo "FFmpeg:"
           which ffmpeg
+          realpath "$(which ffmpeg)"
           ffmpeg -version | head -n 3
+          ls -lh "$(realpath "$(which ffmpeg)")"
+          file "$(realpath "$(which ffmpeg)")"
 
       - name: Build native encoder helpers
         run: |
-          # IMPORTANT:
-          # encode_mivf.py currently looks for "miv2y_moflex_tier.exe",
-          # so keep this filename even on macOS.
-          gcc tools/miv2y_moflex_tier.c -O3 -o tools/miv2y_moflex_tier.exe -lm
+          # Keep .exe suffix because encode_mivf.py currently searches for this exact helper name.
+          gcc tools/miv2y_moflex_tier.c -O3 -DNDEBUG -std=c99 -Wall -Wextra -o tools/miv2y_moflex_tier.exe -lm
 
-          # encode_mivf.py looks for "tools/m2y2_transcode" on non-Windows layouts.
-          gcc tools/m2y2_transcode.c -O3 -o tools/m2y2_transcode
+          # m2y2_transcode is searched inside tools/ without .exe on macOS.
+          gcc tools/m2y2_transcode.c -O3 -DNDEBUG -std=c99 -Wall -Wextra -o tools/m2y2_transcode
 
           chmod +x tools/miv2y_moflex_tier.exe
           chmod +x tools/m2y2_transcode
 
-          echo "Native helper sizes:"
+          echo "Native helper files:"
           ls -lh tools/miv2y_moflex_tier.exe
           ls -lh tools/m2y2_transcode
+
+          echo "Native helper architectures:"
+          file tools/miv2y_moflex_tier.exe
+          file tools/m2y2_transcode
 
       - name: Build standalone macOS encoder
         run: |
@@ -58,6 +81,7 @@ jobs:
           echo "Bundling FFmpeg from:"
           echo "$FFMPEG_PATH"
           ls -lh "$FFMPEG_PATH"
+          file "$FFMPEG_PATH"
 
           pyinstaller --clean --onefile \
             --add-binary "tools/miv2y_moflex_tier.exe:." \
@@ -65,18 +89,24 @@ jobs:
             --add-binary "$FFMPEG_PATH:." \
             encode_mivf.py
 
-          echo "Final raw binary size:"
+          chmod +x dist/encode_mivf
+
+          echo "Final raw binary:"
           ls -lh dist/encode_mivf
           du -h dist/encode_mivf
+          file dist/encode_mivf
 
-      - name: Smoke test binary
-        run: |
-          chmod +x dist/encode_mivf
+          echo "Smoke test:"
           ./dist/encode_mivf --help
+
+      - name: Rename artifact
+        run: |
+          mv dist/encode_mivf "dist/encode_mivf_${{ matrix.artifact_suffix }}"
+          ls -lh dist/
 
       - name: Upload macOS encoder artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MIVF-Encoder-Mac
-          path: dist/encode_mivf
+          name: MIVF-Encoder-${{ matrix.artifact_suffix }}
+          path: dist/encode_mivf_${{ matrix.artifact_suffix }}
           if-no-files-found: error
