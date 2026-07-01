@@ -57,21 +57,33 @@ jobs:
 
       - name: Build native encoder helpers
         run: |
-          # Keep .exe suffix because encode_mivf.py currently searches for this exact helper name.
-          gcc tools/miv2y_moflex_tier.c -O3 -DNDEBUG -std=c99 -Wall -Wextra -o tools/miv2y_moflex_tier.exe -lm
+          # Build with the .exe name because encode_mivf.py currently expects:
+          # miv2y_moflex_tier.exe
+          gcc tools/miv2y_moflex_tier.c \
+            -O3 -DNDEBUG -std=c99 -Wall -Wextra \
+            -o tools/miv2y_moflex_tier.exe \
+            -lm
 
-          # m2y2_transcode is searched inside tools/ without .exe on macOS.
-          gcc tools/m2y2_transcode.c -O3 -DNDEBUG -std=c99 -Wall -Wextra -o tools/m2y2_transcode
+          # Also create a no-extension copy for manual/debug use.
+          cp tools/miv2y_moflex_tier.exe tools/miv2y_moflex_tier
+
+          # Build M2Y2 transcoder.
+          gcc tools/m2y2_transcode.c \
+            -O3 -DNDEBUG -std=c99 -Wall -Wextra \
+            -o tools/m2y2_transcode
 
           chmod +x tools/miv2y_moflex_tier.exe
+          chmod +x tools/miv2y_moflex_tier
           chmod +x tools/m2y2_transcode
 
           echo "Native helper files:"
           ls -lh tools/miv2y_moflex_tier.exe
+          ls -lh tools/miv2y_moflex_tier
           ls -lh tools/m2y2_transcode
 
           echo "Native helper architectures:"
           file tools/miv2y_moflex_tier.exe
+          file tools/miv2y_moflex_tier
           file tools/m2y2_transcode
 
       - name: Build standalone macOS encoder
@@ -85,6 +97,7 @@ jobs:
 
           pyinstaller --clean --onefile \
             --add-binary "tools/miv2y_moflex_tier.exe:." \
+            --add-binary "tools/miv2y_moflex_tier:." \
             --add-binary "tools/m2y2_transcode:tools" \
             --add-binary "$FFMPEG_PATH:." \
             encode_mivf.py
@@ -95,6 +108,9 @@ jobs:
           ls -lh dist/encode_mivf
           du -h dist/encode_mivf
           file dist/encode_mivf
+
+          echo "Verify PyInstaller archive contains helpers:"
+          pyi-archive_viewer dist/encode_mivf | grep -E "miv2y_moflex_tier|m2y2_transcode|ffmpeg" || true
 
           echo "Smoke test:"
           ./dist/encode_mivf --help
