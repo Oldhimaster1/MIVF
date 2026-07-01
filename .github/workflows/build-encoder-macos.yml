@@ -28,7 +28,6 @@ jobs:
         run: |
           FFMPEG_PATH=$(brew --prefix ffmpeg)/bin/ffmpeg
           echo "ffmpeg_path=$FFMPEG_PATH" >> $GITHUB_OUTPUT
-          echo "Using FFmpeg: $FFMPEG_PATH"
 
       - name: Build macOS encoder
         run: |
@@ -55,11 +54,13 @@ jobs:
           path: dist/
 
       - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v1
         with:
           files: |
             dist/encode_mivf_macos
             dist/encode_mivf_macos.sha256
+          tag_name: ${{ github.ref_name || 'latest-macos' }}
+          make_latest: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
