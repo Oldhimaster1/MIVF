@@ -23,6 +23,11 @@ jobs:
           pip install --upgrade pip
           pip install pyinstaller
 
+      - name: Compile Native C Backends
+        run: |
+          gcc tools/miv2y_moflex_tier.c -O3 -o tools/miv2y_moflex_tier -lm
+          gcc tools/m2y2_transcode.c -O3 -o tools/m2y2_transcode -lm
+
       - name: Get FFmpeg path
         id: ffmpeg_path
         run: |
@@ -33,6 +38,8 @@ jobs:
         run: |
           pyinstaller --clean --onefile \
             --add-binary "${{ steps.ffmpeg_path.outputs.ffmpeg_path }}:." \
+            --add-binary "tools/miv2y_moflex_tier:." \
+            --add-binary "tools/m2y2_transcode:tools" \
             --name "encode_mivf_macos" \
             encode_mivf.py
 
