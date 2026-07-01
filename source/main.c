@@ -116,14 +116,11 @@ static u32 g_mivf_stream_stride = MIVF_STREAM_HEADER_SIZE;
 
 #define AUDIO_BUFS 48
 #define AUDIO_MAX_PACKET 8192
-
-
-#define MIVF_LOG_PATH "sdmc:/mivf_phase5a_log.txt"
-
 static FILE *g_mivf_log = NULL;
 
 static void mivf_log_open(void) {
     if (!g_mivf_log) {
+        MIVF_AppDataEnsureLayout();
         g_mivf_log = fopen(MIVF_LOG_PATH, "w");
     }
 }
@@ -5281,21 +5278,32 @@ static void hfix58_draw_alert(u8 *fb) {
     hfix58_draw_text_shadow(fb, 28, 74, g_hfix58_alert_text, 1, 240, 245, 255);
 }
 
-/* HFIX60: favorites store, persisted to sdmc:/mivf_favorites (one path per line). */
+/* HFIX60: favorites store, persisted under the appdata tree (one path per line). */
 #define MIVF_FAV_MAX 128
-#define MIVF_FAV_PATH "sdmc:/mivf_favorites"
 static char g_mivf_favorites[MIVF_FAV_MAX][HFIX58_MAX_PATH];
 static int g_mivf_favorites_count = 0;
 static bool g_mivf_favorites_loaded = false;
 
+static void hfix60_fav_save(void);
+
 static void hfix60_fav_load(void) {
     FILE *fp;
     char line[HFIX58_MAX_PATH];
+    bool used_legacy = false;
 
     g_mivf_favorites_count = 0;
     g_mivf_favorites_loaded = true;
 
-    fp = fopen(MIVF_FAV_PATH, "rb");
+    MIVF_AppDataEnsureLayout();
+
+    fp = fopen(MIVF_FAVORITES_PATH, "rb");
+    if (!fp) {
+        fp = fopen(MIVF_FAVORITES_LEGACY_PATH, "rb");
+        if (fp) {
+            used_legacy = true;
+        }
+    }
+
     if (!fp) {
         return;
     }
@@ -5321,10 +5329,17 @@ static void hfix60_fav_load(void) {
     }
 
     fclose(fp);
+
+    if (used_legacy) {
+        hfix60_fav_save();
+    }
 }
 
 static void hfix60_fav_save(void) {
-    FILE *fp = fopen(MIVF_FAV_PATH, "wb");
+    FILE *fp;
+
+    MIVF_AppDataEnsureLayout();
+    fp = fopen(MIVF_FAVORITES_PATH, "wb");
 
     if (!fp) {
         return;

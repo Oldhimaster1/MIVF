@@ -3,8 +3,22 @@
 #include <3ds.h>
 #include <stdbool.h>
 
-#define MIVF_SETTINGS_PATH "sdmc:/mivf_settings.ini"
-#define MIVF_BOOKMARK_PATH "sdmc:/mivf_bookmarks"
+#define MIVF_APPDATA_DIR "sdmc:/3ds/mivf_player_3ds/appdata"
+
+#define MIVF_SETTINGS_PATH MIVF_APPDATA_DIR "/settings.ini"
+#define MIVF_SETTINGS_LEGACY_PATH "sdmc:/mivf_settings.ini"
+
+#define MIVF_BOOKMARK_PATH MIVF_APPDATA_DIR "/bookmarks"
+#define MIVF_BOOKMARK_LEGACY_PATH "sdmc:/mivf_bookmarks"
+
+#define MIVF_FAVORITES_PATH MIVF_APPDATA_DIR "/favorites.ini"
+#define MIVF_FAVORITES_LEGACY_PATH "sdmc:/mivf_favorites"
+
+#define MIVF_LOG_DIR MIVF_APPDATA_DIR "/logs"
+#define MIVF_LOG_PATH MIVF_LOG_DIR "/mivf.log"
+
+#define MIVF_CACHE_DIR MIVF_APPDATA_DIR "/cache"
+#define MIVF_BENCHMARK_DIR MIVF_APPDATA_DIR "/benchmarks"
 
 typedef struct {
     bool settings_menu_enabled;
@@ -35,6 +49,7 @@ typedef struct {
 
 void MIVF_SettingsInit(MivfSettings *settings);
 void MIVF_SettingsClamp(MivfSettings *settings);
+bool MIVF_AppDataEnsureLayout(void);
 bool MIVF_SettingsLoad(MivfSettings *settings);
 bool MIVF_SettingsSave(const MivfSettings *settings);
 

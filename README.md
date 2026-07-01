@@ -51,7 +51,7 @@ Use **D‑Pad ↑/↓** to move, **A / ← / →** to change, and **B or SELECT*
 
 Items include: Resume bookmarks, Auto dim, Dim timeout/brightness, Force stereo, Debug overlay, Subtitle tracks, Chapters, Favorites, Theme skin, Font scale, Sleep on lid close, Screen brightness, Aspect ratio, Playback speed, Auto‑advance, and Sleep timer.
 
-> **Note:** Settings persist to `sdmc:/mivf_settings.ini`. Bookmarks and favorites live next to it on the SD card.
+> **Note:** Settings, bookmarks, favorites, logs, cache, and benchmark data now live under `sdmc:/3ds/mivf_player_3ds/appdata/`. Legacy root-level settings/bookmark/favorites files are still read for migration.
 
 ---
 

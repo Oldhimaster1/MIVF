@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 static void mivf_copy_key(char *dst, size_t dst_sz, const char *src) {
     if (!dst || dst_sz == 0) {
@@ -36,6 +38,112 @@ static char *mivf_trim(char *s) {
 
     *end = 0;
     return s;
+}
+
+static bool mivf_mkdir_one(const char *path) {
+    if (!path || !*path) {
+        return false;
+    }
+
+    if (mkdir(path, 0777) == 0) {
+        return true;
+    }
+
+    return errno == EEXIST;
+}
+
+static bool mivf_mkdirs(const char *path) {
+    char tmp[512];
+    char *cursor;
+
+    if (!path || !*path) {
+        return false;
+    }
+
+    snprintf(tmp, sizeof(tmp), "%s", path);
+
+    for (cursor = tmp; *cursor; cursor++) {
+        if (*cursor != '/') {
+            continue;
+        }
+
+        if (cursor == tmp + 5 && tmp[4] == ':') {
+            continue;
+        }
+
+        *cursor = 0;
+        if (tmp[0]) {
+            mivf_mkdir_one(tmp);
+        }
+        *cursor = '/';
+    }
+
+    return mivf_mkdir_one(tmp);
+}
+
+static void mivf_path_dirname(const char *path, char *out, size_t out_sz) {
+    const char *slash;
+
+    if (!out || out_sz == 0) {
+        return;
+    }
+
+    out[0] = 0;
+    if (!path || !*path) {
+        return;
+    }
+
+    slash = strrchr(path, '/');
+    if (!slash) {
+        return;
+    }
+
+    if (slash == path) {
+        snprintf(out, out_sz, "/");
+        return;
+    }
+
+    snprintf(out, out_sz, "%.*s", (int)(slash - path), path);
+}
+
+static bool mivf_ensure_parent_dirs(const char *path) {
+    char dir[512];
+
+    mivf_path_dirname(path, dir, sizeof(dir));
+    if (!dir[0]) {
+        return false;
+    }
+
+    return mivf_mkdirs(dir);
+}
+
+bool MIVF_AppDataEnsureLayout(void) {
+    mivf_mkdirs(MIVF_APPDATA_DIR);
+    mivf_mkdirs(MIVF_BOOKMARK_PATH);
+    mivf_mkdirs(MIVF_LOG_DIR);
+    mivf_mkdirs(MIVF_CACHE_DIR);
+    mivf_mkdirs(MIVF_BENCHMARK_DIR);
+    return true;
+}
+
+static FILE *mivf_open_read_with_legacy(const char *path, const char *legacy_path, bool *used_legacy) {
+    FILE *fp;
+
+    if (used_legacy) {
+        *used_legacy = false;
+    }
+
+    fp = fopen(path, "rb");
+    if (fp || !legacy_path) {
+        return fp;
+    }
+
+    fp = fopen(legacy_path, "rb");
+    if (fp && used_legacy) {
+        *used_legacy = true;
+    }
+
+    return fp;
 }
 
 void MIVF_SettingsInit(MivfSettings *settings) {
@@ -118,6 +226,7 @@ static void mivf_settings_set_defaults(MivfSettings *settings) {
 bool MIVF_SettingsLoad(MivfSettings *settings) {
     FILE *fp;
     char line[256];
+    bool used_legacy = false;
 
     if (!settings) {
         return false;
@@ -125,7 +234,7 @@ bool MIVF_SettingsLoad(MivfSettings *settings) {
 
     mivf_settings_set_defaults(settings);
 
-    fp = fopen(MIVF_SETTINGS_PATH, "rb");
+    fp = mivf_open_read_with_legacy(MIVF_SETTINGS_PATH, MIVF_SETTINGS_LEGACY_PATH, &used_legacy);
     if (!fp) {
         return false;
     }
@@ -172,6 +281,11 @@ bool MIVF_SettingsLoad(MivfSettings *settings) {
 
     fclose(fp);
     MIVF_SettingsClamp(settings);
+
+    if (used_legacy) {
+        MIVF_SettingsSave(settings);
+    }
+
     return true;
 }
 
@@ -181,6 +295,9 @@ bool MIVF_SettingsSave(const MivfSettings *settings) {
     if (!settings) {
         return false;
     }
+
+    MIVF_AppDataEnsureLayout();
+    mivf_ensure_parent_dirs(MIVF_SETTINGS_PATH);
 
     fp = fopen(MIVF_SETTINGS_PATH, "wb");
     if (!fp) {
@@ -211,8 +328,9 @@ bool MIVF_SettingsSave(const MivfSettings *settings) {
     return true;
 }
 
-static void mivf_make_bookmark_path(const char *video_path, char *out, size_t out_sz) {
+static void mivf_make_bookmark_path(const char *video_path, char *out, size_t out_sz, bool legacy) {
     const char *base;
+    const char *root;
 
     if (!out || out_sz == 0) {
         return;
@@ -230,26 +348,36 @@ static void mivf_make_bookmark_path(const char *video_path, char *out, size_t ou
         base++;
     }
 
-    snprintf(out, out_sz, "%s.%s.bookmark", MIVF_BOOKMARK_PATH, base);
+    root = legacy ? MIVF_BOOKMARK_LEGACY_PATH : MIVF_BOOKMARK_PATH;
+    snprintf(out, out_sz, "%s.%s.bookmark", root, base);
 }
 
 bool MIVF_BookmarkLoad(const char *video_path, MivfBookmark *bookmark) {
     char path[512];
+    char legacy_path[512];
+    char line[256];
     FILE *fp;
+    bool used_legacy = false;
 
     if (!bookmark) {
         return false;
     }
 
     memset(bookmark, 0, sizeof(*bookmark));
-    mivf_make_bookmark_path(video_path, path, sizeof(path));
+    mivf_make_bookmark_path(video_path, path, sizeof(path), false);
     if (!path[0]) {
         return false;
     }
 
     fp = fopen(path, "rb");
     if (!fp) {
-        return false;
+        mivf_make_bookmark_path(video_path, legacy_path, sizeof(legacy_path), true);
+        fp = fopen(legacy_path, "rb");
+        if (!fp) {
+            return false;
+        }
+
+        used_legacy = true;
     }
 
     if (!fgets(bookmark->video_path, sizeof(bookmark->video_path), fp)) {
@@ -258,13 +386,18 @@ bool MIVF_BookmarkLoad(const char *video_path, MivfBookmark *bookmark) {
     }
 
     bookmark->video_path[strcspn(bookmark->video_path, "\r\n")] = 0;
-    if (!fgets(path, sizeof(path), fp)) {
+    if (!fgets(line, sizeof(line), fp)) {
         fclose(fp);
         return false;
     }
 
-    bookmark->frame = (u32)strtoul(path, NULL, 10);
+    bookmark->frame = (u32)strtoul(line, NULL, 10);
     fclose(fp);
+
+    if (used_legacy) {
+        MIVF_BookmarkSave(video_path, bookmark->frame);
+    }
+
     return bookmark->video_path[0] != 0;
 }
 
@@ -272,10 +405,13 @@ bool MIVF_BookmarkSave(const char *video_path, u32 frame) {
     char path[512];
     FILE *fp;
 
-    mivf_make_bookmark_path(video_path, path, sizeof(path));
+    mivf_make_bookmark_path(video_path, path, sizeof(path), false);
     if (!path[0] || !video_path || !*video_path) {
         return false;
     }
+
+    MIVF_AppDataEnsureLayout();
+    mivf_ensure_parent_dirs(path);
 
     fp = fopen(path, "wb");
     if (!fp) {
@@ -289,11 +425,23 @@ bool MIVF_BookmarkSave(const char *video_path, u32 frame) {
 
 bool MIVF_BookmarkClear(const char *video_path) {
     char path[512];
+    char legacy_path[512];
 
-    mivf_make_bookmark_path(video_path, path, sizeof(path));
+    mivf_make_bookmark_path(video_path, path, sizeof(path), false);
     if (!path[0]) {
         return false;
     }
 
-    return remove(path) == 0;
+    mivf_make_bookmark_path(video_path, legacy_path, sizeof(legacy_path), true);
+
+    if (remove(path) == 0) {
+        remove(legacy_path);
+        return true;
+    }
+
+    if (remove(legacy_path) == 0) {
+        return true;
+    }
+
+    return false;
 }
