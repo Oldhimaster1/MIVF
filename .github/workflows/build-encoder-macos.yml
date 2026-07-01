@@ -1,79 +1,82 @@
-name: Build macOS Encoder
+name: Build Standalone macOS Binary
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+  push:
+    paths:
+      - "encode_mivf.py"
+      - "tools/miv2y_moflex_tier.c"
+      - "tools/m2y2_transcode.c"
+      - ".github/workflows/build-encoder-macos.yml"
 
 jobs:
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-15-arm64
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install FFmpeg and Python build tools
         run: |
+          brew update
           brew install ffmpeg
-          pip install --upgrade pip
-          pip install pyinstaller
 
-      - name: Compile Native C Backends
-        run: |
-          gcc tools/miv2y_moflex_tier.c -O3 -o tools/miv2y_moflex_tier -lm
-          gcc tools/m2y2_transcode.c -O3 -o tools/m2y2_transcode -lm
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
 
-      - name: Get FFmpeg path and verify binaries
-        id: ffmpeg_path
+          echo "FFmpeg path:"
+          which ffmpeg
+          ffmpeg -version | head -n 3
+
+      - name: Build native encoder helpers
         run: |
-          FFMPEG_PATH=$(brew --prefix ffmpeg)/bin/ffmpeg
-          echo "ffmpeg_path=$FFMPEG_PATH" >> $GITHUB_OUTPUT
-          echo "=== FFmpeg Info ==="
-          file "$FFMPEG_PATH"
+          # IMPORTANT:
+          # encode_mivf.py currently looks for "miv2y_moflex_tier.exe",
+          # so keep this filename even on macOS.
+          gcc tools/miv2y_moflex_tier.c -O3 -o tools/miv2y_moflex_tier.exe -lm
+
+          # encode_mivf.py looks for "tools/m2y2_transcode" on non-Windows layouts.
+          gcc tools/m2y2_transcode.c -O3 -o tools/m2y2_transcode
+
+          chmod +x tools/miv2y_moflex_tier.exe
+          chmod +x tools/m2y2_transcode
+
+          echo "Native helper sizes:"
+          ls -lh tools/miv2y_moflex_tier.exe
+          ls -lh tools/m2y2_transcode
+
+      - name: Build standalone macOS encoder
+        run: |
+          FFMPEG_PATH="$(realpath "$(which ffmpeg)")"
+
+          echo "Bundling FFmpeg from:"
+          echo "$FFMPEG_PATH"
           ls -lh "$FFMPEG_PATH"
-          echo "=== Native tools ==="
-          ls -lh tools/miv2y_moflex_tier tools/m2y2_transcode
 
-      - name: Build macOS encoder
-        run: |
           pyinstaller --clean --onefile \
-            --add-binary "${{ steps.ffmpeg_path.outputs.ffmpeg_path }}:." \
-            --add-binary "tools/miv2y_moflex_tier:." \
+            --add-binary "tools/miv2y_moflex_tier.exe:." \
             --add-binary "tools/m2y2_transcode:tools" \
-            --name "encode_mivf_macos" \
+            --add-binary "$FFMPEG_PATH:." \
             encode_mivf.py
 
-      - name: Verify binary
-        run: |
-          file dist/encode_mivf_macos
-          ls -lh dist/encode_mivf_macos
-          chmod +x dist/encode_mivf_macos
-          dist/encode_mivf_macos --help
+          echo "Final raw binary size:"
+          ls -lh dist/encode_mivf
+          du -h dist/encode_mivf
 
-      - name: Generate checksums
+      - name: Smoke test binary
         run: |
-          shasum -a 256 dist/encode_mivf_macos > dist/encode_mivf_macos.sha256
-          cat dist/encode_mivf_macos.sha256
+          chmod +x dist/encode_mivf
+          ./dist/encode_mivf --help
 
-      - name: Upload artifacts
+      - name: Upload macOS encoder artifact
         uses: actions/upload-artifact@v4
         with:
-          name: encode_mivf_macos
-          path: dist/
-
-      - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            dist/encode_mivf_macos
-            dist/encode_mivf_macos.sha256
-          tag_name: ${{ github.ref_name || 'latest-macos' }}
-          make_latest: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: MIVF-Encoder-Mac
+          path: dist/encode_mivf
+          if-no-files-found: error
