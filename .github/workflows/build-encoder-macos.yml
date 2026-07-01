@@ -10,19 +10,9 @@ on:
       - ".github/workflows/build-encoder-macos.yml"
 
 jobs:
-  build-macos:
-    name: Build macOS ${{ matrix.artifact_suffix }}
-    runs-on: ${{ matrix.runner }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - artifact_suffix: macos_x64
-            runner: macos-13
-
-          - artifact_suffix: macos_arm64
-            runner: macos-15-arm64
+  build-macos-x64:
+    name: Build macOS Intel x64
+    runs-on: macos-13
 
     steps:
       - name: Checkout repository
@@ -45,9 +35,6 @@ jobs:
           uname -a
           sw_vers
 
-          echo "Python:"
-          python --version
-
           echo "FFmpeg:"
           which ffmpeg
           realpath "$(which ffmpeg)"
@@ -57,31 +44,21 @@ jobs:
 
       - name: Build native encoder helpers
         run: |
-          # Keep .exe suffix because encode_mivf.py currently searches for this exact helper name.
           gcc tools/miv2y_moflex_tier.c -O3 -DNDEBUG -std=c99 -Wall -Wextra -o tools/miv2y_moflex_tier.exe -lm
-
-          # m2y2_transcode is searched inside tools/ without .exe on macOS.
           gcc tools/m2y2_transcode.c -O3 -DNDEBUG -std=c99 -Wall -Wextra -o tools/m2y2_transcode
 
           chmod +x tools/miv2y_moflex_tier.exe
           chmod +x tools/m2y2_transcode
 
-          echo "Native helper files:"
           ls -lh tools/miv2y_moflex_tier.exe
           ls -lh tools/m2y2_transcode
 
-          echo "Native helper architectures:"
           file tools/miv2y_moflex_tier.exe
           file tools/m2y2_transcode
 
       - name: Build standalone macOS encoder
         run: |
           FFMPEG_PATH="$(realpath "$(which ffmpeg)")"
-
-          echo "Bundling FFmpeg from:"
-          echo "$FFMPEG_PATH"
-          ls -lh "$FFMPEG_PATH"
-          file "$FFMPEG_PATH"
 
           pyinstaller --clean --onefile \
             --add-binary "tools/miv2y_moflex_tier.exe:." \
@@ -96,17 +73,16 @@ jobs:
           du -h dist/encode_mivf
           file dist/encode_mivf
 
-          echo "Smoke test:"
           ./dist/encode_mivf --help
 
       - name: Rename artifact
         run: |
-          mv dist/encode_mivf "dist/encode_mivf_${{ matrix.artifact_suffix }}"
+          mv dist/encode_mivf dist/encode_mivf_macos_x64
           ls -lh dist/
 
       - name: Upload macOS encoder artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MIVF-Encoder-${{ matrix.artifact_suffix }}
-          path: dist/encode_mivf_${{ matrix.artifact_suffix }}
+          name: MIVF-Encoder-macos_x64
+          path: dist/encode_mivf_macos_x64
           if-no-files-found: error
