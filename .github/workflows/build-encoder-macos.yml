@@ -89,8 +89,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      - name: Upload artifacts (v4)
+        uses: actions/upload-artifact@v4
         with:
           name: encode_mivf_macos
           path: |
