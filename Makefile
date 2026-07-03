@@ -11,7 +11,12 @@ export LD:=$(PREFIX)gcc
 include $(DEVKITARM)/3ds_rules
 TARGET:=mivf_player_3ds
 BUILD:=build
-SOURCES:=source
+SOURCES:=source \
+	source/moflex \
+	source/moflex/decoder \
+	source/moflex/ffmpeg_support \
+	source/moflex/playback \
+	source/moflex/ui
 ARCH:=-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 CFLAGS:=-g -Wall -O2 -mword-relocations -ffunction-sections $(ARCH) $(INCLUDE)
 LDFLAGS:=-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
@@ -24,7 +29,14 @@ export VPATH:=$(foreach dir,$(SOURCES),$(CURDIR)/$(dir))
 export DEPSDIR:=$(CURDIR)/$(BUILD)
 export CFILES:=$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 export OFILES:=$(CFILES:.c=.o)
-export INCLUDE:=$(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD)
+export INCLUDE:=$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+	-I$(CURDIR)/source \
+	-I$(CURDIR)/source/moflex/decoder \
+	-I$(CURDIR)/source/moflex/playback \
+	-I$(CURDIR)/source/moflex/ui \
+	-I$(CURDIR)/source/moflex/ffmpeg_support/include \
+	-I$(CURDIR)/source/moflex/ffmpeg_support/include/libavcodec \
+	-I$(CURDIR)/$(BUILD)
 export LIBPATHS:=$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
 
 # --- HOME-menu icon / banner metadata (edit these for your own release) ---
