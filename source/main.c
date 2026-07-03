@@ -5400,24 +5400,50 @@ static void hfix60_fav_toggle(const char *path) {
     hfix60_fav_save();
 }
 
-static bool hfix58_has_ext_mivf(const char *name) {
+typedef enum {
+    HFIX58_MEDIA_UNKNOWN = 0,
+    HFIX58_MEDIA_MIVF,
+    HFIX58_MEDIA_MOFLEX,
+} Hfix58MediaKind;
+
+static Hfix58MediaKind hfix58_media_kind(const char *name) {
     if (!name) {
-        return false;
+        return HFIX58_MEDIA_UNKNOWN;
     }
 
     size_t n = strlen(name);
 
-    if (n < 5) {
-        return false;
-    }
+    if (n >= 5) {
+        const char *e = name + n - 5;
 
-    const char *e = name + n - 5;
-
-    return (tolower((unsigned char)e[0]) == '.' &&
+        if (tolower((unsigned char)e[0]) == '.' &&
             tolower((unsigned char)e[1]) == 'm' &&
             tolower((unsigned char)e[2]) == 'i' &&
             tolower((unsigned char)e[3]) == 'v' &&
-            tolower((unsigned char)e[4]) == 'f');
+            tolower((unsigned char)e[4]) == 'f') {
+            return HFIX58_MEDIA_MIVF;
+        }
+    }
+
+    if (n >= 7) {
+        const char *e = name + n - 7;
+
+        if (tolower((unsigned char)e[0]) == '.' &&
+            tolower((unsigned char)e[1]) == 'm' &&
+            tolower((unsigned char)e[2]) == 'o' &&
+            tolower((unsigned char)e[3]) == 'f' &&
+            tolower((unsigned char)e[4]) == 'l' &&
+            tolower((unsigned char)e[5]) == 'e' &&
+            tolower((unsigned char)e[6]) == 'x') {
+            return HFIX58_MEDIA_MOFLEX;
+        }
+    }
+
+    return HFIX58_MEDIA_UNKNOWN;
+}
+
+static bool hfix58_is_supported_media(const char *name) {
+    return hfix58_media_kind(name) != HFIX58_MEDIA_UNKNOWN;
 }
 
 static int hfix58_file_cmp(const void *a, const void *b) {
@@ -5899,7 +5925,7 @@ static bool hfix58_scan_dir(const char *dir) {
             break;
         }
 
-        if (!hfix58_has_ext_mivf(ent->d_name)) {
+        if (!hfix58_is_supported_media(ent->d_name)) {
             continue;
         }
 
@@ -6090,6 +6116,8 @@ static void hfix58_draw_browser(u8 *fb) {
 
     hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
     hfix58_draw_text_shadow(fb, 24, 212, "A PLAY  Y FAV  B BACK  START EXIT", 1, 210, 225, 245);
+
+    hfix58_draw_alert(fb);
 }
 
 static void hfix58_browser_redraw(void) {
@@ -6181,6 +6209,12 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
             }
 
             if (down & KEY_A) {
+                if (hfix58_media_kind(g_hfix58_browser.entries[g_hfix58_browser.selected].name) == HFIX58_MEDIA_MOFLEX) {
+                    hfix58_alert_set("MoFlex backend imported; playback dispatch not enabled yet.", 1);
+                    hfix58_browser_redraw();
+                    continue;
+                }
+
                 snprintf(
                     out_path,
                     out_sz,

@@ -10,6 +10,7 @@ It is built for the real hardware: the codecs are tuned for the ARM11, the playe
 
 * **Custom codecs:** M2Y1 (raw token YUV420) and M2Y2 (the same picture, entropy‑coded with a division‑free binary range coder, ~24% smaller and still a locked 30 fps on hardware). Also reads RAWV, M2Y0, and PC16/IA4M audio.
 * **File browser:** Includes thumbnails, posters, synopsis, and favorites.
+* **MoFlex staging:** The playback-only MoFlex backend is vendored and building. `.moflex` files are visible in the browser, but playback dispatch is not enabled yet.
 * **Auto‑resume bookmarks:** Pick up exactly where you left off.
 * **Playlists / auto‑advance:** Automatically play the next file in the folder.
 * **Aspect‑ratio modes:** FIT (letterbox), STRETCH (fill), NATIVE (1:1).
