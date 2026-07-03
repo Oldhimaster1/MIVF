@@ -85,6 +85,7 @@ static const char g_hfix58d_version_tag[] __attribute__((used)) =
 #include "mivf_settings.h"
 #include "mivf_rc.h"
 #include "mivf_transform.h"
+#include "moflex/playback/moflex_playback.h"
 
 /* Kept transform coefficients per quadrant for the frame being decoded.
    Read from the M2Y1/M2Y2 body header (reserved byte 13); 0 means legacy 4. */
@@ -6022,6 +6023,41 @@ static bool hfix58_scan_default_dirs(void) {
     return false;
 }
 
+static void hfix58_browser_redraw(void);
+
+static void hfix58_restore_browser_after_moflex(void) {
+    gfxSet3D(false);
+    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_BOTTOM, GSP_RGB565_OES);
+    hfix58_preview_clear();
+    hfix58_browser_redraw();
+}
+
+static MoflexResult play_moflex_selected_media(const char *path) {
+    MoflexResult result;
+
+    if (!path || !*path) {
+        return MOFLEX_ERROR;
+    }
+
+    g_hfix58_alert_text[0] = '\0';
+    g_hfix58_alert_level = 0;
+
+    /* Release MIVF's per-file audio state before MoFlex takes NDSP channel 0. */
+    audio_shutdown();
+
+    result = moflex_play(path);
+
+    hfix58_restore_browser_after_moflex();
+
+    if (result == MOFLEX_ERROR) {
+        hfix58_alert_set("MoFlex playback error", 2);
+        hfix58_browser_redraw();
+    }
+
+    return result;
+}
+
 static void hfix58_draw_browser(u8 *fb) {
     if (!fb) {
         return;
@@ -6209,12 +6245,6 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
             }
 
             if (down & KEY_A) {
-                if (hfix58_media_kind(g_hfix58_browser.entries[g_hfix58_browser.selected].name) == HFIX58_MEDIA_MOFLEX) {
-                    hfix58_alert_set("MoFlex backend imported; playback dispatch not enabled yet.", 1);
-                    hfix58_browser_redraw();
-                    continue;
-                }
-
                 snprintf(
                     out_path,
                     out_sz,
@@ -9636,6 +9666,17 @@ int main(void) {
             }
 
             g_hfix58_has_selected_media = true;
+        }
+
+        if (hfix58_media_kind(MIVF_PATH) == HFIX58_MEDIA_MOFLEX) {
+            MoflexResult result = play_moflex_selected_media(MIVF_PATH);
+
+            if (result == MOFLEX_QUIT_EXIT) {
+                break;
+            }
+
+            g_hfix58_has_selected_media = false;
+            continue;
         }
 
         int r = play();
