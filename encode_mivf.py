@@ -73,6 +73,7 @@ class EncodeSettings:
     fps: int = DEFAULT_FPS
     audio_rate: int = DEFAULT_AUDIO_RATE
     audio_channels: int = DEFAULT_AUDIO_CHANNELS
+    audio_codec: str = "ia4m"
     keyint: int = DEFAULT_KEYINT
     qp: int = DEFAULT_QP
     c_qp_offset: int = DEFAULT_C_QP_OFFSET
@@ -803,9 +804,14 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
     print(f"Parallel Engine: Master container unified with {running_frame_idx} sequential frames.")
 
 
-def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate: int, channels: int, workdir: Path) -> None:
-    if channels != 1:
-        raise SystemExit("IA4M mux currently supports mono only")
+def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate: int, channels: int, workdir: Path, audio_codec: str = "ia4m") -> None:
+    audio_codec = audio_codec.lower()
+    if audio_codec not in {"ia4m", "pc16"}:
+        raise SystemExit(f"unsupported audio codec: {audio_codec}")
+    if audio_codec == "ia4m" and channels != 1:
+        raise SystemExit("IA4M mux currently supports mono only; use --audio-codec pc16 for stereo")
+    if channels not in (1, 2):
+        raise SystemExit("audio channels must be 1 or 2")
 
     frame_no = 0
 
@@ -831,11 +837,12 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
         if samples_per_frame <= 0:
             raise SystemExit("bad audio samples/frame")
 
-        extra = b"IA4M" + struct.pack("<IHHI", rate, channels, samples_per_frame, 0)
+        codec_tag = b"IA4M" if audio_codec == "ia4m" else b"PC16"
+        extra = codec_tag + struct.pack("<IHHI", rate, channels, samples_per_frame, 0)
         if len(extra) != 16:
             raise AssertionError(len(extra))
 
-        desc1 = make_stream_desc(1, 2, b"IA4M", rate, channels, samples_per_frame, 1, extra)
+        desc1 = make_stream_desc(1, 2, codec_tag, rate, channels, samples_per_frame, 1, extra)
         first_new = HEADER_SIZE + len(desc0) + len(desc1)
 
         out_file.write(wr_header(header, 2, first_new))
@@ -864,8 +871,19 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
                 if len(payload) != payload_size:
                     raise SystemExit(f"short page payload at frame {frame_no}")
 
-                samples = read_audio_samples_from_pipe(audio_proc, samples_per_frame, channels)
-                abody = encode_ia4m_packet(samples, frame_no)
+                pcm_bytes_needed = samples_per_frame * channels * 2
+                if audio_proc.stdout:
+                    pcm = audio_proc.stdout.read(pcm_bytes_needed)
+                else:
+                    pcm = b""
+                if len(pcm) < pcm_bytes_needed:
+                    pcm += b"\x00" * (pcm_bytes_needed - len(pcm))
+
+                if audio_codec == "ia4m":
+                    samples = list(struct.unpack("<" + "h" * samples_per_frame, pcm[:samples_per_frame * 2]))
+                    abody = encode_ia4m_packet(samples, frame_no)
+                else:
+                    abody = pcm
                 apkt = struct.pack("<BBHIII", 1, 0, PACKET_HEADER_SIZE, 0, len(abody), frame_no) + abody
 
                 new_payload = payload + apkt
@@ -905,7 +923,7 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
                 print(stderr, file=sys.stderr)
 
     print(f"WROTE {out_path}")
-    print(f"frames={frame_no} audio={rate}Hz channels={channels} samples/frame={samples_per_frame} bytes={out_path.stat().st_size}")
+    print(f"frames={frame_no} audio={audio_codec.upper()} {rate}Hz channels={channels} samples/frame={samples_per_frame} bytes={out_path.stat().st_size}")
 
 
 def deploy_output(output_path: Path) -> None:
@@ -990,9 +1008,9 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
 
         print()
         print("============================================================")
-        print("2. Multiplexing Compressed 4-bit Audio (IA4M)")
+        print(f"2. Multiplexing Audio ({settings.audio_codec.upper()})")
         print("============================================================")
-        mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir)
+        mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir, settings.audio_codec)
 
         if make_m2y2:
             print()
@@ -1038,6 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
     parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE)
     parser.add_argument("--audio-channels", type=int, default=DEFAULT_AUDIO_CHANNELS)
+    parser.add_argument("--audio-codec", choices=["ia4m", "pc16"], default="ia4m", help="audio mux format: ia4m is small ADPCM mono, pc16 is larger high-quality PCM")
     parser.add_argument("--keyint", type=int, default=DEFAULT_KEYINT)
     parser.add_argument("--qp", type=int, default=DEFAULT_QP)
     parser.add_argument("--c-qp-offset", type=int, default=DEFAULT_C_QP_OFFSET)
@@ -1065,6 +1084,7 @@ def main() -> None:
         fps=args.fps,
         audio_rate=args.audio_rate,
         audio_channels=args.audio_channels,
+        audio_codec=args.audio_codec,
         keyint=args.keyint,
         qp=args.qp,
         c_qp_offset=args.c_qp_offset,

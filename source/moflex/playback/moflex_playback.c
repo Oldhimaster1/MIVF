@@ -24,6 +24,12 @@ extern size_t mobi_ctx_size(void);
 
 /* ---- software volume (persisted) ---- */
 static float g_vol = 1.0f;
+static int g_audio_enabled = 1;
+
+void moflex_set_audio_enabled(int enabled) {
+    g_audio_enabled = enabled ? 1 : 0;
+}
+
 static void vol_load(void) {
     FILE *f = fopen("sdmc:/moflex_player/volume.txt", "rb");
     if (f) { float v; if (fscanf(f, "%f", &v) == 1 && v >= 0.25f && v <= 4.0f) g_vol = v; fclose(f); }
@@ -164,12 +170,23 @@ static void panel_draw(const char *title, int64_t cur, int64_t dur, int playing)
     ui_present();
 }
 
-static void mp_wait_key(void) {
-    while (aptMainLoop()) {
-        hidScanInput();
-        if (hidKeysDown() & (KEY_A | KEY_B)) break;
-        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
-    }
+static MoflexResult fail(const char *msg) {
+    printf("\x1b[2J\x1b[H%s\n", msg ? msg : "MoFlex error");
+    return MOFLEX_ERROR;
+}
+
+static void configure_audio_channel(int arate, int chn) {
+    ndspChnReset(0);
+    ndspSetOutputMode(chn == 2 ? NDSP_OUTPUT_STEREO : NDSP_OUTPUT_MONO);
+    ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE);
+    ndspChnSetRate(0, (float)arate);
+    ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+
+    float mix[12];
+    memset(mix, 0, sizeof(mix));
+    mix[0] = 1.0f;
+    mix[1] = chn == 2 ? 1.0f : 0.0f;
+    ndspChnSetMix(0, mix);
 }
 
 /* seek to a target time (us); flush decoder so decode restarts at a keyframe */
@@ -198,6 +215,7 @@ static void prime_after_seek(MfxDemux *m, AVCodecContext *ctx, AVFrame *out, int
             if (ok && *left_ok && *vidx == *left_vidx + 1) {
                 blit_eye(out, GFX_RIGHT, W, H);
                 gfxFlushBuffers(); gfxSwapBuffers();
+                gspWaitForVBlank();
                 (*vidx)++;
                 return;                                     /* landing frame shown */
             }
@@ -212,20 +230,35 @@ MoflexResult moflex_play(const char *path) {
     vol_load();
 
     FILE *f = fopen(path, "rb");
-    if (!f) { printf("\x1b[2J\x1b[Hfopen failed\npress A\n"); mp_wait_key(); return MOFLEX_ERROR; }
+    if (!f) return fail("fopen failed");
 
     MfxDemux m;
-    if (mfx_open(&m, f) != 0) { printf("\x1b[2J\x1b[Hmfx_open failed\npress A\n"); mp_wait_key(); fclose(f); return MOFLEX_ERROR; }
+    if (mfx_open(&m, f) != 0) { fclose(f); return fail("mfx_open failed"); }
 
     int vi = -1, ai = -1;
     for (int i = 0; i < m.nb_streams; i++) {
         if (m.streams[i].media_type == MFX_TYPE_VIDEO && vi < 0) vi = i;
         if (m.streams[i].media_type == MFX_TYPE_AUDIO && ai < 0) ai = i;
     }
-    if (vi < 0) { printf("\x1b[2J\x1b[Hno video\npress A\n"); mp_wait_key(); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
+    if (vi < 0) { mfx_close(&m); fclose(f); return fail("no video"); }
     int W = m.streams[vi].width, H = m.streams[vi].height;
+    if (m.streams[vi].codec_id != MFX_VCODEC_MOBICLIP ||
+        W <= 0 || H <= 0 || W > SCR_W || H > SCR_H ||
+        (W & 15) != 0 || (H & 15) != 0) {
+        mfx_close(&m);
+        fclose(f);
+        return fail("unsupported video");
+    }
+
     int arate = ai >= 0 ? m.streams[ai].sample_rate : 44100;
     int chn   = ai >= 0 ? m.streams[ai].channels    : 2;
+    if (arate <= 0) arate = 44100;
+    if (chn < 1 || chn > 2) chn = 2;
+    int have_audio = (ai >= 0 &&
+                      g_audio_enabled &&
+                      m.streams[ai].codec_id == MFX_ACODEC_ADPCM_IMA &&
+                      m.streams[ai].channels >= 1 &&
+                      m.streams[ai].channels <= 2);
 
     AVCodecContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -233,6 +266,7 @@ MoflexResult moflex_play(const char *path) {
     ctx.priv_data = calloc(1, mobi_ctx_size());
     if (!ctx.priv_data || mobi_init(&ctx) != 0) { free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
     AVFrame *out = av_frame_alloc();
+    if (!out) { mobi_close(&ctx); free(ctx.priv_data); mfx_close(&m); fclose(f); return MOFLEX_ERROR; }
 
     gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
     gfxSetDoubleBuffering(GFX_TOP, true);   /* MUST be on: both eyes go to the back
@@ -254,18 +288,23 @@ MoflexResult moflex_play(const char *path) {
     #define ABUF_SAMPLES (16 * 1024)
     ndspWaveBuf wbuf[NWB];
     int16_t *abuf[NWB] = { 0 };
-    int have_audio = (ai >= 0);
     memset(wbuf, 0, sizeof(wbuf));
     if (have_audio) {
-        ndspChnReset(0);
-        ndspChnSetInterp(0, NDSP_INTERP_POLYPHASE);
-        ndspChnSetRate(0, (float)arate);
-        ndspChnSetFormat(0, chn == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
-        float mix[12]; memset(mix, 0, sizeof(mix)); mix[0] = mix[1] = 1.0f;
-        ndspChnSetMix(0, mix);
         for (int i = 0; i < NWB; i++) {
             abuf[i] = (int16_t *)linearAlloc(ABUF_SAMPLES * chn * sizeof(int16_t));
+            if (!abuf[i]) {
+                for (int j = 0; j < i; j++) {
+                    linearFree(abuf[j]);
+                    abuf[j] = NULL;
+                }
+                have_audio = 0;
+                break;
+            }
             wbuf[i].data_vaddr = abuf[i]; wbuf[i].status = NDSP_WBUF_DONE;
+        }
+
+        if (have_audio) {
+            configure_audio_channel(arate, chn);
         }
     }
 
@@ -293,7 +332,7 @@ MoflexResult moflex_play(const char *path) {
 
         /* ---- controls (direct, nothing to select): A play/pause,
                Left/Right (hold) rewind/FF, Up/Down volume, B back ---- */
-        if (kd & KEY_B) { result = MOFLEX_QUIT_BACK; break; }
+        if (kd & (KEY_B | KEY_START)) { result = MOFLEX_QUIT_BACK; break; }
         if (kd & KEY_A) { playing = !playing; if (have_audio) ndspChnSetPaused(0, !playing); dirty = 1; }
         if (kd & KEY_UP)   { if (g_vol < 4.0f)  g_vol += 0.25f; vol_save(); dirty = 1; }
         if (kd & KEY_DOWN) { if (g_vol > 0.25f) g_vol -= 0.25f; vol_save(); dirty = 1; }
@@ -331,7 +370,7 @@ MoflexResult moflex_play(const char *path) {
             vidx = 0; left_ok = 0;          /* re-establish L/R pairing after seek */
             playing = 1;
             if (have_audio) {
-                ndspChnWaveBufClear(0);
+                configure_audio_channel(arate, chn);
                 ndspChnSetPaused(0, false);
                 for (int i = 0; i < NWB; i++) wbuf[i].status = NDSP_WBUF_DONE;
                 wb_idx = 0;
@@ -344,7 +383,8 @@ MoflexResult moflex_play(const char *path) {
         /* ---- decode one packet (if playing) ---- */
         if (playing) {
             int rc = mfx_next_packet(&m, &pkt);
-            if (rc != 1) { playing = 0; dirty = 1; if (have_audio) ndspChnSetPaused(0, true); }
+            if (rc == 0) { result = MOFLEX_EOF; break; }
+            if (rc < 0) { result = MOFLEX_ERROR; break; }
             else {
                 cur_us = m.ts;
                 if (cur_us < 0) cur_us = 0;
@@ -361,7 +401,14 @@ MoflexResult moflex_play(const char *path) {
                     while (wb->status != NDSP_WBUF_FREE && wb->status != NDSP_WBUF_DONE) {
                         gspWaitForVBlank();
                         if (!aptMainLoop()) { result = MOFLEX_QUIT_EXIT; goto done; }
+                        hidScanInput();
+                        if (hidKeysDown() & (KEY_B | KEY_START)) { result = MOFLEX_QUIT_BACK; goto done; }
                         if (++spins > 150) break;
+                    }
+                    int header = 4 * chn;
+                    int expected_frames = pkt.size >= header ? ((pkt.size - header) * 2 / chn) : 0;
+                    if (expected_frames <= 0 || expected_frames > ABUF_SAMPLES) {
+                        continue;
                     }
                     int fr = adpcm_moflex_decode(pkt.data, pkt.size, chn, abuf[wb_idx]);
                     if (fr > 0 && fr <= ABUF_SAMPLES) {
@@ -387,6 +434,7 @@ MoflexResult moflex_play(const char *path) {
                         if (ok && left_ok && vidx == left_vidx + 1) {
                             blit_eye(out, GFX_RIGHT, W, H);
                             gfxFlushBuffers(); gfxSwapBuffers();
+                            gspWaitForVBlank();
                         }
                         left_ok = 0;
                     }

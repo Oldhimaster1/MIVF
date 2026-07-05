@@ -286,6 +286,26 @@ static bool audio_can_use_ndsp(void) {
     return g_ndsp_ready && audio.ready;
 }
 
+static bool audio_configure_ndsp_channel(void) {
+    if (!g_ndsp_ready) {
+        return false;
+    }
+
+    ndspChnReset(0);
+    ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
+    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+    ndspChnSetRate(0, (float)audio.rate * (float)mivf_speed_pct() / 100.0f);
+    ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
+
+    float mix[12];
+    memset(mix, 0, sizeof(mix));
+    mix[0] = 1.0f;
+    mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
+    ndspChnSetMix(0, mix);
+
+    return true;
+}
+
 static bool audio_dspfirm_available(void) {
     FILE *f = fopen("sdmc:/3ds/dspfirm.cdc", "rb");
 
@@ -681,10 +701,15 @@ static int read_stream(FILE *f, Stream *s) {
             0x14 fps numerator
             0x16 fps denominator
 
-        PC16 audio streams in current files:
+        Legacy PC16 audio streams:
             0x10 channels
             0x14 sample rate
             0x2A samples per video frame, observed 533 for 16000/30
+
+        Modern MIVF audio streams, including files written by encode_mivf.py:
+            0x10 sample rate
+            0x12 channels
+            0x14 samples per video frame
 
         We map into Stream as:
             w    = sample rate
@@ -693,12 +718,26 @@ static int read_stream(FILE *f, Stream *s) {
             fpsd = 1
     */
     if (!strcmp(s->codec, "PC16")) {
-        u16 channels = le16(b + 0x10);
-        u16 rate = le16(b + 0x14);
+        u16 modern_rate = le16(b + 0x10);
+        u16 modern_channels = le16(b + 0x12);
+        u16 modern_samples_per_frame = le16(b + 0x14);
+        u16 legacy_channels = le16(b + 0x10);
+        u16 legacy_rate = le16(b + 0x14);
+        u16 channels = legacy_channels;
+        u16 rate = legacy_rate;
         u16 samples_per_frame = 0;
 
         if (to_read >= 0x2C) {
             samples_per_frame = le16(b + 0x2A);
+        }
+
+        if (modern_rate >= 8000 &&
+            modern_channels >= 1 &&
+            modern_channels <= 2 &&
+            modern_samples_per_frame > 0) {
+            rate = modern_rate;
+            channels = modern_channels;
+            samples_per_frame = modern_samples_per_frame;
         }
 
         if (channels == 0 || channels > 2) {
@@ -4684,8 +4723,8 @@ static void blit565_scaled(const u8 *src, int w, int h) {
 /* This operates only on decoded PCM16 immediately before NDSP queueing.      */
 /* It never mutates compressed audio packets.                                 */
 /* ------------------------------------------------------------------------- */
-static int  g_hfix56_volume_percent = 160;     /* default 160% */
-static bool g_hfix56_limiter_enabled = true;
+static int  g_hfix56_volume_percent = 100;
+static bool g_hfix56_limiter_enabled = false;
 static u8   g_hfix56_audio_src_channels = 1;
 
 static u8  *g_hfix56_audio_mix_buf = NULL;
@@ -6045,6 +6084,7 @@ static MoflexResult play_moflex_selected_media(const char *path) {
 
     /* Release MIVF's per-file audio state before MoFlex takes NDSP channel 0. */
     audio_shutdown();
+    moflex_set_audio_enabled(g_ndsp_ready);
 
     result = moflex_play(path);
 
@@ -7274,18 +7314,15 @@ static bool audio_init_from_stream(const Stream *s) {
         audio.wb[i].looping = false;
     }
 
-    if (audio_can_use_ndsp()) {
-        ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
-        ndspChnReset(0);
-        ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
-        ndspChnSetRate(0, (float)audio.rate * (float)mivf_speed_pct() / 100.0f);
-        ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
-
-        float mix[12];
-        memset(mix, 0, sizeof(mix));
-        mix[0] = 1.0f;
-        mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
-        ndspChnSetMix(0, mix);
+    /*
+        First-playback setup must not depend on audio.ready: this function is
+        the code that makes audio ready. The seek path always reconfigured
+        NDSP, which is why seeking back to frame 0 could "fix" bad startup
+        audio.
+    */
+    if (!audio_configure_ndsp_channel()) {
+        audio_shutdown();
+        return false;
     }
 
     audio.ready = true;
@@ -7367,22 +7404,51 @@ static int decode_ia4m_packet(const u8 *p, size_t n, s16 *out, int out_cap) {
     return sample;
 }
 
+static void audio_queue(const u8 *data, u32 size);
+
+static bool hfix58_queue_audio_packet(const Stream *a, const u8 *body, u32 psize, u32 frame_no) {
+    (void)frame_no;
+
+    if (!a || !audio.ready || !body || psize == 0) {
+        return false;
+    }
+
+    if (memcmp(a->codec, "IA4M", 4) == 0) {
+        static s16 ia4m_pcm[4096];
+        int ns = decode_ia4m_packet(body, psize, ia4m_pcm, 4096);
+
+        if (ns <= 0) {
+            return false;
+        }
+
+        audio_queue((const u8*)ia4m_pcm, (u32)(ns * 2));
+        return true;
+    }
+
+    audio_queue(body, psize);
+    return true;
+}
+
 static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
     if (!audio_can_use_ndsp() || !data || size == 0) {
         return;
     }
 
+    enum { AUDIO_FREE_WAIT_VBLANKS = 4 };
     int start = audio.next;
 
-    for (int tries = 0; tries < AUDIO_BUFS; tries++) {
-        int i = (start + tries) % AUDIO_BUFS;
+    for (int wait = 0; wait <= AUDIO_FREE_WAIT_VBLANKS; wait++) {
+        for (int tries = 0; tries < AUDIO_BUFS; tries++) {
+            int i = (start + tries) % AUDIO_BUFS;
 
-        if (!audio.buf[i]) {
-            continue;
-        }
+            if (!audio.buf[i]) {
+                continue;
+            }
 
-        if (audio.wb[i].status == NDSP_WBUF_FREE ||
-            audio.wb[i].status == NDSP_WBUF_DONE) {
+            if (audio.wb[i].status != NDSP_WBUF_FREE &&
+                audio.wb[i].status != NDSP_WBUF_DONE) {
+                continue;
+            }
 
             /*
                 HFIX9:
@@ -7420,6 +7486,7 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
                 return;
             }
 
+            memset(&audio.wb[i], 0, sizeof(audio.wb[i]));
             memcpy(audio.buf[i], data, n);
 
             audio.wb[i].data_pcm16 = (s16*)audio.buf[i];
@@ -7437,11 +7504,12 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
 
             return;
         }
+
+        gspWaitForVBlank();
     }
 
     /*
-        No free audio buffer.
-        Do not stall video.
+        No free audio buffer after a bounded wait.
     */
     g_audio_drop++;
 }
@@ -8490,21 +8558,11 @@ static void hfix58f_audio_flush_for_seek(void) {
         return;
     }
 
-    ndspChnReset(0);
-    ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
-    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
-    ndspChnSetRate(0, (float)audio.rate * (float)mivf_speed_pct() / 100.0f);
-    ndspChnSetFormat(0, audio.channels == 1 ? NDSP_FORMAT_MONO_PCM16 : NDSP_FORMAT_STEREO_PCM16);
-
-    float mix[12];
-    memset(mix, 0, sizeof(mix));
-    mix[0] = 1.0f;
-    mix[1] = audio.channels == 1 ? 0.0f : 1.0f;
-    ndspChnSetMix(0, mix);
+    audio_configure_ndsp_channel();
 
     for (int i = 0; i < AUDIO_BUFS; i++) {
         memset(&audio.wb[i], 0, sizeof(ndspWaveBuf));
-        audio.wb[i].data_vaddr = audio.buf[i];
+        audio.wb[i].data_pcm16 = (s16*)audio.buf[i];
         audio.wb[i].nsamples = audio.samples_per_frame;
     }
 
@@ -8759,12 +8817,26 @@ static void wait_stream_prebuffer(MivfStream *stream) {
     }
 
     /*
-        HFIX58J_QUICK_START_PREBUFFER:
-        Startup should not wait for a giant fill. Let reader keep filling while
-        first frames begin.
+        PC16 stereo pages are much larger than the original IA4M pages. Starting
+        with only a few chunks buffered lets the first cold file read fight the
+        decoder and NDSP queue, then a seek back works because the host cache is
+        warm. Build a real startup cushion, but cap the wait so bad media never
+        hangs the app.
     */
-    const u32 target = 24 * 1024;
+    u32 target = stream->ring.size / 2;
+    const u32 min_target = 512 * 1024;
+    const u32 max_target = 1024 * 1024;
+
+    if (target < min_target) {
+        target = min_target;
+    }
+
+    if (target > max_target) {
+        target = max_target;
+    }
+
     int spins = 0;
+    const int max_spins = 120;
 
     while (aptMainLoop()) {
         u32 fill = 0;
@@ -8783,7 +8855,7 @@ static void wait_stream_prebuffer(MivfStream *stream) {
 
         spins++;
 
-        if (spins >= 3) {
+        if (spins >= max_spins) {
             break;
         }
 
@@ -9311,14 +9383,52 @@ static int play(void) {
 
         size_t off = 0;
         bool got_video = false;
+        bool audio_prequeued = false;
 
         u64 parse_t0 = svcGetSystemTick();
+
+        /*
+            Queue audio before video decode/presentation. The muxer writes video
+            first, then audio, but waiting to submit audio until after frame
+            pacing makes NDSP vulnerable to underruns whenever video decode is
+            uneven. A fast prepass gives the audio queue one frame of cushion.
+        */
+        if (audio.ready) {
+            size_t audio_off = 0;
+
+            for (u16 ai = 0; ai < pg.packets; ai++) {
+                Packet ak;
+
+                if (read_packet(cur_page + audio_off, pg.payload - audio_off, &ak)) {
+                    break;
+                }
+
+                if ((u64)audio_off + (u64)ak.hsize + (u64)ak.psize > (u64)pg.payload) {
+                    break;
+                }
+
+                if (ak.sid == audio.sid) {
+                    const u8 *abody = cur_page + audio_off + ak.hsize;
+
+                    diag_audio_pkts++;
+                    if (hfix58_queue_audio_packet(&a, abody, ak.psize, ak.frame)) {
+                        audio_prequeued = true;
+                    }
+                }
+
+                audio_off += ak.hsize + ak.psize;
+            }
+        }
 
         for (u16 i = 0; i < pg.packets; i++) {
             Packet k;
 
             if (read_packet(cur_page + off, pg.payload - off, &k)) {
                 /* HFIX58D: scrubbed full bottom-console printf statement. */
+                break;
+            }
+
+            if ((u64)off + (u64)k.hsize + (u64)k.psize > (u64)pg.payload) {
                 break;
             }
 
@@ -9466,46 +9576,9 @@ static int play(void) {
                 }
 
                 got_video = true;
-                hfix59r3_present_video_frame(
-                    &v,
-                    &m2y0,
-                    &m2y0_have_prev,
-                    &frame,
-                    &prev,
-                    fsz,
-                    &have_prev,
-                    hfix51b_direct_present_pending,
-                    &hfix51c_last_direct_yuv,
-                    &shown,
-                    &next_frame_tick,
-                    frame_ticks_abs,
-                    fpsn_abs,
-                    fpsd_abs);
-            } else if (audio.ready && k.sid == audio.sid) {
+            } else if (!audio_prequeued && audio.ready && k.sid == audio.sid) {
                 diag_audio_pkts++;
-                /* HFIX24A IA4M decode wrapper */
-                if (memcmp(a.codec, "IA4M", 4) == 0) {
-                    static s16 ia4m_pcm[4096];
-                    int ns = decode_ia4m_packet(body, k.psize, ia4m_pcm, 4096);
-                    if (ns > 0) {
-                        audio_queue((const u8*)ia4m_pcm, (u32)(ns * 2));
-                        if ((k.frame & 31) == 0) {
-                            int amin = ia4m_pcm[0];
-                            int amax = ia4m_pcm[0];
-                            for (int ai = 1; ai < ns; ai++) {
-                                if (ia4m_pcm[ai] < amin) amin = ia4m_pcm[ai];
-                                if (ia4m_pcm[ai] > amax) amax = ia4m_pcm[ai];
-                            }
-                            /* HFIX58D: scrubbed full bottom-console printf statement. */
-
-
-                        }
-                    } else {
-                        /* HFIX58D: scrubbed full bottom-console printf statement. */
-                    }
-                } else {
-                    audio_queue(body, k.psize);
-                }
+                hfix58_queue_audio_packet(&a, body, k.psize, k.frame);
             }
 
             off += k.hsize + k.psize;
@@ -9516,80 +9589,61 @@ static int play(void) {
 
         mivf_stream_release_page(&stream, &page);
 
-        if (0 && got_video) {
-            /*
-            HFIX11 pre-present pacing:
-            Decode work happens before this point. Now wait until the
-            absolute presentation deadline, then blit the frame. This avoids
-            early presentation followed by correction delay.
-        */
-            while (svcGetSystemTick() < next_frame_tick) {
-                gspWaitForVBlank();
-            }
-
+        if (got_video) {
             u64 blit_t0 = svcGetSystemTick();
-            /* HFIX51B: Explicitly Guarded Presentation Pass */
-            if (hfix51b_direct_present_pending &&
-                m2y0.w == TOP_W &&
-                m2y0.h == TOP_H &&
-                m2y0_to_rgb565_y2r_linear(&m2y0)) {
-                /*
-                    HFIX52B:
-                    Y2R hardware path succeeded. Output is linear RGB565,
-                    so use the rotated RGB565 blit path. In the UI master,
-                    blit565_scaled() routes through the unified present finish.
-                */
-                blit565_scaled(g_hfix52a_y2r_rgb565, v.w, v.h);
-            } else if (hfix51b_direct_present_pending &&
-                       m2y0.w == TOP_W &&
-                       m2y0.h == TOP_H) {
-                /*
-                    Fallback: proven HFIX51B CPU direct YUV -> top VRAM path.
-                */
-                m2y0_to_top_rgb565_direct(&m2y0);
-            } else {
-                hfix51c_last_direct_yuv = false;
-                blit565_scaled(frame, v.w, v.h);
-            }
-            u64 blit_t1 = svcGetSystemTick();
-            blit_us = ticks_to_us(blit_t1 - blit_t0);
 
-            u8 *tmp = prev;
-            prev = frame;
-            frame = tmp;
+            hfix59r3_present_video_frame(
+                &v,
+                &m2y0,
+                &m2y0_have_prev,
+                &frame,
+                &prev,
+                fsz,
+                &have_prev,
+                hfix51b_direct_present_pending,
+                &hfix51c_last_direct_yuv,
+                &shown,
+                &next_frame_tick,
+                frame_ticks_abs,
+                fpsn_abs,
+                fpsd_abs);
 
-            have_prev = true;
-            shown++;
-            hfix58s_subtitles_set_frame_time((uint32_t)shown, fpsn_abs, fpsd_abs);
+            blit_us = ticks_to_us(svcGetSystemTick() - blit_t0);
 
-            /* A/B scene looper: jump back to A once we reach B. */
             if (g_mivf_ab_state == 2 &&
                 g_mivf_ab_b != MIVF_AB_UNSET &&
                 g_mivf_ab_a != MIVF_AB_UNSET &&
                 shown >= g_mivf_ab_b) {
                 hfix58j_request_absolute_seek(g_mivf_ab_a);
             }
+        }
 
-            #if MIVF_RUNTIME_TELEMETRY
-            if ((shown % 60) == 0) {
-                print_ring_telemetry(&stream, shown);
-            }
-#endif
+        if (g_mivf_diag && got_video) {
+            u64 total_us = ticks_to_us(svcGetSystemTick() - frame_start_tick);
 
-            /*
-            Absolute pacing:
-            using a persistent next_frame_tick avoids small frame-to-frame
-            timing oscillations caused by basing the target on each loop's
-            start time.
-        */
-            u64 now_tick = svcGetSystemTick();
+            fprintf(g_mivf_diag,
+                "%lu,%lu,%lu,%u,%lu,%llu,%llu,%llu,%llu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+                (unsigned long)shown,
+                (unsigned long)diag_page_no,
+                (unsigned long)diag_page_payload,
+                (unsigned int)diag_page_packets,
+                (unsigned long)diag_ring_kb,
+                (unsigned long long)page_wait_us,
+                (unsigned long long)parse_us,
+                (unsigned long long)blit_us,
+                (unsigned long long)total_us,
+                (unsigned long)diag_video_pkts,
+                (unsigned long)diag_audio_pkts,
+                (unsigned long)g_last_audio_bytes,
+                (unsigned long)g_last_audio_samples,
+                (unsigned long)g_audio_submit,
+                (unsigned long)g_audio_drop);
 
-            if (now_tick > next_frame_tick + frame_ticks_abs * 2) {
-                next_frame_tick = now_tick + frame_ticks_abs;
-            } else {
-                next_frame_tick += frame_ticks_abs;
+            if ((shown & 31u) == 0u) {
+                fflush(g_mivf_diag);
             }
         }
+
     }
 
     g_media_ctl.state = STATE_PLAYING;

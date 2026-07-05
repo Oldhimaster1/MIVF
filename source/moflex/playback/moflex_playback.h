@@ -22,6 +22,10 @@ typedef enum {
  * the saved position and checkpoints it as it plays. */
 MoflexResult moflex_play(const char *path);
 
+/* Enable/disable MoFlex audio use. Pass false when the host app could not
+ * initialize NDSP; video playback will continue silently. */
+void moflex_set_audio_enabled(int enabled);
+
 /* Saved resume position (microseconds) for a movie, or 0 if none. */
 long long moflex_resume_get(const char *path);
 

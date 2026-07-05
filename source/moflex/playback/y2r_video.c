@@ -61,8 +61,14 @@ bool y2r_video_blit(AVFrame *f, gfx3dSide_t side, int w, int h) {
     Y2RU_SetReceiving(g_out, (u32)w * h * 2, (s16)(w * 2 * 8), 0);   /* 8 lines/unit (per Y2R note) */
 
     svcClearEvent(g_done);
-    if (R_FAILED(Y2RU_StartConversion())) return false;
-    svcWaitSynchronization(g_done, 300000000LL);   /* 300ms safety timeout */
+    if (R_FAILED(Y2RU_StartConversion())) {
+        y2r_video_exit();
+        return false;
+    }
+    if (R_FAILED(svcWaitSynchronization(g_done, 50000000LL))) {
+        y2r_video_exit();
+        return false;
+    }
 
     /* CPU will read g_out; invalidate so we don't see stale cache lines */
     GSPGPU_InvalidateDataCache(g_out, (u32)w * h * 2);
