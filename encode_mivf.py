@@ -1595,6 +1595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-seek-index", action="store_true", help="do not generate .idx sidecar seek index")
     parser.add_argument("--no-embedded-index", action="store_true", help="do not append embedded seek index payload/footer into output .mivf")
     parser.add_argument("--report-packet-sizes", action="store_true", help="print per-video-packet size histogram after encoding")
+    parser.add_argument("--profile", choices=["default", "3ds-fast"], default="default", help="encoder quality/speed preset: default for quality, 3ds-fast for smaller packets and smoother 3DS playback")
     parser.add_argument("--seek-index-sidecar", default=None, help="optional explicit path for generated .idx sidecar")
     return parser
 
@@ -1623,6 +1624,52 @@ def main() -> None:
         jobs=args.jobs,
         chunk_frames=args.chunk_frames,
     )
+
+    # ---- profile presets ----
+    # Apply preset defaults, but let explicit CLI flags override by
+    # only changing fields that the user did NOT explicitly set.
+    if args.profile == "3ds-fast":
+        if args.qp == DEFAULT_QP:
+            settings.qp = 42
+        if args.lambda_value == DEFAULT_LAMBDA:
+            settings.lambda_value = 35.0
+        if args.keep == DEFAULT_KEEP:
+            settings.keep = 8
+        if args.y_skip == DEFAULT_Y_SKIP:
+            settings.y_skip = 30
+        if args.c_skip == DEFAULT_C_SKIP:
+            settings.c_skip = 36
+        if args.y_delta == DEFAULT_Y_DELTA:
+            settings.y_delta = 32
+        if args.c_delta == DEFAULT_C_DELTA:
+            settings.c_delta = 40
+        if args.c_qp_offset == DEFAULT_C_QP_OFFSET:
+            settings.c_qp_offset = 8
+        # mv_range stays at 4 (already minimal)
+
+    # Print effective encode settings
+    print("============================================================")
+    print("ENCODE SETTINGS")
+    print("============================================================")
+    print(f"  profile:         {args.profile}")
+    print(f"  resolution:      {settings.width}x{settings.height}")
+    print(f"  fps:             {settings.fps}")
+    print(f"  keyint:          {settings.keyint}")
+    print(f"  qp:              {settings.qp}")
+    print(f"  c_qp_offset:     {settings.c_qp_offset}")
+    print(f"  lambda:          {settings.lambda_value:.1f}")
+    print(f"  keep:            {settings.keep}")
+    print(f"  y_skip:          {settings.y_skip}")
+    print(f"  c_skip:          {settings.c_skip}")
+    print(f"  y_delta:         {settings.y_delta}")
+    print(f"  c_delta:         {settings.c_delta}")
+    print(f"  mv_range:        {settings.mv_range}")
+    print(f"  audio:           {settings.audio_codec.upper()} {settings.audio_rate}Hz ch={settings.audio_channels}")
+    if args.profile == "3ds-fast":
+        print()
+        print("  Tip: use --report-packet-sizes to check packet size distribution.")
+    print("============================================================")
+    print()
 
     input_path = Path(args.input)
     output_path = Path(args.output)
