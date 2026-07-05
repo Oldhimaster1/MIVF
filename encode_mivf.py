@@ -207,6 +207,173 @@ def parse_video_stream_desc(desc_blob: bytes) -> tuple[int, bytes, int, int]:
     raise RuntimeError("video stream descriptor not found")
 
 
+def report_packet_size_stats(mivf_path: Path) -> dict:
+    """Parse final .mivf and print per-video-packet size statistics.
+
+    Returns a dict with all computed values for programmatic use.
+    """
+    file_size = mivf_path.stat().st_size
+
+    with mivf_path.open("rb") as f:
+        header = f.read(HEADER_SIZE)
+        if len(header) != HEADER_SIZE or header[:4] != b"MIVF":
+            raise RuntimeError(f"{mivf_path}: not a valid MIVF file")
+
+        first = le64(header, 36)
+        if first <= HEADER_SIZE or first > 4096:
+            raise RuntimeError(f"{mivf_path}: invalid first page offset {first}")
+
+        desc_blob = f.read(first - HEADER_SIZE)
+        if len(desc_blob) != first - HEADER_SIZE:
+            raise RuntimeError(f"{mivf_path}: short stream descriptor block")
+
+        video_sid, video_codec, video_w, video_h = parse_video_stream_desc(desc_blob)
+
+        sizes: list[int] = []
+        pos = first
+        pages = 0
+
+        while pos + PAGE_HEADER_SIZE <= file_size:
+            f.seek(pos)
+            page_hdr = f.read(PAGE_HEADER_SIZE)
+            if len(page_hdr) != PAGE_HEADER_SIZE:
+                break
+
+            if page_hdr[:2] != b"MP":
+                break
+
+            payload = le32(page_hdr, 16)
+            packets = le16(page_hdr, 20)
+
+            if payload == 0 or payload > (512 * 1024) or packets == 0 or packets > 128:
+                break
+
+            page_payload_start = pos + PAGE_HEADER_SIZE
+            page_end = page_payload_start + payload
+            if page_end > file_size:
+                break
+
+            pkt_pos = page_payload_start
+
+            for _ in range(packets):
+                if pkt_pos + PACKET_HEADER_SIZE > page_end:
+                    break
+
+                f.seek(pkt_pos)
+                pkt_hdr = f.read(PACKET_HEADER_SIZE)
+                if len(pkt_hdr) != PACKET_HEADER_SIZE:
+                    break
+
+                pkt_sid = pkt_hdr[0]
+                hsize = le16(pkt_hdr, 2)
+                psize = le32(pkt_hdr, 8)
+
+                if hsize < PACKET_HEADER_SIZE or pkt_pos + hsize + psize > page_end:
+                    break
+
+                if pkt_sid == video_sid:
+                    sizes.append(psize)
+
+                pkt_pos += hsize + psize
+
+            pages += 1
+            pos = page_end
+
+    if not sizes:
+        print(f"PACKET REPORT: no video packets found in {mivf_path}")
+        return {"count": 0}
+
+    sizes.sort()
+    n = len(sizes)
+    total = sum(sizes)
+    avg = total / n
+
+    def percentile(pct: float) -> int:
+        idx = int(n * pct / 100.0)
+        if idx >= n:
+            idx = n - 1
+        return sizes[idx]
+
+    buckets = [
+        (0, 2048),
+        (2048, 5120),
+        (5120, 10240),
+        (10240, 15360),
+        (15360, 20480),
+        (20480, 30720),
+        (30720, 40960),
+        (40960, 999999),
+    ]
+    bucket_labels = [
+        "0-2 KB",
+        "2-5 KB",
+        "5-10 KB",
+        "10-15 KB",
+        "15-20 KB",
+        "20-30 KB",
+        "30-40 KB",
+        "40 KB+",
+    ]
+    bucket_counts: list[int] = []
+    for lo, hi in buckets:
+        bucket_counts.append(sum(1 for s in sizes if lo <= s < hi))
+
+    thresholds = [10240, 15360, 20480, 30720, 40960]
+
+    print()
+    print("============================================================")
+    print("VIDEO PACKET SIZE REPORT")
+    print("============================================================")
+    print(f"  file:           {mivf_path}")
+    print(f"  video codec:    {video_codec.decode('ascii','replace')}")
+    print(f"  video packets:  {n}")
+    print(f"  pages scanned:  {pages}")
+    print(f"  min:            {sizes[0]:>6d} B  ({sizes[0]/1024:.1f} KB)")
+    print(f"  max:            {sizes[-1]:>6d} B  ({sizes[-1]/1024:.1f} KB)")
+    print(f"  avg:            {avg:>6.0f} B  ({avg/1024:.1f} KB)")
+    print(f"  p50 (median):   {percentile(50):>6d} B  ({percentile(50)/1024:.1f} KB)")
+    print(f"  p90:            {percentile(90):>6d} B  ({percentile(90)/1024:.1f} KB)")
+    print(f"  p95:            {percentile(95):>6d} B  ({percentile(95)/1024:.1f} KB)")
+    print(f"  p99:            {percentile(99):>6d} B  ({percentile(99)/1024:.1f} KB)")
+    print()
+    print("  Histogram:")
+    max_count = max(bucket_counts) if bucket_counts else 1
+    for label, count in zip(bucket_labels, bucket_counts):
+        pct = 100.0 * count / n
+        bar = "#" * max(1, int(40 * count / max_count))
+        print(f"    {label:>10s}: {count:5d} ({pct:5.1f}%)  {bar}")
+    print()
+    over_warned = False
+    for thresh in thresholds:
+        over = sum(1 for s in sizes if s >= thresh)
+        pct = 100.0 * over / n
+        tag = ""
+        if thresh <= 15360 and pct > 10.0:
+            tag = "  *** WARNING: many large packets may cause decode lag on 3DS"
+            over_warned = True
+        print(f"    >= {thresh//1024:2d} KB:        {over:5d} ({pct:5.1f}%){tag}")
+    if over_warned:
+        print()
+        print("  Recommendation: consider --profile 3ds-fast or lower --qp / higher --lambda")
+        print("  to keep video packet sizes below ~10-15 KB for smooth 3DS playback.")
+    print()
+    print(f"  total video payload: {total/1048576:.1f} MiB")
+    print("============================================================")
+
+    return {
+        "count": n,
+        "min": sizes[0],
+        "max": sizes[-1],
+        "avg": avg,
+        "p50": percentile(50),
+        "p90": percentile(90),
+        "p95": percentile(95),
+        "p99": percentile(99),
+        "bucket_counts": bucket_counts,
+        "bucket_labels": bucket_labels,
+    }
+
+
 def collect_seek_index_data(mivf_path: Path) -> SeekIndexData:
     file_size = mivf_path.stat().st_size
 
@@ -1285,6 +1452,7 @@ def encode_one(
     make_m2y2: bool = False,
     make_seek_index: bool = True,
     make_embedded_index: bool = True,
+    report_packet_sizes: bool = False,
     seek_index_sidecar: Path | None = None,
 ) -> None:
     workdir = make_temp_workdir()
@@ -1346,6 +1514,16 @@ def encode_one(
             except Exception as exc:
                 print(f"WARNING: seek index generation failed: {exc}")
 
+        if report_packet_sizes:
+            print()
+            print("============================================================")
+            print("5. Packet Size Report")
+            print("============================================================")
+            try:
+                report_packet_size_stats(output_path)
+            except Exception as exc:
+                print(f"WARNING: packet size report failed: {exc}")
+
         if deploy_sd:
             deploy_output(output_path)
     finally:
@@ -1359,6 +1537,7 @@ def encode_folder(
     make_m2y2: bool = False,
     make_seek_index: bool = True,
     make_embedded_index: bool = True,
+    report_packet_sizes: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     files = sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
@@ -1381,6 +1560,7 @@ def encode_folder(
             make_m2y2=make_m2y2,
             make_seek_index=make_seek_index,
             make_embedded_index=make_embedded_index,
+            report_packet_sizes=report_packet_sizes,
             seek_index_sidecar=None,
         )
 
@@ -1414,6 +1594,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--m2y2", action="store_true", help="range-code video to the smaller M2Y2 codec (lossless, approximately 20 percent smaller)")
     parser.add_argument("--no-seek-index", action="store_true", help="do not generate .idx sidecar seek index")
     parser.add_argument("--no-embedded-index", action="store_true", help="do not append embedded seek index payload/footer into output .mivf")
+    parser.add_argument("--report-packet-sizes", action="store_true", help="print per-video-packet size histogram after encoding")
     parser.add_argument("--seek-index-sidecar", default=None, help="optional explicit path for generated .idx sidecar")
     return parser
 
@@ -1458,6 +1639,7 @@ def main() -> None:
             make_m2y2=args.m2y2,
             make_seek_index=not args.no_seek_index,
             make_embedded_index=not args.no_embedded_index,
+            report_packet_sizes=args.report_packet_sizes,
         )
         return
 
@@ -1472,6 +1654,7 @@ def main() -> None:
         make_m2y2=args.m2y2,
         make_seek_index=not args.no_seek_index,
         make_embedded_index=not args.no_embedded_index,
+        report_packet_sizes=args.report_packet_sizes,
         seek_index_sidecar=seek_index_sidecar,
     )
 
