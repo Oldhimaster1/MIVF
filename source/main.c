@@ -8197,6 +8197,7 @@ typedef struct {
 } Hfix58FSeekIndex;
 
 static Hfix58FSeekIndex g_hfix58f_seek;
+static u64 g_hfix58f_media_end_offset = 0;
 
 
 
@@ -8987,6 +8988,7 @@ static bool hfix58f_try_load_embedded_index(FILE *f, u32 first_offset) {
     g_hfix58f_seek.total_frames = total_frames;
     g_hfix58f_seek.ready = true;
     g_media_ctl.total_frames = total_frames;
+    g_hfix58f_media_end_offset = index_offset;
 
     loaded = true;
 
@@ -9358,6 +9360,8 @@ static bool hfix58f_execute_pending_seek(
             hfix58_alert_set("STREAM REOPEN FAIL", 2);
             return false;
         }
+
+        mivf_stream_set_media_end_offset(stream, g_hfix58f_media_end_offset);
     }
 
     /* HFIX58I_ZERO_WAIT_SEEK: do not block after seek; reader fills asynchronously. */
@@ -9678,6 +9682,8 @@ static int play(void) {
         printf("no audio stream\n");
     }
 
+    g_hfix58f_media_end_offset = 0;
+
     g_hfix59r2_video_fps_num = v.fpsn ? v.fpsn : 30;
     g_hfix59r2_video_fps_den = v.fpsd ? v.fpsd : 1;
 
@@ -9697,6 +9703,8 @@ static int play(void) {
         fclose(f);
         return -5;
     }
+
+    mivf_stream_set_media_end_offset(&stream, g_hfix58f_media_end_offset);
 
     size_t fsz = (size_t)v.w * (size_t)v.h * 2u;
 
@@ -10396,6 +10404,7 @@ static int play(void) {
         }
 
         if (g_mivf_diag && got_video) {
+            diag_ring_kb = stream.ring.fill >> 10;
             u64 total_us = ticks_to_us(svcGetSystemTick() - frame_start_tick);
 
             fprintf(g_mivf_diag,
