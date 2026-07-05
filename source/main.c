@@ -8182,6 +8182,7 @@ static void hfix59r3_present_video_frame(
 
 #define HFIX58F_MAX_SEEK_POINTS 4096
 #define HFIX58F_SEEK_STEP_FRAMES 150
+#define HFIX58F_SYNC_INDEX_FAST_LIMIT_BYTES (256ull * 1024ull * 1024ull)
 
 typedef struct {
     u32 frame;
@@ -8548,6 +8549,23 @@ static u32 hfix58f_total_frames(void) {
     return 1;
 }
 
+static void hfix58f_seed_total_frames_from_duration(const Stream *v) {
+    u32 fpsn = v && v->fpsn ? v->fpsn : (g_hfix59r2_video_fps_num ? g_hfix59r2_video_fps_num : 30u);
+    u32 fpsd = v && v->fpsd ? v->fpsd : (g_hfix59r2_video_fps_den ? g_hfix59r2_video_fps_den : 1u);
+
+    if (g_hfix59r2_duration_ticks != 0 && fpsn != 0) {
+        u64 den = 30000ull * (u64)(fpsd ? fpsd : 1u);
+        u64 frames = (g_hfix59r2_duration_ticks * (u64)fpsn + den - 1u) / den;
+
+        if (frames > 0xffffffffull) {
+            frames = 0xffffffffull;
+        }
+
+        g_hfix58f_seek.total_frames = (u32)frames;
+        g_media_ctl.total_frames = (u32)frames;
+    }
+}
+
 static bool hfix58f_seek_active(void) {
     return g_hfix58f_seek_ui_active ||
         g_hfix58f_seek_pending ||
@@ -8909,6 +8927,21 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
         }
     } else {
         cache_path[0] = 0;
+    }
+
+    if (file_size > HFIX58F_SYNC_INDEX_FAST_LIMIT_BYTES) {
+        hfix58f_seed_total_frames_from_duration(v);
+
+        if (saved >= 0) {
+            fseek(f, saved, SEEK_SET);
+        }
+
+        /*
+            Movie-sized uncached files must start playback immediately. A full
+            first-run seek-index scan can walk gigabytes and looks like a hang.
+            Existing .idx files are still used, and small files still build one.
+        */
+        return false;
     }
 
     /*
