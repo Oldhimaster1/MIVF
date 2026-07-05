@@ -48,6 +48,9 @@ PAGE_HAS_KEYFRAME = 2
 HFIX58F_MAX_SEEK_POINTS = 4096
 HFIX58J_IDX_MAGIC = 0x314A4458
 HFIX58J_IDX_VERSION = 2
+MIVF_EMBED_IDX_FOOTER_MAGIC = 0x5844494D
+MIVF_EMBED_IDX_FOOTER_VERSION = 1
+MIVF_EMBED_IDX_FOOTER_SIZE = 32
 
 IMA_INDEX_TABLE = [
     -1, -1, -1, -1, 2, 4, 6, 8,
@@ -90,6 +93,14 @@ class EncodeSettings:
     keep: int = DEFAULT_KEEP
     jobs: int = DEFAULT_JOBS
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
+
+
+@dataclass
+class SeekIndexData:
+    file_size: int
+    first_offset: int
+    total_frames: int
+    seek_points: list[tuple[int, int]]
 
 
 def resource_dir() -> Path:
@@ -196,10 +207,7 @@ def parse_video_stream_desc(desc_blob: bytes) -> tuple[int, bytes, int, int]:
     raise RuntimeError("video stream descriptor not found")
 
 
-def generate_seek_index_sidecar(mivf_path: Path, sidecar_path: Path | None = None) -> Path | None:
-    if sidecar_path is None:
-        sidecar_path = make_idx_sidecar_path(mivf_path)
-
+def collect_seek_index_data(mivf_path: Path) -> SeekIndexData:
     file_size = mivf_path.stat().st_size
 
     with mivf_path.open("rb") as f:
@@ -283,31 +291,120 @@ def generate_seek_index_sidecar(mivf_path: Path, sidecar_path: Path | None = Non
 
             pos = page_end
 
-    if not seek_points:
+    total_frames = highest_frame + 1
+    return SeekIndexData(
+        file_size=file_size,
+        first_offset=first,
+        total_frames=total_frames,
+        seek_points=seek_points,
+    )
+
+
+def build_hfix58j_payload(file_size: int, first_offset: int, total_frames: int, seek_points: list[tuple[int, int]]) -> bytes:
+    payload = bytearray()
+    payload += struct.pack("<I", HFIX58J_IDX_MAGIC)
+    payload += struct.pack("<I", HFIX58J_IDX_VERSION)
+    payload += struct.pack("<Q", file_size)
+    payload += struct.pack("<I", first_offset)
+    payload += struct.pack("<I", total_frames)
+    payload += struct.pack("<I", len(seek_points))
+
+    # Record layout must match player's Hfix58FSeekPoint ABI:
+    # u32 frame + 4-byte padding + u64 file_offset = 16 bytes.
+    for frame, file_offset in seek_points:
+        payload += struct.pack("<IIQ", frame, 0, file_offset)
+
+    return bytes(payload)
+
+
+def write_seek_index_sidecar_payload(
+    mivf_path: Path,
+    sidecar_path: Path,
+    payload: bytes,
+    seek_points: list[tuple[int, int]],
+    total_frames: int,
+    file_size: int,
+    first_offset: int,
+) -> Path:
+    with sidecar_path.open("wb") as idx:
+        idx.write(payload)
+
+    print(
+        "SEEK INDEX SIDECAR: "
+        f"path={sidecar_path} points={len(seek_points)} total_frames={total_frames} "
+        f"file_size={file_size} first={first_offset} source={mivf_path}"
+    )
+    return sidecar_path
+
+
+def append_embedded_seek_index(mivf_path: Path, seek_data: SeekIndexData) -> dict[str, int] | None:
+    if not seek_data.seek_points:
+        print(f"SEEK INDEX: no sync points found for {mivf_path}; skipping embedded footer")
+        return None
+
+    base_size = mivf_path.stat().st_size
+
+    # Payload length is independent of file_size field, so compute final size in 2 passes.
+    payload_probe = build_hfix58j_payload(base_size, seek_data.first_offset, seek_data.total_frames, seek_data.seek_points)
+    final_size = base_size + len(payload_probe) + MIVF_EMBED_IDX_FOOTER_SIZE
+    payload = build_hfix58j_payload(final_size, seek_data.first_offset, seek_data.total_frames, seek_data.seek_points)
+
+    index_offset = base_size
+    index_size = len(payload)
+    footer = struct.pack(
+        "<IIQIIII",
+        MIVF_EMBED_IDX_FOOTER_MAGIC,
+        MIVF_EMBED_IDX_FOOTER_VERSION,
+        index_offset,
+        index_size,
+        HFIX58J_IDX_MAGIC,
+        HFIX58J_IDX_VERSION,
+        0,
+    )
+
+    if len(footer) != MIVF_EMBED_IDX_FOOTER_SIZE:
+        raise RuntimeError(f"embedded footer size mismatch: {len(footer)}")
+
+    with mivf_path.open("ab") as out:
+        out.write(payload)
+        out.write(footer)
+
+    print(
+        "SEEK INDEX EMBEDDED: "
+        f"offset={index_offset} size={index_size} points={len(seek_data.seek_points)} "
+        f"final_file_size={final_size} path={mivf_path}"
+    )
+
+    return {
+        "index_offset": index_offset,
+        "index_size": index_size,
+        "final_file_size": final_size,
+    }
+
+
+def generate_seek_index_sidecar(mivf_path: Path, sidecar_path: Path | None = None) -> Path | None:
+    if sidecar_path is None:
+        sidecar_path = make_idx_sidecar_path(mivf_path)
+    seek_data = collect_seek_index_data(mivf_path)
+    if not seek_data.seek_points:
         print(f"SEEK INDEX: no sync points found for {mivf_path}; skipping sidecar")
         return None
 
-    total_frames = highest_frame + 1
-
-    with sidecar_path.open("wb") as idx:
-        idx.write(struct.pack("<I", HFIX58J_IDX_MAGIC))
-        idx.write(struct.pack("<I", HFIX58J_IDX_VERSION))
-        idx.write(struct.pack("<Q", file_size))
-        idx.write(struct.pack("<I", first))
-        idx.write(struct.pack("<I", total_frames))
-        idx.write(struct.pack("<I", len(seek_points)))
-
-        # Record layout must match player's Hfix58FSeekPoint ABI:
-        # u32 frame + 4-byte padding + u64 file_offset = 16 bytes.
-        for frame, file_offset in seek_points:
-            idx.write(struct.pack("<IIQ", frame, 0, file_offset))
-
-    print(
-        "SEEK INDEX: "
-        f"path={sidecar_path} points={len(seek_points)} total_frames={total_frames} "
-        f"file_size={file_size} first={first}"
+    payload = build_hfix58j_payload(
+        seek_data.file_size,
+        seek_data.first_offset,
+        seek_data.total_frames,
+        seek_data.seek_points,
     )
-    return sidecar_path
+    return write_seek_index_sidecar_payload(
+        mivf_path,
+        sidecar_path,
+        payload,
+        seek_data.seek_points,
+        seek_data.total_frames,
+        seek_data.file_size,
+        seek_data.first_offset,
+    )
 
 
 def fmt_time(secs: float) -> str:
@@ -1187,6 +1284,7 @@ def encode_one(
     deploy_sd: bool,
     make_m2y2: bool = False,
     make_seek_index: bool = True,
+    make_embedded_index: bool = True,
     seek_index_sidecar: Path | None = None,
 ) -> None:
     workdir = make_temp_workdir()
@@ -1216,10 +1314,35 @@ def encode_one(
         if make_seek_index:
             print()
             print("============================================================")
-            print("4. Generating Seek Index Sidecar")
+            print("4. Generating Seek Index Metadata")
             print("============================================================")
             try:
-                generate_seek_index_sidecar(output_path, seek_index_sidecar)
+                seek_data = collect_seek_index_data(output_path)
+                if not seek_data.seek_points:
+                    print(f"SEEK INDEX: no sync points found for {output_path}; skipping embedded+sidecar")
+                else:
+                    if make_embedded_index:
+                        append_embedded_seek_index(output_path, seek_data)
+                    else:
+                        print("SEEK INDEX EMBEDDED: disabled by --no-embedded-index")
+
+                    sidecar_path = seek_index_sidecar or make_idx_sidecar_path(output_path)
+                    final_file_size = output_path.stat().st_size
+                    sidecar_payload = build_hfix58j_payload(
+                        final_file_size,
+                        seek_data.first_offset,
+                        seek_data.total_frames,
+                        seek_data.seek_points,
+                    )
+                    write_seek_index_sidecar_payload(
+                        output_path,
+                        sidecar_path,
+                        sidecar_payload,
+                        seek_data.seek_points,
+                        seek_data.total_frames,
+                        final_file_size,
+                        seek_data.first_offset,
+                    )
             except Exception as exc:
                 print(f"WARNING: seek index generation failed: {exc}")
 
@@ -1235,6 +1358,7 @@ def encode_folder(
     settings: EncodeSettings,
     make_m2y2: bool = False,
     make_seek_index: bool = True,
+    make_embedded_index: bool = True,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     files = sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
@@ -1256,6 +1380,7 @@ def encode_folder(
             deploy_sd=False,
             make_m2y2=make_m2y2,
             make_seek_index=make_seek_index,
+            make_embedded_index=make_embedded_index,
             seek_index_sidecar=None,
         )
 
@@ -1288,6 +1413,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-deploy", action="store_true", help="skip SD card deployment")
     parser.add_argument("--m2y2", action="store_true", help="range-code video to the smaller M2Y2 codec (lossless, approximately 20 percent smaller)")
     parser.add_argument("--no-seek-index", action="store_true", help="do not generate .idx sidecar seek index")
+    parser.add_argument("--no-embedded-index", action="store_true", help="do not append embedded seek index payload/footer into output .mivf")
     parser.add_argument("--seek-index-sidecar", default=None, help="optional explicit path for generated .idx sidecar")
     return parser
 
@@ -1331,6 +1457,7 @@ def main() -> None:
             settings,
             make_m2y2=args.m2y2,
             make_seek_index=not args.no_seek_index,
+            make_embedded_index=not args.no_embedded_index,
         )
         return
 
@@ -1344,6 +1471,7 @@ def main() -> None:
         deploy_sd=not args.no_deploy,
         make_m2y2=args.m2y2,
         make_seek_index=not args.no_seek_index,
+        make_embedded_index=not args.no_embedded_index,
         seek_index_sidecar=seek_index_sidecar,
     )
 
