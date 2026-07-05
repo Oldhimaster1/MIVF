@@ -14,6 +14,9 @@
 #define MIVF_FAVORITES_PATH MIVF_APPDATA_DIR "/favorites.ini"
 #define MIVF_FAVORITES_LEGACY_PATH "sdmc:/mivf_favorites"
 
+#define MIVF_RECENTS_PATH MIVF_APPDATA_DIR "/recents.ini"
+#define MIVF_RECENTS_LEGACY_PATH "sdmc:/mivf_recents"
+
 #define MIVF_LOG_DIR MIVF_APPDATA_DIR "/logs"
 #define MIVF_LOG_PATH MIVF_LOG_DIR "/mivf.log"
 
@@ -34,6 +37,8 @@ typedef struct {
     bool force_stereo;
     bool debug_overlay_enabled;
     u32 subtitle_track_index;
+    int subtitle_delay_ms;     /* negative = earlier, positive = later */
+    u32 subtitle_position;     /* 0 = low, 1 = middle, 2 = high */
     u32 theme_index;
     u32 font_scale;
     u32 aspect_mode;          /* 0 = FIT, 1 = STRETCH, 2 = NATIVE */
