@@ -44,6 +44,13 @@ PAGE_HEADER_SIZE = 32
 PACKET_HEADER_SIZE = 16
 PAGE_CRC = 1
 PAGE_HAS_KEYFRAME = 2
+MAX_EMBEDDED_SEEK_POINTS = 4096
+EMBEDDED_SEEK_INDEX_MAGIC = b"MIDX"
+EMBEDDED_SEEK_FOOTER_MAGIC = b"MIFX"
+EMBEDDED_SEEK_VERSION = 1
+EMBEDDED_SEEK_HEADER_SIZE = 32
+EMBEDDED_SEEK_RECORD_SIZE = 12
+EMBEDDED_SEEK_FOOTER_SIZE = 32
 
 IMA_INDEX_TABLE = [
     -1, -1, -1, -1, 2, 4, 6, 8,
@@ -423,6 +430,194 @@ def wr_header(template: bytes, streams: int, first: int) -> bytes:
     buf[28:32] = struct.pack("<I", streams)
     buf[36:44] = struct.pack("<Q", first)
     return bytes(buf)
+
+
+def strip_embedded_seek_index(path: Path) -> None:
+    size = path.stat().st_size
+    if size < EMBEDDED_SEEK_FOOTER_SIZE + EMBEDDED_SEEK_HEADER_SIZE:
+        return
+
+    with path.open("r+b") as f:
+        f.seek(size - EMBEDDED_SEEK_FOOTER_SIZE)
+        footer = f.read(EMBEDDED_SEEK_FOOTER_SIZE)
+        if len(footer) != EMBEDDED_SEEK_FOOTER_SIZE:
+            return
+        if footer[:4] != EMBEDDED_SEEK_FOOTER_MAGIC:
+            return
+        version = le32(footer, 4)
+        index_offset = le64(footer, 8)
+        index_size = le64(footer, 16)
+        if version != EMBEDDED_SEEK_VERSION:
+            return
+        if index_offset < HEADER_SIZE:
+            return
+        if index_offset + index_size + EMBEDDED_SEEK_FOOTER_SIZE != size:
+            return
+        f.truncate(index_offset)
+
+
+def find_video_stream(desc: bytes, stream_count: int) -> tuple[int, bytes, int, int, int, int]:
+    if stream_count <= 0:
+        raise RuntimeError("MIVF stream count is zero")
+
+    p = 0
+    fallback_stride = len(desc) // stream_count if stream_count else 0
+
+    for _ in range(stream_count):
+        if p + 24 > len(desc):
+            break
+
+        hsize = le16(desc, p + 2)
+        if hsize < 24 or p + hsize > len(desc):
+            hsize = fallback_stride
+        if hsize < 24 or p + hsize > len(desc):
+            break
+
+        sid = desc[p]
+        stype = desc[p + 1]
+        codec = desc[p + 4:p + 8]
+
+        if stype == 1:
+            w = le16(desc, p + 16)
+            h = le16(desc, p + 18)
+            fpsn = le16(desc, p + 20) or DEFAULT_FPS
+            fpsd = le16(desc, p + 22) or 1
+            return sid, codec, w, h, fpsn, fpsd
+
+        p += hsize
+
+    raise RuntimeError("no video stream found")
+
+
+def packet_body_is_sync(body: bytes, flags: int, codec: bytes, w: int, h: int) -> bool:
+    if len(body) < 4:
+        return False
+
+    if body[:4] == b"M2Y0":
+        return True
+
+    if len(body) >= 13 and body[:3] == b"M2Y" and body[3] in (ord("1"), ord("2")):
+        return body[12] == 1
+
+    if body[:4] == b"M1P0":
+        return True
+
+    if flags & 1 and body[0] == ord("M") and body[1] in (ord("2"), ord("1")):
+        return True
+
+    if codec == b"RAWV":
+        raw_size = w * h * 2
+        return raw_size > 0 and len(body) == raw_size
+
+    return False
+
+
+def choose_embedded_seek_points(points: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if len(points) <= MAX_EMBEDDED_SEEK_POINTS:
+        return points
+
+    last = len(points) - 1
+    keep = MAX_EMBEDDED_SEEK_POINTS - 1
+    return [points[(i * last) // keep] for i in range(MAX_EMBEDDED_SEEK_POINTS)]
+
+
+def append_embedded_seek_index(path: Path) -> None:
+    strip_embedded_seek_index(path)
+
+    with path.open("r+b") as f:
+        header = f.read(HEADER_SIZE)
+        if len(header) != HEADER_SIZE or header[:4] != b"MIVF":
+            raise RuntimeError(f"{path}: not a MIVF file")
+
+        stream_count = le32(header, 12) or le32(header, 28)
+        first = le64(header, 36)
+        if first <= HEADER_SIZE or first > 4096:
+            raise RuntimeError(f"{path}: invalid first page offset {first}")
+
+        desc = f.read(first - HEADER_SIZE)
+        if len(desc) != first - HEADER_SIZE:
+            raise RuntimeError(f"{path}: short stream descriptor area")
+
+        video_sid, video_codec, video_w, video_h, fpsn, fpsd = find_video_stream(desc, stream_count)
+
+        points: list[tuple[int, int]] = []
+        highest_frame = -1
+        f.seek(first)
+
+        while True:
+            page_offset = f.tell()
+            page_header = f.read(PAGE_HEADER_SIZE)
+            if not page_header:
+                break
+            if len(page_header) != PAGE_HEADER_SIZE:
+                raise RuntimeError(f"{path}: short page header while indexing")
+            if page_header[:2] != b"MP":
+                break
+
+            payload_size = le32(page_header, 16)
+            packet_count = le16(page_header, 20)
+            payload = f.read(payload_size)
+            if len(payload) != payload_size:
+                raise RuntimeError(f"{path}: short page payload while indexing")
+
+            off = 0
+            for _ in range(packet_count):
+                if off + PACKET_HEADER_SIZE > payload_size:
+                    break
+
+                sid = payload[off]
+                flags = payload[off + 1]
+                hsize = le16(payload, off + 2)
+                psize = le32(payload, off + 8)
+                frame = le32(payload, off + 12)
+
+                if hsize < PACKET_HEADER_SIZE or off + hsize + psize > payload_size:
+                    break
+
+                if sid == video_sid:
+                    highest_frame = max(highest_frame, frame)
+                    body = payload[off + hsize:off + hsize + psize]
+                    if packet_body_is_sync(body, flags, video_codec, video_w, video_h):
+                        points.append((frame, page_offset))
+                        break
+
+                off += hsize + psize
+
+        points = choose_embedded_seek_points(points)
+        if not points:
+            print(f"WARNING: no seek points found for {path}; embedded index skipped")
+            return
+
+        duration_ticks = le64(header, 20)
+        duration_frames = 0
+        if duration_ticks and fpsn:
+            den = 30000 * (fpsd or 1)
+            duration_frames = (duration_ticks * fpsn + den - 1) // den
+        total_frames = max(highest_frame + 1, duration_frames, points[-1][0] + 1)
+
+        block = bytearray()
+        block += EMBEDDED_SEEK_INDEX_MAGIC
+        block += struct.pack(
+            "<IIIIQ",
+            EMBEDDED_SEEK_VERSION,
+            first,
+            total_frames & 0xFFFFFFFF,
+            len(points),
+            EMBEDDED_SEEK_RECORD_SIZE,
+        )
+        block += b"\x00" * (EMBEDDED_SEEK_HEADER_SIZE - len(block))
+
+        for frame, offset in points:
+            block += struct.pack("<IQ", frame & 0xFFFFFFFF, offset)
+
+        index_offset = f.seek(0, os.SEEK_END)
+        f.write(block)
+        f.write(
+            EMBEDDED_SEEK_FOOTER_MAGIC +
+            struct.pack("<IQQQ", EMBEDDED_SEEK_VERSION, index_offset, len(block), 0)
+        )
+
+    print(f"embedded seek index: points={len(points)} frames={total_frames} file={path.name}", flush=True)
 
 
 def encoder_segment_cmd(
@@ -1020,6 +1215,8 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
             tmp_m2y2 = output_path.with_name(output_path.stem + ".m2y2tmp")
             transcode_to_m2y2(output_path, tmp_m2y2)
             os.replace(tmp_m2y2, output_path)
+
+        append_embedded_seek_index(output_path)
 
         if deploy_sd:
             deploy_output(output_path)

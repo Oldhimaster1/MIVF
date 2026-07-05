@@ -8183,6 +8183,12 @@ static void hfix59r3_present_video_frame(
 #define HFIX58F_MAX_SEEK_POINTS 4096
 #define HFIX58F_SEEK_STEP_FRAMES 150
 #define HFIX58F_SYNC_INDEX_FAST_LIMIT_BYTES (256ull * 1024ull * 1024ull)
+#define HFIX58K_EMBED_IDX_MAGIC 0x5844494du
+#define HFIX58K_EMBED_IDX_FOOTER_MAGIC 0x5846494du
+#define HFIX58K_EMBED_IDX_VERSION 1u
+#define HFIX58K_EMBED_IDX_HEADER_SIZE 32u
+#define HFIX58K_EMBED_IDX_RECORD_SIZE 12u
+#define HFIX58K_EMBED_IDX_FOOTER_SIZE 32u
 
 typedef struct {
     u32 frame;
@@ -8889,6 +8895,87 @@ static void hfix58j_save_seek_cache(const char *cache_path, u64 file_size, u32 f
     }
 }
 
+static bool hfix58k_try_load_embedded_seek_index(FILE *f, u64 file_size, u32 first_offset) {
+    if (!f || file_size < (u64)(HFIX58K_EMBED_IDX_HEADER_SIZE + HFIX58K_EMBED_IDX_FOOTER_SIZE)) {
+        return false;
+    }
+
+    u8 footer[HFIX58K_EMBED_IDX_FOOTER_SIZE];
+
+    if (fseek(f, (long)(file_size - HFIX58K_EMBED_IDX_FOOTER_SIZE), SEEK_SET) != 0) {
+        return false;
+    }
+
+    if (fread(footer, 1, sizeof(footer), f) != sizeof(footer)) {
+        return false;
+    }
+
+    if (le32(footer + 0) != HFIX58K_EMBED_IDX_FOOTER_MAGIC ||
+        le32(footer + 4) != HFIX58K_EMBED_IDX_VERSION) {
+        return false;
+    }
+
+    u64 index_offset = le64(footer + 8);
+    u64 index_size = le64(footer + 16);
+
+    if (index_offset < first_offset ||
+        index_size < HFIX58K_EMBED_IDX_HEADER_SIZE ||
+        index_offset + index_size + HFIX58K_EMBED_IDX_FOOTER_SIZE != file_size) {
+        return false;
+    }
+
+    u8 hdr[HFIX58K_EMBED_IDX_HEADER_SIZE];
+
+    if (fseek(f, (long)index_offset, SEEK_SET) != 0) {
+        return false;
+    }
+
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        return false;
+    }
+
+    u32 magic = le32(hdr + 0);
+    u32 version = le32(hdr + 4);
+    u32 cached_first = le32(hdr + 8);
+    u32 total_frames = le32(hdr + 12);
+    u32 count = le32(hdr + 16);
+    u32 record_size = le32(hdr + 20);
+
+    if (magic != HFIX58K_EMBED_IDX_MAGIC ||
+        version != HFIX58K_EMBED_IDX_VERSION ||
+        cached_first != first_offset ||
+        count == 0 ||
+        count > HFIX58F_MAX_SEEK_POINTS ||
+        record_size != HFIX58K_EMBED_IDX_RECORD_SIZE ||
+        index_size != (u64)HFIX58K_EMBED_IDX_HEADER_SIZE + (u64)count * HFIX58K_EMBED_IDX_RECORD_SIZE) {
+        return false;
+    }
+
+    for (u32 i = 0; i < count; i++) {
+        u8 rec[HFIX58K_EMBED_IDX_RECORD_SIZE];
+
+        if (fread(rec, 1, sizeof(rec), f) != sizeof(rec)) {
+            return false;
+        }
+
+        g_hfix58f_seek.points[i].frame = le32(rec + 0);
+        g_hfix58f_seek.points[i].file_offset = le64(rec + 4);
+
+        if (g_hfix58f_seek.points[i].file_offset < first_offset ||
+            g_hfix58f_seek.points[i].file_offset >= index_offset) {
+            return false;
+        }
+    }
+
+    g_hfix58f_seek.count = count;
+    g_hfix58f_seek.total_frames = total_frames;
+    g_hfix58f_seek.ready = true;
+    g_media_ctl.total_frames = total_frames;
+
+    hfix58_alert_set("EMBEDDED SEEK INDEX", 1);
+    return true;
+}
+
 static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v) {
     memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
 
@@ -8913,6 +9000,13 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
 
     u64 file_size = (u64)end_pos_l;
     char cache_path[512];
+
+    if (hfix58k_try_load_embedded_seek_index(f, file_size, first_offset)) {
+        if (saved >= 0) {
+            fseek(f, saved, SEEK_SET);
+        }
+        return true;
+    }
 
     if (hfix58j_make_idx_path(cache_path, sizeof(cache_path), MIVF_PATH)) {
         /*
