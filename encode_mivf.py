@@ -45,6 +45,10 @@ PACKET_HEADER_SIZE = 16
 PAGE_CRC = 1
 PAGE_HAS_KEYFRAME = 2
 
+HFIX58F_MAX_SEEK_POINTS = 4096
+HFIX58J_IDX_MAGIC = 0x314A4458
+HFIX58J_IDX_VERSION = 2
+
 IMA_INDEX_TABLE = [
     -1, -1, -1, -1, 2, 4, 6, 8,
     -1, -1, -1, -1, 2, 4, 6, 8,
@@ -129,6 +133,181 @@ def wr_u32le(buf: bytearray, offset: int, value: int) -> None:
 
 def wr_u64le(buf: bytearray, offset: int, value: int) -> None:
     struct.pack_into("<Q", buf, offset, value)
+
+
+def make_idx_sidecar_path(mivf_path: Path) -> Path:
+    return mivf_path.with_suffix(".idx")
+
+
+def body_is_m2y_delta_codec(body: bytes) -> bool:
+    return (
+        len(body) >= 13
+        and body[0:3] == b"M2Y"
+        and body[3] in (ord("1"), ord("2"))
+    )
+
+
+def body_is_m2y_keyframe(body: bytes) -> bool:
+    return body_is_m2y_delta_codec(body) and body[12] == 1
+
+
+def packet_body_is_sync_video(body: bytes, codec: bytes, width: int, height: int, flags: int, psize: int) -> bool:
+    if len(body) < 4:
+        return False
+
+    if body[0:4] == b"M2Y0":
+        return True
+
+    if body_is_m2y_delta_codec(body):
+        return body_is_m2y_keyframe(body)
+
+    if body[0:4] == b"M1P0":
+        return True
+
+    if (not body_is_m2y_delta_codec(body)) and (flags & 1) and body[0] == ord("M") and body[1] in (ord("1"), ord("2")):
+        return True
+
+    if codec == b"RAWV":
+        raw_size = width * height * 2
+        if raw_size > 0 and psize == raw_size:
+            return True
+
+    return False
+
+
+def parse_video_stream_desc(desc_blob: bytes) -> tuple[int, bytes, int, int]:
+    pos = 0
+    while pos + STREAM_DESC_SIZE <= len(desc_blob):
+        dsize = le16(desc_blob, pos + 2)
+        if dsize < STREAM_DESC_SIZE or pos + dsize > len(desc_blob):
+            break
+
+        sid = desc_blob[pos + 0]
+        stype = desc_blob[pos + 1]
+        codec = bytes(desc_blob[pos + 4:pos + 8])
+        width = le16(desc_blob, pos + 16)
+        height = le16(desc_blob, pos + 18)
+
+        if stype == 1:
+            return sid, codec, width, height
+
+        pos += dsize
+
+    raise RuntimeError("video stream descriptor not found")
+
+
+def generate_seek_index_sidecar(mivf_path: Path, sidecar_path: Path | None = None) -> Path | None:
+    if sidecar_path is None:
+        sidecar_path = make_idx_sidecar_path(mivf_path)
+
+    file_size = mivf_path.stat().st_size
+
+    with mivf_path.open("rb") as f:
+        header = f.read(HEADER_SIZE)
+        if len(header) != HEADER_SIZE or header[:4] != b"MIVF":
+            raise RuntimeError(f"{mivf_path}: not a valid MIVF file")
+
+        first = le64(header, 36)
+        if first <= HEADER_SIZE or first > 4096:
+            raise RuntimeError(f"{mivf_path}: invalid first page offset {first}")
+
+        desc_blob = f.read(first - HEADER_SIZE)
+        if len(desc_blob) != first - HEADER_SIZE:
+            raise RuntimeError(f"{mivf_path}: short stream descriptor block")
+
+        video_sid, video_codec, video_w, video_h = parse_video_stream_desc(desc_blob)
+
+        seek_points: list[tuple[int, int]] = []
+        highest_frame = 0
+        pos = first
+
+        while pos + PAGE_HEADER_SIZE <= file_size and len(seek_points) < HFIX58F_MAX_SEEK_POINTS:
+            f.seek(pos)
+            page_hdr = f.read(PAGE_HEADER_SIZE)
+            if len(page_hdr) != PAGE_HEADER_SIZE:
+                break
+
+            if page_hdr[:2] != b"MP":
+                break
+
+            payload = le32(page_hdr, 16)
+            packets = le16(page_hdr, 20)
+
+            if payload == 0 or payload > (512 * 1024) or packets == 0 or packets > 128:
+                break
+
+            page_payload_start = pos + PAGE_HEADER_SIZE
+            page_end = page_payload_start + payload
+            if page_end > file_size:
+                break
+
+            pkt_pos = page_payload_start
+            page_sync_frame: int | None = None
+
+            for _ in range(packets):
+                if pkt_pos + PACKET_HEADER_SIZE > page_end:
+                    break
+
+                f.seek(pkt_pos)
+                pkt_hdr = f.read(PACKET_HEADER_SIZE)
+                if len(pkt_hdr) != PACKET_HEADER_SIZE:
+                    break
+
+                pkt_sid = pkt_hdr[0]
+                pkt_flags = pkt_hdr[1]
+                hsize = le16(pkt_hdr, 2)
+                psize = le32(pkt_hdr, 8)
+                frame = le32(pkt_hdr, 12)
+
+                if hsize < PACKET_HEADER_SIZE or pkt_pos + hsize + psize > page_end:
+                    break
+
+                if pkt_sid == video_sid:
+                    if frame > highest_frame:
+                        highest_frame = frame
+
+                    probe_len = min(psize, 16)
+                    body = b""
+                    if probe_len > 0:
+                        f.seek(pkt_pos + hsize)
+                        body = f.read(probe_len)
+
+                    if packet_body_is_sync_video(body, video_codec, video_w, video_h, pkt_flags, psize):
+                        page_sync_frame = frame
+                        break
+
+                pkt_pos += hsize + psize
+
+            if page_sync_frame is not None:
+                seek_points.append((page_sync_frame, pos))
+
+            pos = page_end
+
+    if not seek_points:
+        print(f"SEEK INDEX: no sync points found for {mivf_path}; skipping sidecar")
+        return None
+
+    total_frames = highest_frame + 1
+
+    with sidecar_path.open("wb") as idx:
+        idx.write(struct.pack("<I", HFIX58J_IDX_MAGIC))
+        idx.write(struct.pack("<I", HFIX58J_IDX_VERSION))
+        idx.write(struct.pack("<Q", file_size))
+        idx.write(struct.pack("<I", first))
+        idx.write(struct.pack("<I", total_frames))
+        idx.write(struct.pack("<I", len(seek_points)))
+
+        # Record layout must match player's Hfix58FSeekPoint ABI:
+        # u32 frame + 4-byte padding + u64 file_offset = 16 bytes.
+        for frame, file_offset in seek_points:
+            idx.write(struct.pack("<IIQ", frame, 0, file_offset))
+
+    print(
+        "SEEK INDEX: "
+        f"path={sidecar_path} points={len(seek_points)} total_frames={total_frames} "
+        f"file_size={file_size} first={first}"
+    )
+    return sidecar_path
 
 
 def fmt_time(secs: float) -> str:
@@ -947,6 +1126,11 @@ def deploy_output(output_path: Path) -> None:
     else:
         print(f"WARNING: Bundled 3DS payload not found at {player_3dsx}; skipping 3DS copy.")
     shutil.copy2(output_path, sd_card / output_path.name)
+
+    sidecar_idx = make_idx_sidecar_path(output_path)
+    if sidecar_idx.exists():
+        shutil.copy2(sidecar_idx, sd_card / sidecar_idx.name)
+
     print("DEPLOY SUCCESSFUL!")
 
 
@@ -996,7 +1180,15 @@ def transcode_to_m2y2(src: Path, dst: Path) -> None:
         raise SystemExit(f"M2Y2 transcode failed (exit code {result.returncode}).")
 
 
-def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, deploy_sd: bool, make_m2y2: bool = False) -> None:
+def encode_one(
+    input_path: Path,
+    output_path: Path,
+    settings: EncodeSettings,
+    deploy_sd: bool,
+    make_m2y2: bool = False,
+    make_seek_index: bool = True,
+    seek_index_sidecar: Path | None = None,
+) -> None:
     workdir = make_temp_workdir()
     try:
         temp_video_only = workdir / "temp_video_only.mivf"
@@ -1021,13 +1213,29 @@ def encode_one(input_path: Path, output_path: Path, settings: EncodeSettings, de
             transcode_to_m2y2(output_path, tmp_m2y2)
             os.replace(tmp_m2y2, output_path)
 
+        if make_seek_index:
+            print()
+            print("============================================================")
+            print("4. Generating Seek Index Sidecar")
+            print("============================================================")
+            try:
+                generate_seek_index_sidecar(output_path, seek_index_sidecar)
+            except Exception as exc:
+                print(f"WARNING: seek index generation failed: {exc}")
+
         if deploy_sd:
             deploy_output(output_path)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def encode_folder(input_dir: Path, output_dir: Path, settings: EncodeSettings, make_m2y2: bool = False) -> None:
+def encode_folder(
+    input_dir: Path,
+    output_dir: Path,
+    settings: EncodeSettings,
+    make_m2y2: bool = False,
+    make_seek_index: bool = True,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     files = sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
 
@@ -1041,7 +1249,15 @@ def encode_folder(input_dir: Path, output_dir: Path, settings: EncodeSettings, m
         print(f"Encoding: {source}")
         print(f"Output:   {target}")
         print("============================================================")
-        encode_one(source, target, settings, deploy_sd=False, make_m2y2=make_m2y2)
+        encode_one(
+            source,
+            target,
+            settings,
+            deploy_sd=False,
+            make_m2y2=make_m2y2,
+            make_seek_index=make_seek_index,
+            seek_index_sidecar=None,
+        )
 
     print()
     print(f"Batch encode complete. Outputs are in: {output_dir}")
@@ -1071,6 +1287,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-frames", type=int, default=DEFAULT_CHUNK_FRAMES, help=f"frames per streaming worker chunk, default {DEFAULT_CHUNK_FRAMES}")
     parser.add_argument("--no-deploy", action="store_true", help="skip SD card deployment")
     parser.add_argument("--m2y2", action="store_true", help="range-code video to the smaller M2Y2 codec (lossless, approximately 20 percent smaller)")
+    parser.add_argument("--no-seek-index", action="store_true", help="do not generate .idx sidecar seek index")
+    parser.add_argument("--seek-index-sidecar", default=None, help="optional explicit path for generated .idx sidecar")
     return parser
 
 
@@ -1102,14 +1320,32 @@ def main() -> None:
     input_path = Path(args.input)
     output_path = Path(args.output)
 
+    seek_index_sidecar = Path(args.seek_index_sidecar) if args.seek_index_sidecar else None
+
     if input_path.is_dir():
-        encode_folder(input_path, output_path, settings, make_m2y2=args.m2y2)
+        if seek_index_sidecar is not None:
+            raise SystemExit("--seek-index-sidecar is only supported for single-file encode")
+        encode_folder(
+            input_path,
+            output_path,
+            settings,
+            make_m2y2=args.m2y2,
+            make_seek_index=not args.no_seek_index,
+        )
         return
 
     if not input_path.exists():
         raise SystemExit(f"Input file not found: {input_path}")
 
-    encode_one(input_path, output_path, settings, deploy_sd=not args.no_deploy, make_m2y2=args.m2y2)
+    encode_one(
+        input_path,
+        output_path,
+        settings,
+        deploy_sd=not args.no_deploy,
+        make_m2y2=args.m2y2,
+        make_seek_index=not args.no_seek_index,
+        seek_index_sidecar=seek_index_sidecar,
+    )
 
 
 if __name__ == "__main__":
