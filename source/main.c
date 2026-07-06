@@ -5417,24 +5417,31 @@ static void hfix58_draw_alert(u8 *fb) {
     int rr = 70;
     int gg = 150;
     int bb = 230;
+    int tr = 245;
+    int tg = 250;
+    int tb = 255;
 
     if (g_hfix58_alert_level == 1) {
         rr = 70; gg = 210; bb = 110;
         kind = "OK";
+        tr = 225; tg = 255; tb = 232;
     } else if (g_hfix58_alert_level == 2) {
         rr = 235; gg = 150; bb = 45;
         kind = "WARN";
+        tr = 255; tg = 238; tb = 214;
     } else if (g_hfix58_alert_level == 3) {
         rr = 235; gg = 70; bb = 70;
         kind = "STOP";
+        tr = 255; tg = 226; tb = 226;
     }
 
     hfix58_rect565(fb, 22, 58, 276, 30, 3, 6, 14);
     hfix58_rect565(fb, 24, 60, 272, 26, 14, 20, 34);
+    hfix58_rect565(fb, 24, 60, 272, 1, rr / 2, gg / 2, bb / 2);
     hfix58_rect565(fb, 24, 60, 4, 26, rr, gg, bb);
     hfix58_rect565(fb, 32, 64, 38, 14, rr / 2, gg / 2, bb / 2);
 
-    hfix58_draw_text_shadow(fb, 38, 67, kind, 1, 245, 250, 255);
+    hfix58_draw_text_shadow(fb, 38, 67, kind, 1, tr, tg, tb);
     hfix58_draw_text_shadow(fb, 78, 67, g_hfix58_alert_text, 1, 240, 245, 255);
 
     if (g_hfix58_alert_frames > 0) {
@@ -7549,7 +7556,8 @@ static void hfix58d_draw_fluent_panel(u8 *fb, int panel_y) {
 
     int footer_y = panel_y + 120;
     if (footer_y < 232) {
-        hfix58_draw_text_shadow(fb, 22, footer_y, "D-PAD SELECT   A PRESS   L+D-PAD AUDIO", 1, 170, 190, 215);
+        hfix58_rect565(fb, 22, footer_y - 4, 276, 1, 40, 62, 94);
+        hfix58_draw_text_shadow(fb, 22, footer_y, "D-PAD SELECT   A PRESS   L+D-PAD AUDIO", 1, 202, 222, 244);
     }
 }
 
