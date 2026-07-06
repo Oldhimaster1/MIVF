@@ -2972,7 +2972,15 @@ static void hfix59r3_draw_settings_overlay(u8 *fb) {
 
         hfix58_draw_text_shadow(fb, 30, y, hfix59r3_settings_group(i), 1, 130, 165, 205);
         hfix58_draw_text_shadow(fb, 80, y, hfix59r3_settings_label(i), 1, selected ? 255 : 205, selected ? 255 : 220, selected ? 255 : 235);
-        hfix58_draw_text_shadow(fb, 222, y, value, 1, 170, 205, 245);
+        hfix58_draw_text_shadow(
+            fb,
+            222,
+            y,
+            value,
+            1,
+            selected ? 210 : 182,
+            selected ? 236 : 214,
+            selected ? 255 : 244);
     }
 
     if (HFIX59R3_SETTINGS_COUNT > HFIX59R3_SETTINGS_VISIBLE) {
@@ -2986,8 +2994,9 @@ static void hfix59r3_draw_settings_overlay(u8 *fb) {
         hfix58_rect565(fb, 292, knob_y, 4, knob_h, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
     }
 
-    hfix58_draw_text_shadow(fb, 24, 216, "UP/DOWN MOVE  LEFT/RIGHT CHANGE", 1, 190, 215, 235);
-    hfix58_draw_text_shadow(fb, 24, 226, "SELECT OR B CLOSES AND SAVES", 1, 190, 215, 235);
+    hfix58_rect565(fb, 22, 212, 266, 1, 44, 66, 96);
+    hfix58_draw_text_shadow(fb, 24, 216, "UP/DOWN MOVE  LEFT/RIGHT CHANGE", 1, 208, 228, 246);
+    hfix58_draw_text_shadow(fb, 24, 226, "SELECT OR B CLOSES AND SAVES", 1, 208, 228, 246);
 }
 
 static void hfix58d_draw_bottom_fluent_ui(u8 *fb);
@@ -6314,10 +6323,11 @@ static void hfix58_draw_browser_preview(u8 *fb) {
         hfix58_draw_text_shadow(fb, x + 83, y + 72, "CONT", 1, 220, 255, 220);
     }
 
-    hfix58_draw_text_shadow(fb, x + 8, y + 88, g_hfix58_preview.title[0] ? g_hfix58_preview.title : "NO FILE", 1, 210, 225, 245);
-    hfix58_draw_text_shadow(fb, x + 8, y + 100, g_hfix58_preview.summary[0] ? g_hfix58_preview.summary : "", 1, 185, 205, 230);
-    hfix58_draw_text_shadow(fb, x + 8, y + 112, g_hfix58_preview.detail[0] ? g_hfix58_preview.detail : "", 1, 185, 205, 230);
-    hfix58_draw_text_shadow(fb, x + 8, y + 124, g_hfix58_preview.extra[0] ? g_hfix58_preview.extra : "", 1, 170, 190, 215);
+    hfix58_rect565(fb, x + 8, y + 84, 114, 1, 34, 48, 72);
+    hfix58_draw_text_shadow(fb, x + 8, y + 90, g_hfix58_preview.title[0] ? g_hfix58_preview.title : "NO FILE", 1, 210, 225, 245);
+    hfix58_draw_text_shadow(fb, x + 8, y + 102, g_hfix58_preview.summary[0] ? g_hfix58_preview.summary : "", 1, 185, 205, 230);
+    hfix58_draw_text_shadow(fb, x + 8, y + 114, g_hfix58_preview.detail[0] ? g_hfix58_preview.detail : "", 1, 185, 205, 230);
+    hfix58_draw_text_shadow(fb, x + 8, y + 126, g_hfix58_preview.extra[0] ? g_hfix58_preview.extra : "", 1, 170, 190, 215);
 
     /* HFIX60: optional synopsis from a ".nfo" sidecar. */
     if (g_hfix58_preview.synopsis1[0]) {
@@ -6501,12 +6511,15 @@ static void hfix58_draw_browser(u8 *fb) {
 
     hfix58_blend_rect565(fb, 18, 46, 150, 22, 6, 10, 22, 220);
     hfix58_draw_text_shadow(fb, 26, 53, g_hfix58_browser.cwd, 1, 160, 200, 255);
+    hfix58_rect565(fb, 24, 68, 132, 1, 36, 58, 90);
 
     hfix58_draw_browser_preview(fb);
 
     if (g_hfix58_browser.count <= 0) {
-        hfix58_draw_text_shadow(fb, 36, 106, "NO .MIVF FILES FOUND", 1, 250, 180, 70);
-        hfix58_draw_text_shadow(fb, 42, 132, "PUT FILES IN SDMC:/MIVF", 1, 210, 220, 230);
+        hfix58_blend_rect565(fb, 24, 98, 138, 52, 10, 14, 26, 230);
+        hfix58_rect565(fb, 24, 98, 4, 52, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+        hfix58_draw_text_shadow(fb, 34, 108, "NO .MIVF FILES FOUND", 1, 250, 186, 86);
+        hfix58_draw_text_shadow(fb, 38, 132, "PUT FILES IN SDMC:/MIVF", 1, 216, 226, 236);
     } else {
         int first = g_hfix58_browser.scroll;
         int last = first + HFIX58_BROWSER_VISIBLE_ROWS;
@@ -6515,11 +6528,11 @@ static void hfix58_draw_browser(u8 *fb) {
             last = g_hfix58_browser.count;
         }
 
-        hfix58_draw_text_shadow(fb, 28, 70,
+        hfix58_draw_text_shadow(fb, 28, 72,
             (first == 0 && g_hfix58_browser.entries[0].quick) ? "QUICK ACCESS" : "FILES",
             1, 140, 175, 210);
 
-        int y = 82;
+        int y = 84;
 
         for (int i = first; i < last; i++) {
             bool selected = (i == g_hfix58_browser.selected);
@@ -6577,7 +6590,7 @@ static void hfix58_draw_browser(u8 *fb) {
             Scroll bar.
         */
         if (g_hfix58_browser.count > HFIX58_BROWSER_VISIBLE_ROWS) {
-            int track_y = 82;
+            int track_y = 84;
             int track_h = HFIX58_BROWSER_VISIBLE_ROWS * 14;
             int knob_h = (track_h * HFIX58_BROWSER_VISIBLE_ROWS) / g_hfix58_browser.count;
 
@@ -6596,7 +6609,8 @@ static void hfix58_draw_browser(u8 *fb) {
     }
 
     hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
-    hfix58_draw_text_shadow(fb, 24, 212, "A OPEN   Y FAVORITE   B BACK   START EXIT", 1, 210, 225, 245);
+    hfix58_rect565(fb, 22, 205, 276, 1, 40, 62, 94);
+    hfix58_draw_text_shadow(fb, 24, 212, "A OPEN   Y FAVORITE   B BACK   START EXIT", 1, 222, 236, 252);
 
     hfix58_draw_alert(fb);
 }
@@ -7606,7 +7620,7 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         hfix58_draw_text_shadow(fb, 31, 78, speed_t, 1, 190, 220, 255);
 
         hfix58_rect565(fb, 74, 76, 42, 10, 20, 30, 48);
-        hfix58_draw_text_shadow(fb, 79, 78, hfix60_aspect_name(g_mivf_settings.aspect_mode), 1, 190, 220, 255);
+        hfix58_draw_text_shadow(fb, 79, 78, hfix60_aspect_name(g_mivf_settings.aspect_mode), 1, 206, 228, 255);
 
         hfix58_rect565(fb, 122, 76, 38, 10, 20, 30, 48);
         hfix58_draw_text_shadow(fb, 127, 78,
@@ -7617,7 +7631,7 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
             (g_mivf_settings.show_subtitle_tracks && g_hfix58s_subtitles_ready) ? 210 : 175);
 
         hfix58_rect565(fb, 166, 76, 36, 10, 20, 30, 48);
-        hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 190, 220, 255);
+        hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 206, 228, 255);
 
         int meter_x = 222;
         int meter_y = 74;
@@ -7630,7 +7644,7 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
 
         char vol_txt[32];
         snprintf(vol_txt, sizeof(vol_txt), "VOL %d%%", vol);
-        hfix58_draw_text_shadow(fb, 222, 62, vol_txt, 1, 230, 240, 250);
+        hfix58_draw_text_shadow(fb, 222, 62, vol_txt, 1, 238, 246, 255);
 
         hfix58_rect565(fb, meter_x, meter_y, meter_w, meter_h, 19, 27, 40);
         hfix58_rect565(fb, meter_x, meter_y, fill, meter_h, 70, 210, 130);
