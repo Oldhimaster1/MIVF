@@ -6576,7 +6576,19 @@ static void hfix58_draw_browser(u8 *fb) {
             */
             line[16] = '\0';
 
-            hfix58_rect565(fb, 30, y - 2, 22, 10, br, bg, bb);
+            hfix58_blend_rect565(fb, 29, y - 3, 24, 12,
+                selected ? br + 20 : br,
+                selected ? bg + 20 : bg,
+                selected ? bb + 18 : bb,
+                selected ? 242 : 228);
+            hfix58_rect565(fb, 30, y - 2, 22, 1,
+                selected ? 255 : 220,
+                selected ? 255 : 235,
+                selected ? 255 : 248);
+            hfix58_rect565(fb, 30, y + 7, 22, 1,
+                br > 10 ? br - 10 : br,
+                bg > 10 ? bg - 10 : bg,
+                bb > 12 ? bb - 12 : bb);
             hfix58_draw_text_shadow(fb, 33, y, badge, 1, 235, 245, 255);
 
             hfix58_draw_text_shadow(
