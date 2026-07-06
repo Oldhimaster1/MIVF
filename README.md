@@ -1,159 +1,157 @@
-MIVF Player for Nintendo 3DS
+# MIVF Player for Nintendo 3DS
 
-A homebrew video player for the Nintendo 3DS. MIVF is a custom, page‑based video container with its own software codecs, a native C player that runs on the console, and a standalone encoder that turns ordinary `.mp4` or `.mkv` files into `.mivf`.
+A homebrew video player for the Nintendo 3DS. MIVF uses a custom page-based video container, software codecs tuned for the ARM11, a native C player, and a PC-side encoder that converts ordinary video files into `.mivf`.
 
-It is built for the real hardware: the codecs are tuned for the ARM11, the player streams pages from the SD card with a background reader, and the whole UI (file browser, transport, settings) is drawn straight into the RGB565 framebuffers.
-
-**Status:** Works on real hardware and on the Azahar emulator. Tested primarily at 400×240, 30 fps.
+**Status:** Tested on real hardware (New 3DS / Old 3DS) and the Azahar emulator. Primary target: 400×240, 30 fps. Old 3DS may need the `--profile 3ds-fast` encoder preset for smooth playback.
 
 ## Features
 
-* **Custom codecs:** M2Y1 (raw token YUV420) and M2Y2 (the same picture, entropy‑coded with a division‑free binary range coder, ~24% smaller and still a locked 30 fps on hardware). Also reads RAWV, M2Y0, and PC16/IA4M audio.
-* **File browser:** Includes thumbnails, posters, synopsis, and favorites.
-* **MoFlex staging:** The playback-only MoFlex backend is vendored and building. `.moflex` files are visible in the browser, but playback dispatch is not enabled yet.
-* **Auto‑resume bookmarks:** Pick up exactly where you left off.
-* **Playlists / auto‑advance:** Automatically play the next file in the folder.
-* **Aspect‑ratio modes:** FIT (letterbox), STRETCH (fill), NATIVE (1:1).
-* **A/B scene looper:** Mark two points and loop the section.
-* **Playback speed:** 0.5× to 2.0×, audio stays in sync.
-* **Sleep timer + clamshell pause/park:** Closes cleanly and resumes on wake.
-* **Customization:** Subtitles (`.srt`, multiple tracks), chapters, themes, adjustable brightness, font scale, and a persistent settings menu.
-* **Touch transport:** Drag the timeline to scrub.
-
----
+- **Custom codecs:** M2Y1 (raw-token YUV420) and M2Y2 (entropy-coded with a division-free binary range coder — smaller files, similar quality). Also supports RAWV, M2Y0, and PC16/IA4M audio.
+- **File browser:** thumbnail previews, `.cover` posters, `.nfo` synopsis, favorites, and recents with debounced preview loading for smooth scrolling.
+- **MoFlex playback:** `.moflex` (MobiClip 3D video) files are recognized in the browser and play via the built-in MoFlex backend. See [docs/MOFLEX_STATUS.md](docs/MOFLEX_STATUS.md) for details.
+- **Auto-resume bookmarks:** pick up where you left off.
+- **Auto-advance:** automatically play the next file in the folder.
+- **Aspect ratio modes:** FIT (letterbox), STRETCH (fill), NATIVE (1:1).
+- **A/B scene looper:** mark two points and loop the section.
+- **Playback speed:** 0.5× to 2.0× with pitch-corrected audio.
+- **Sleep timer + lid-close pause:** pauses cleanly and resumes on wake.
+- **Subtitles:** `.srt` support with multiple tracks, adjustable delay and position.
+- **Chapters:** `.chapters` sidecar with named markers, previous/next navigation.
+- **Customization:** themes, adjustable brightness, auto-dim, font scale, persistent settings saved on close.
+- **Touch transport:** drag the timeline to scrub.
+- **Seek index:** sidecar `.idx` and embedded footer for fast seeking. Large uncached files skip expensive synchronous scanning at open time.
 
 ## Controls
 
-### File Browser
-| Button | Action |
+See [docs/CONTROLS.md](docs/CONTROLS.md) for the full control map.
+
+### Quick Reference
+
+| Context | Button | Action |
+| :--- | :--- | :--- |
+| Browser | D-Pad ↑/↓ | Move selection |
+| Browser | A | Open file |
+| Browser | Y | Toggle favorite |
+| Browser | B / START | Exit |
+| Playback | A | Play / pause |
+| Playback | ←/→ | Seek ±5 s |
+| Playback | Touch + drag | Scrub timeline |
+| Playback | X | Cycle playback speed |
+| Playback | B | A/B loop marker |
+| Playback | Y | Cycle subtitle track |
+| Playback | L + D-Pad | Audio volume |
+| Playback | R + ↑/↓ | Screen brightness |
+| Playback | R + ←/→ | Previous / next chapter |
+| Playback | SELECT | Open settings |
+| Playback | START | Stop and return to browser |
+
+### Settings (SELECT)
+D-Pad ↑/↓ to move, A/←/→ to change, B or SELECT to close and save.
+
+## Installation
+
+See [docs/INSTALLING.md](docs/INSTALLING.md) for detailed instructions.
+
+1. Download `mivf_player_3ds.cia` (HOME menu) or `mivf_player_3ds.3dsx` (Homebrew Launcher) from the [Releases page](../../releases).
+2. Install `.cia` with FBI, or place `.3dsx` in `sdmc:/3ds/`.
+3. Put `.mivf` files in `sdmc:/mivf/`. The player also scans `sdmc:/3ds/mivf_player_3ds/` and the SD root.
+4. Settings and app data live under `sdmc:/3ds/mivf_player_3ds/appdata/`. Legacy root-level settings are still read for migration.
+
+## Encoding Videos
+
+See [docs/ENCODING.md](docs/ENCODING.md) for full encoder documentation and tuning guidance.
+
+Quick examples:
+
+```bash
+# Recommended: M2Y2 (smaller files, same quality)
+python encode_mivf.py input.mp4 output.mivf --m2y2
+
+# Old 3DS: smaller packets for smoother playback
+python encode_mivf.py input.mp4 output.mivf --m2y2 --profile 3ds-fast
+
+# Batch encode a folder
+python encode_mivf.py ./videos/ ./output/
+```
+
+**Requirements:** Python 3 and `ffmpeg` on your system PATH.
+
+### Key Encoder Flags
+
+| Flag | Purpose |
 | :--- | :--- |
-| **D‑Pad ↑/↓** | Move selection |
-| **A** | Play |
-| **Y** | Toggle favorite |
-| **B / START** | Exit |
+| `--m2y2` | Use M2Y2 codec (smaller files, ~20% savings) |
+| `--profile 3ds-fast` | Tune for Old 3DS playback smoothness |
+| `--report-packet-sizes` | Print per-video-packet size histogram after encoding |
+| `--no-seek-index` | Skip `.idx` sidecar generation |
+| `--no-embedded-index` | Skip embedded seek footer in `.mivf` |
+| `--qp` | Quality parameter (higher QP = smaller file, lower quality) |
+| `--keep {4,8,16}` | Transform coefficients per quadrant (16 = max detail, 4 = smallest) |
+| `--fps` | Override output frame rate |
+| `--jobs` | Parallel encoder workers (default 8) |
+| `--audio-codec {ia4m,pc16}` | Audio format: ia4m (ADPCM mono, small) or pc16 (PCM stereo, larger) |
 
-### Playback
-| Button | Action |
-| :--- | :--- |
-| **A** | Play / pause |
-| **← / →** | Seek −/+ (~5 s) |
-| **Touch + drag** | Scrub timeline |
-| **X** | Cycle playback speed (0.5×–2.0×) |
-| **B** | A/B loop: set A → set B → clear |
-| **Y** | Cycle subtitle track |
-| **L + D‑Pad** | Audio (volume / stereo) |
-| **R + ↑/↓** | Screen brightness |
-| **R + ←/→** | Previous / next chapter |
-| **SELECT** | Open settings |
-| **START** | Stop and return to the browser |
+See `python encode_mivf.py --help` for the complete flag list.
 
-### Settings menu (SELECT)
-Use **D‑Pad ↑/↓** to move, **A / ← / →** to change, and **B or SELECT** to close and save. 
+## Sidecar Files
 
-Items include: Resume bookmarks, Auto dim, Dim timeout/brightness, Force stereo, Debug overlay, Subtitle tracks, Chapters, Favorites, Theme skin, Font scale, Sleep on lid close, Screen brightness, Aspect ratio, Playback speed, Auto‑advance, and Sleep timer.
-
-> **Note:** Settings, bookmarks, favorites, logs, cache, and benchmark data now live under `sdmc:/3ds/mivf_player_3ds/appdata/`. Legacy root-level settings/bookmark/favorites files are still read for migration.
-
----
-
-## Installing
-
-The easiest way to install MIVF Player is to grab the latest release from the **[Releases Page](../../releases)**.
-
-1. **For a HOME-menu icon:** Download `mivf_player_3ds.cia` and install it using a title manager like FBI.
-2. **For the Homebrew Launcher:** Download `mivf_player_3ds.3dsx`, place it in `sdmc:/3ds/`, and launch it via the Homebrew Launcher.
-
-Put your compiled `.mivf` video files in `sdmc:/mivf/` (the player also scans `sdmc:/3ds/mivf_player_3ds/` and the SD root).
-
-### Optional sidecar files
 Place these next to `yourvideo.mivf`:
 
 | File | Purpose |
 | :--- | :--- |
 | `yourvideo.srt`, `yourvideo.1.srt` | Subtitle tracks (cycle with Y) |
-| `yourvideo.chapters` | Chapter marks: `SECONDS Label`, `H:MM:SS Label`, or just `SECONDS` |
-| `yourvideo.cover` | Poster (raw RGB565, browser‑preview sized) |
-| `yourvideo.nfo` | Synopsis text shown in the browser |
+| `yourvideo.chapters` | Chapter markers with optional labels |
+| `yourvideo.cover` | Poster image (raw RGB565, browser-preview size) |
+| `yourvideo.nfo` | Synopsis text shown in the browser preview |
+| `yourvideo.idx` | Seek index sidecar (auto-generated by encoder) |
 
----
+See [docs/FILES_AND_SIDECARS.md](docs/FILES_AND_SIDECARS.md) for details.
 
-## Encoding videos to .mivf
+## Performance Notes
 
-You can download the standalone PC encoder from the **[Releases Page](../../releases)** to easily convert `.mp4` files into `.mivf` formats without needing to install Python. 
+- **New 3DS:** M2Y2 at 400×240, 30 fps runs well with default encoder settings.
+- **Old 3DS:** Use `--profile 3ds-fast` when encoding. Consider `--keep 4` or `--keep 8` for demanding content. See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md).
+- **Seek index:** Encoder generates both sidecar (`.idx`) and embedded index by default. Large uncached files skip expensive synchronous scanning at open time for faster load.
 
-The `encode_mivf` tool wraps `ffmpeg` and the native encoder to process a single file or a whole folder.
+## Documentation Index
 
-> **Requirement:** `ffmpeg` must be available on your system (either bundled next to the executable or added to your system's PATH).
+- [Installing](docs/INSTALLING.md)
+- [Encoding Videos](docs/ENCODING.md)
+- [Controls Reference](docs/CONTROLS.md)
+- [Files & Sidecars](docs/FILES_AND_SIDECARS.md)
+- [Seek Index](docs/SEEK_INDEX.md)
+- [MoFlex Status](docs/MOFLEX_STATUS.md)
+- [Performance Tuning](docs/PERFORMANCE_TUNING.md)
+- [Developer Build](docs/DEVELOPING.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
 
-**Windows Example:**
-```cmd
-:: Smaller, entropy-coded M2Y2 (Recommended):
-encode_mivf.exe input.mp4 output.mivf --m2y2
+## Developer Build
 
-:: Faster, raw token M2Y1:
-encode_mivf.exe input.mp4 output.mivf
+See [docs/DEVELOPING.md](docs/DEVELOPING.md) for full instructions.
 
-::Best Balanced
-encode_mivf.exe input.mp4 output.mivf --m2y2 --fps 24 --audio-rate 48000 --jobs 6 --seek-preroll 2 --keep 4 --mv-range 1 --qp 38 --lambda 34
-
-```
-
-**Linux Example:**
-
-```bash
-./encode_mivf input.mp4 output.mivf --m2y2
-
-```
-
-*(Developers can also run the Python front-end directly via `python encode_mivf.py input.mp4 output.mivf --m2y2`).*
-
----
-
-## Developer Build Instructions
-
-### Building the player (.3dsx)
-
-You need devkitPro with the `3ds-dev` group (devkitARM + libctru).
+Quickstart:
 
 ```bash
-# Make sure DEVKITPRO / DEVKITARM are set and the toolchain is on PATH, then:
-make
-
+# Requires devkitPro (3ds-dev group: devkitARM + libctru)
+make          # builds mivf_player_3ds.3dsx
+make cia      # builds mivf_player_3ds.cia (requires makerom + bannertool)
 ```
 
-This produces `mivf_player_3ds.3dsx` with the embedded SMDH icon/metadata. To skip the icon, run `make NO_SMDH=1`.
+### Repository Layout
 
-### Building an installable .cia
-
-The `.cia` needs two third‑party tools that are not part of devkitPro:
-
-* [makerom](https://github.com/3DSGuy/Project_CTR/releases)
-* [bannertool](https://github.com/Epicpkmn11/bannertool/releases)
-
-Drop both executables into `devkitPro/tools/bin` (or anywhere on your PATH), then:
-
-```bash
-make cia
-
-```
-
-This builds the banner, reuses the SMDH icon, and packages everything per `meta/app.rsf` into `mivf_player_3ds.cia`.
-
-### Repository layout
-
-* **`source/`** - Native 3DS player (C). `main.c` is the app; `mivf_*.c/.h` are modules. `mivf_rc.h` is the shared M2Y2 range coder.
-* **`tools/`** - Native encoder + M2Y2 transcoder/verifier and helpers.
-* **`meta/`** - Icon, banner, banner audio, makerom RSF, asset generator.
-* **`Makefile`** - Builds the `.3dsx` (and `make cia` for the installable title).
-* **`encode_mivf.py`** - Python front-end for ffmpeg -> `.mivf` encoding.
-
----
+- **`source/`** — Native 3DS player (C). `main.c` is the app; `mivf_*.c/.h` are modules.
+- **`tools/`** — Native encoder, M2Y2 transcoder, and helper binaries.
+- **`meta/`** — Icon, banner, banner audio, makerom RSF.
+- **`Makefile`** — Builds `.3dsx` and `make cia` for installable title.
+- **`encode_mivf.py`** — Python front-end for ffmpeg → `.mivf` encoding.
 
 ## Acknowledgements
 
-Built with devkitPro / devkitARM and libctru. CIA packaging uses makerom and bannertool.
+Built with devkitPro / devkitARM and libctru. CIA packaging uses makerom and bannertool. MoFlex demuxer and decoder are adapted from FFmpeg (LGPL).
 
 ## License
 
-Released under the MIT License.
+Released under the MIT License. Bundled FFmpeg-derived components retain their original LGPL licensing.
 

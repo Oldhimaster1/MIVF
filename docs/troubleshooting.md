@@ -2,34 +2,113 @@
 
 Common issues and how to resolve them.
 
-FFmpeg not found
+## Encoder Issues
 
-- Error: "FFmpeg was not found". Solution: install ffmpeg and ensure it is on PATH, or place a `ffmpeg`/`ffmpeg.exe` next to `encode_mivf.exe`.
+### "ffmpeg not found"
 
-m2y2_transcode.exe not found
+The encoder requires `ffmpeg` on your system PATH.
 
-- Error: when `--m2y2` is requested but `m2y2_transcode` cannot be found. Solution: build `tools/m2y2_transcode.c` or download the prebuilt helper and place it in `tools/` or next to the frontend executable.
+- **Windows:** Download ffmpeg from [ffmpeg.org](https://ffmpeg.org/download.html), extract it, and add the `bin/` folder to your PATH.
+- **Linux:** `sudo apt install ffmpeg` or equivalent.
+- **macOS:** `brew install ffmpeg`.
 
-miv2y_moflex_tier.exe not found
+### "No such file or directory" during encoding
 
-- The native encoder helper is required for chunk encoding. Build it with gcc or use a prebuilt binary.
+Check that your input file path is correct. Use absolute paths if needed:
 
-Output frame count differs by a few frames
+```bash
+python encode_mivf.py "C:/videos/input.mp4" "C:/videos/output.mivf" --m2y2
+```
 
-- Small off-by-one frame differences may occur due to source timestamps or ffmpeg vs internal frame counting. Inspect the input with `ffprobe` and prefer explicit `--fps` to force a frame rate.
+### Encoded file won't play / "MIVF invalid"
 
-High RAM usage
+- Make sure you're using the `.mivf` output file, not an intermediate file.
+- Try re-encoding without `--m2y2` to rule out codec-specific issues.
+- Check that `ffmpeg` can read your source file: `ffmpeg -i input.mp4`
 
-- Lower `--chunk-frames`, reduce `--jobs`, or run the parallel slice engine only on machines with large RAM.
+### Helper binary not found
 
-Slow M2Y2 final pass
+The encoder uses native helper binaries for encoding and M2Y2 transcoding. These are in the `tools/` directory. Make sure they are built or downloaded, and placed where the encoder can find them (same directory as `encode_mivf.py` or in `tools/`).
 
-- `--m2y2` performs an extra range-coding pass; it is CPU-intensive but lossless. If encode time is critical, omit `--m2y2`.
+### High RAM usage
 
-Audio mux mono-only
+Lower `--chunk-frames`, reduce `--jobs`, or run on a machine with more RAM.
 
-- The IA4M mux currently supports mono only. Convert audio to mono before running the mux (ffmpeg `-ac 1`) or set `--audio-channels 1`.
+### Packet-size report shows very large packets
 
-SD card deployment problems
+Large packets cause decode stalls on hardware. Apply more aggressive tuning:
 
-- The encoder attempts to deploy to `/d` by default (Windows SD-mount convention). If your SD card is on another drive, copy the `.mivf` manually to `sdmc:/mivf/`.
+```bash
+python encode_mivf.py input.mp4 output.mivf --m2y2 --profile 3ds-fast --keep 4 --qp 38
+```
+
+### Slow M2Y2 pass
+
+`--m2y2` adds a CPU-intensive range-coding pass that is lossless. If encode time is critical, omit `--m2y2` (use default M2Y1).
+
+## Player Issues
+
+### Browser feels slow on Old 3DS
+
+This was addressed in recent updates:
+- Preview loading is debounced (loads only after cursor stops for ~200 ms)
+- Settings are saved on close, not on every value change
+
+If the browser still feels slow, try fewer files in the scanned folders, or use a faster SD card.
+
+### Seek doesn't work / is very slow
+
+- Check that a seek index exists: either a `.idx` sidecar file or the embedded footer (encoder generates both by default).
+- For very large files without an index, the player skips the expensive scan — seeking will be approximate.
+- Re-encode with index generation: `python encode_mivf.py input.mp4 output.mivf --m2y2`
+
+### No subtitles showing
+
+- Verify your `.srt` file has the exact same base name as the `.mivf` file (e.g., `movie.mivf` + `movie.srt`).
+- Cycle subtitle tracks with **Y** during playback. Track 0 is "off."
+- Make sure subtitles are enabled in Settings (SELECT → Subtitles → ON).
+- Check that your `.srt` file is UTF-8 encoded.
+
+### Audio not working
+
+- Check that the file has an audio track (the encoder includes audio by default).
+- Make sure volume isn't muted (L + D-Pad ↑/↓).
+- On some setups, NDSP may not initialize. The player falls back to video-only mode.
+
+### Settings not saving
+
+- Settings are saved when you close the settings menu (B or SELECT), not on every change.
+- After adjusting settings, press B or SELECT to close and save.
+- Check `sdmc:/3ds/mivf_player_3ds/appdata/settings.ini` exists after closing.
+
+### MoFlex file won't open
+
+- Only unencrypted `.moflex` files are supported.
+- Some `.moflex` files from certain sources may use different container layouts.
+- Try the file in Azahar emulator first to rule out SD card issues.
+
+### App freezes on large movie
+
+- Large files without a seek index used to cause a synchronous scan freeze. This was fixed — the player now skips the scan and uses approximate seeking.
+- Re-encode with index generation for best results.
+
+## Build Issues
+
+### "3ds.h: No such file or directory"
+
+You need devkitPro with the `3ds-dev` group installed. The devkit environment variables (`DEVKITARM`, `DEVKITPRO`) must be set. Build from the MSYS2 shell that comes with devkitPro.
+
+### "makerom not found"
+
+`makerom` is only needed for `make cia`. Download it from [Project_CTR releases](https://github.com/3DSGuy/Project_CTR/releases) and place it in `devkitPro/tools/bin/`.
+
+### "bannertool not found"
+
+Same as makerom — download from [bannertool releases](https://github.com/Epicpkmn11/bannertool/releases).
+
+## Azahar Emulator
+
+- Point the emulator's SD card path to a folder containing a `mivf/` subfolder with your `.mivf` files.
+- The emulator's SD card I/O is faster than real hardware; performance issues may not reproduce.
+- Test on real hardware before concluding performance is acceptable.
+
