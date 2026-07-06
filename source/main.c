@@ -9509,8 +9509,15 @@ static void hfix58f_draw_timeline(u8 *fb, int panel_y) {
         hfix58f_draw_mmss(fb, 254, text_y, total_secs);
     }
 
+    /* Track: background + subtle top edge for depth. */
     hfix58_rect565(fb, x, y, w, h, 20, 28, 42);
+    hfix58_rect565(fb, x, y, w, 1, 32, 42, 60);
+
+    /* Progress fill + subtle bottom shade edge. */
     hfix58_rect565(fb, x, y, fill_w, h, 0, 140, 255);
+    if (fill_w > 0) {
+        hfix58_rect565(fb, x, y + h - 1, fill_w, 1, 0, 100, 190);
+    }
 
     /* HFIX60: chapter tick markers along the timeline. */
     if (g_mivf_chapters_count > 0 && total > 0) {
@@ -9527,7 +9534,11 @@ static void hfix58f_draw_timeline(u8 *fb, int panel_y) {
             if (mx < x) mx = x;
             if (mx > x + w - 1) mx = x + w - 1;
 
-            hfix58_rect565(fb, mx, y - 2, 1, h + 4, 250, 220, 90);
+            /* Subtle dim glow behind the tick for readability. */
+            hfix58_blend_rect565(fb, mx - 1, y - 3, 3, h + 6,
+                34, 38, 52, 180);
+            /* Bright chapter tick. */
+            hfix58_rect565(fb, mx, y - 3, 1, h + 6, 252, 228, 110);
         }
     }
 
