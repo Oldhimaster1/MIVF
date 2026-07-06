@@ -2981,6 +2981,11 @@ static void hfix59r3_draw_settings_overlay(u8 *fb) {
             selected ? 210 : 182,
             selected ? 236 : 214,
             selected ? 255 : 244);
+
+        if (selected) {
+            hfix58_draw_text_shadow(fb, 210, y, "<", 1, 168, 208, 244);
+            hfix58_draw_text_shadow(fb, 286, y, ">", 1, 168, 208, 244);
+        }
     }
 
     if (HFIX59R3_SETTINGS_COUNT > HFIX59R3_SETTINGS_VISIBLE) {
