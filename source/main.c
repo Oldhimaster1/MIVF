@@ -2612,8 +2612,20 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
 
     switch (hook) {
         case APTHOOK_ONSUSPEND:
+            /* HOME menu / app suspend: park playback but leave the
+               screen on so the HOME menu is visible.  Only real sleep
+               (ONSLEEP / lid close) powers off backlights. */
+            if (g_media_ctl.state == STATE_PLAYING) {
+                g_media_ctl.state = STATE_PAUSED;
+                g_mivf_park_resume_audio = true;
+                if (audio_can_use_ndsp()) {
+                    ndspChnSetPaused(0, true);
+                }
+            }
+            break;
         case APTHOOK_ONSLEEP:
-            /* Lid close / suspend: park playback so A/V resume cleanly on wake. */
+            /* Lid close / real sleep: park playback and power off
+               backlights to save power. */
             if (g_media_ctl.state == STATE_PLAYING) {
                 g_media_ctl.state = STATE_PAUSED;
                 g_mivf_park_resume_audio = true;
