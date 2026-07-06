@@ -4988,6 +4988,11 @@ static Hfix58BrowserPreview g_hfix58_preview;
    once the selection has been stable for that interval. */
 static u64 g_hfix58_preview_deadline = 0;
 
+/* HFIX60: show-all toggle — when true the browser scans the SD root
+   first so files outside the dedicated media folders are visible.
+   Toggled with SELECT in the file browser. */
+static bool g_hfix58_show_all_dirs = false;
+
 static char g_hfix58_alert_text[96] = "";
 static int  g_hfix58_alert_level = 0;
 static u32  g_hfix58_alert_frames = 0;
@@ -6368,6 +6373,24 @@ static void hfix58_draw_browser_preview(u8 *fb) {
     }
 }
 
+/* HFIX60: known system-folder names to skip when show-all is off.
+   These are directory names (case-insensitive match), not full paths.
+   In MIVF's flat browser model directories already fail the extension
+   check, so this is an explicit belt-and-suspenders filter plus a
+   foundation for any future folder-browsing UI. */
+static bool hfix58_is_system_folder_name(const char *name) {
+    static const char *sys[] = {
+        "nintendo 3ds", "dcim", "3ds", "luma", "gm9", "cias",
+        "private", "boot9strap", "themes", "fbi", "updates",
+        NULL
+    };
+    if (!name || !*name) return false;
+    for (int i = 0; sys[i]; i++) {
+        if (!strcasecmp(name, sys[i])) return true;
+    }
+    return false;
+}
+
 static bool hfix58_scan_dir(const char *dir) {
     DIR *d = opendir(dir);
 
@@ -6385,6 +6408,14 @@ static bool hfix58_scan_dir(const char *dir) {
     while ((ent = readdir(d)) != NULL) {
         if (g_hfix58_browser.count >= HFIX58_MAX_BROWSER_FILES) {
             break;
+        }
+
+        /* HFIX60: when show-all is off, skip entries whose names
+           match known system folders — belt-and-suspenders on top
+           of the extension filter (directories already fail it). */
+        if (!g_hfix58_show_all_dirs &&
+            hfix58_is_system_folder_name(ent->d_name)) {
+            continue;
         }
 
         if (!hfix58_is_supported_media(ent->d_name)) {
@@ -6470,12 +6501,23 @@ static bool mivf_find_next_in_folder(const char *cur_path, char *out, size_t out
 }
 
 static bool hfix58_scan_default_dirs(void) {
-    static const char *dirs[] = {
+    /* When show-all is off (default), dedicated media folders are
+       scanned first; the SD root is only a fallback.  When show-all
+       is on the root is scanned first so files placed at the top
+       level are visible immediately. */
+    static const char *hidden_dirs[] = {
         "sdmc:/mivf",
         "sdmc:/3ds/mivf_player_3ds",
         "sdmc:/",
         NULL
     };
+    static const char *show_all_dirs[] = {
+        "sdmc:/",
+        "sdmc:/mivf",
+        "sdmc:/3ds/mivf_player_3ds",
+        NULL
+    };
+    const char **dirs = g_hfix58_show_all_dirs ? show_all_dirs : hidden_dirs;
 
     for (int i = 0; dirs[i]; i++) {
         if (hfix58_scan_dir(dirs[i])) {
@@ -6651,7 +6693,12 @@ static void hfix58_draw_browser(u8 *fb) {
 
     hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
     hfix58_rect565(fb, 22, 205, 276, 1, 40, 62, 94);
-    hfix58_draw_text_shadow(fb, 24, 212, "A OPEN   Y FAVORITE   B BACK   START EXIT", 1, 222, 236, 252);
+    {
+        char footer[56];
+        snprintf(footer, sizeof(footer), "A OPEN  Y FAV  %s  B BACK  START EXIT",
+            g_hfix58_show_all_dirs ? "SEL:HIDE SYS" : "SEL:SHOW SYS");
+        hfix58_draw_text_shadow(fb, 24, 212, footer, 1, 222, 236, 252);
+    }
 
     hfix58_draw_alert(fb);
 }
@@ -6695,6 +6742,16 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
 
         if (down & KEY_B) {
             return false;
+        }
+
+        /* HFIX60: SELECT toggles show-all mode — rescans with the
+           alternate directory order so the user can see files at
+           the SD root (or hide them again). */
+        if (down & KEY_SELECT) {
+            g_hfix58_show_all_dirs = !g_hfix58_show_all_dirs;
+            hfix58_scan_default_dirs();
+            hfix58_preview_clear();
+            hfix58_browser_redraw();
         }
 
         if (g_hfix58_browser.count > 0) {
