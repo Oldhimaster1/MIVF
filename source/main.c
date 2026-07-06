@@ -1,4 +1,5 @@
 #include <3ds.h>
+#include <sys/stat.h>
 
 /* ------------------------------------------------------------------------- */
 /* HFIX58J_RETAIL_UX_AND_IO                                                   */
@@ -4956,6 +4957,7 @@ typedef struct {
     char name[256];
     char path[HFIX58_MAX_PATH];
     u8 quick; /* 0 = library, 1 = recent, 2 = favorite */
+    u32 file_size_kb; /* populated once at scan time, zero if unknown */
 } Hfix58FileEntry;
 
 typedef struct {
@@ -6371,6 +6373,30 @@ static void hfix58_draw_browser_preview(u8 *fb) {
             hfix58_draw_text_shadow(fb, x + 8, y + 150, g_hfix58_preview.synopsis2, 1, 200, 215, 235);
         }
     }
+
+    /* HFIX60: compact file-size badge from scan-time entry data.
+       Zero draw-time I/O — the size was captured once during
+       hfix58_scan_dir via stat(). */
+    {
+        u32 kb = 0;
+        if (g_hfix58_browser.selected >= 0 &&
+            g_hfix58_browser.selected < g_hfix58_browser.count) {
+            kb = g_hfix58_browser.entries[g_hfix58_browser.selected].file_size_kb;
+        }
+        if (kb > 0) {
+            char sz[24];
+            if (kb >= 1024) {
+                snprintf(sz, sizeof(sz), "%lu.%lu MB",
+                    (unsigned long)(kb / 1024u),
+                    (unsigned long)((kb % 1024u) * 10u / 1024u));
+            } else {
+                snprintf(sz, sizeof(sz), "%lu KB", (unsigned long)kb);
+            }
+            int sy = g_hfix58_preview.synopsis2[0] ? y + 158 :
+                     g_hfix58_preview.synopsis1[0] ? y + 148 : y + 134;
+            hfix58_draw_text_shadow(fb, x + 8, sy, sz, 1, 155, 195, 235);
+        }
+    }
 }
 
 /* HFIX60: known system-folder names to skip when show-all is off.
@@ -6432,6 +6458,15 @@ static bool hfix58_scan_dir(const char *dir) {
             snprintf(out->path, sizeof(out->path), "%s%s", dir, ent->d_name);
         } else {
             snprintf(out->path, sizeof(out->path), "%s/%s", dir, ent->d_name);
+        }
+
+        /* Capture file size once at scan time — cheap stat() call,
+           never repeated during draw or selection changes. */
+        {
+            struct stat st;
+            if (stat(out->path, &st) == 0 && st.st_size > 0) {
+                out->file_size_kb = (u32)((u64)st.st_size / 1024u);
+            }
         }
     }
 
