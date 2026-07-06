@@ -2921,7 +2921,9 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
 
     MIVF_SettingsClamp(&g_mivf_settings);
     hfix59r3_sync_runtime_settings();
-    MIVF_SettingsSave(&g_mivf_settings);
+    /* Settings are saved on close (hfix59r3_set_settings_open(false));
+       saving on every value change + held-key repeat causes SD I/O stalls
+       on Old 3DS hardware. */
     hfix59r3_note_activity();
     return true;
 }
@@ -2972,7 +2974,20 @@ static void hfix59r3_draw_settings_overlay(u8 *fb) {
 
         hfix58_draw_text_shadow(fb, 30, y, hfix59r3_settings_group(i), 1, 130, 165, 205);
         hfix58_draw_text_shadow(fb, 80, y, hfix59r3_settings_label(i), 1, selected ? 255 : 205, selected ? 255 : 220, selected ? 255 : 235);
-        hfix58_draw_text_shadow(fb, 222, y, value, 1, 170, 205, 245);
+        hfix58_draw_text_shadow(
+            fb,
+            222,
+            y,
+            value,
+            1,
+            selected ? 210 : 182,
+            selected ? 236 : 214,
+            selected ? 255 : 244);
+
+        if (selected) {
+            hfix58_draw_text_shadow(fb, 210, y, "<", 1, 168, 208, 244);
+            hfix58_draw_text_shadow(fb, 286, y, ">", 1, 168, 208, 244);
+        }
     }
 
     if (HFIX59R3_SETTINGS_COUNT > HFIX59R3_SETTINGS_VISIBLE) {
@@ -2986,8 +3001,9 @@ static void hfix59r3_draw_settings_overlay(u8 *fb) {
         hfix58_rect565(fb, 292, knob_y, 4, knob_h, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
     }
 
-    hfix58_draw_text_shadow(fb, 24, 216, "UP/DOWN MOVE  LEFT/RIGHT CHANGE", 1, 190, 215, 235);
-    hfix58_draw_text_shadow(fb, 24, 226, "SELECT OR B CLOSES AND SAVES", 1, 190, 215, 235);
+    hfix58_rect565(fb, 22, 212, 266, 1, 44, 66, 96);
+    hfix58_draw_text_shadow(fb, 24, 216, "UP/DOWN MOVE  LEFT/RIGHT CHANGE", 1, 208, 228, 246);
+    hfix58_draw_text_shadow(fb, 24, 226, "SELECT OR B CLOSES AND SAVES", 1, 208, 228, 246);
 }
 
 static void hfix58d_draw_bottom_fluent_ui(u8 *fb);
@@ -4967,6 +4983,11 @@ typedef struct {
 static Hfix58FileBrowser g_hfix58_browser;
 static Hfix58BrowserPreview g_hfix58_preview;
 
+/* HFIX60: preview debounce deadline in system ticks (0 = disabled).
+   Cursor movement sets a ~200 ms deadline; the preview is only loaded
+   once the selection has been stable for that interval. */
+static u64 g_hfix58_preview_deadline = 0;
+
 static char g_hfix58_alert_text[96] = "";
 static int  g_hfix58_alert_level = 0;
 static u32  g_hfix58_alert_frames = 0;
@@ -5408,24 +5429,31 @@ static void hfix58_draw_alert(u8 *fb) {
     int rr = 70;
     int gg = 150;
     int bb = 230;
+    int tr = 245;
+    int tg = 250;
+    int tb = 255;
 
     if (g_hfix58_alert_level == 1) {
         rr = 70; gg = 210; bb = 110;
         kind = "OK";
+        tr = 225; tg = 255; tb = 232;
     } else if (g_hfix58_alert_level == 2) {
         rr = 235; gg = 150; bb = 45;
         kind = "WARN";
+        tr = 255; tg = 238; tb = 214;
     } else if (g_hfix58_alert_level == 3) {
         rr = 235; gg = 70; bb = 70;
         kind = "STOP";
+        tr = 255; tg = 226; tb = 226;
     }
 
     hfix58_rect565(fb, 22, 58, 276, 30, 3, 6, 14);
     hfix58_rect565(fb, 24, 60, 272, 26, 14, 20, 34);
+    hfix58_rect565(fb, 24, 60, 272, 1, rr / 2, gg / 2, bb / 2);
     hfix58_rect565(fb, 24, 60, 4, 26, rr, gg, bb);
     hfix58_rect565(fb, 32, 64, 38, 14, rr / 2, gg / 2, bb / 2);
 
-    hfix58_draw_text_shadow(fb, 38, 67, kind, 1, 245, 250, 255);
+    hfix58_draw_text_shadow(fb, 38, 67, kind, 1, tr, tg, tb);
     hfix58_draw_text_shadow(fb, 78, 67, g_hfix58_alert_text, 1, 240, 245, 255);
 
     if (g_hfix58_alert_frames > 0) {
@@ -5847,6 +5875,7 @@ static void hfix58_browser_promote_quick_access(void) {
 
 static void hfix58_preview_clear(void) {
     memset(&g_hfix58_preview, 0, sizeof(g_hfix58_preview));
+    g_hfix58_preview_deadline = 0;
 }
 
 static const char *hfix58_preview_basename(const char *path) {
@@ -6276,6 +6305,15 @@ static void hfix58_browser_refresh_preview(void) {
         return;
     }
 
+    /* Debounce: defer preview load until selection is stable (~200 ms).
+       The caller in the browser loop triggers a redraw once the
+       deadline expires. */
+    if (g_hfix58_preview_deadline != 0 &&
+        svcGetSystemTick() < g_hfix58_preview_deadline) {
+        return;
+    }
+    g_hfix58_preview_deadline = 0;
+
     hfix58_browser_load_preview(g_hfix58_browser.entries[g_hfix58_browser.selected].path);
 }
 
@@ -6314,10 +6352,11 @@ static void hfix58_draw_browser_preview(u8 *fb) {
         hfix58_draw_text_shadow(fb, x + 83, y + 72, "CONT", 1, 220, 255, 220);
     }
 
-    hfix58_draw_text_shadow(fb, x + 8, y + 88, g_hfix58_preview.title[0] ? g_hfix58_preview.title : "NO FILE", 1, 210, 225, 245);
-    hfix58_draw_text_shadow(fb, x + 8, y + 100, g_hfix58_preview.summary[0] ? g_hfix58_preview.summary : "", 1, 185, 205, 230);
-    hfix58_draw_text_shadow(fb, x + 8, y + 112, g_hfix58_preview.detail[0] ? g_hfix58_preview.detail : "", 1, 185, 205, 230);
-    hfix58_draw_text_shadow(fb, x + 8, y + 124, g_hfix58_preview.extra[0] ? g_hfix58_preview.extra : "", 1, 170, 190, 215);
+    hfix58_rect565(fb, x + 8, y + 84, 114, 1, 34, 48, 72);
+    hfix58_draw_text_shadow(fb, x + 8, y + 90, g_hfix58_preview.title[0] ? g_hfix58_preview.title : "NO FILE", 1, 210, 225, 245);
+    hfix58_draw_text_shadow(fb, x + 8, y + 102, g_hfix58_preview.summary[0] ? g_hfix58_preview.summary : "", 1, 185, 205, 230);
+    hfix58_draw_text_shadow(fb, x + 8, y + 114, g_hfix58_preview.detail[0] ? g_hfix58_preview.detail : "", 1, 185, 205, 230);
+    hfix58_draw_text_shadow(fb, x + 8, y + 126, g_hfix58_preview.extra[0] ? g_hfix58_preview.extra : "", 1, 170, 190, 215);
 
     /* HFIX60: optional synopsis from a ".nfo" sidecar. */
     if (g_hfix58_preview.synopsis1[0]) {
@@ -6501,12 +6540,15 @@ static void hfix58_draw_browser(u8 *fb) {
 
     hfix58_blend_rect565(fb, 18, 46, 150, 22, 6, 10, 22, 220);
     hfix58_draw_text_shadow(fb, 26, 53, g_hfix58_browser.cwd, 1, 160, 200, 255);
+    hfix58_rect565(fb, 24, 68, 132, 1, 36, 58, 90);
 
     hfix58_draw_browser_preview(fb);
 
     if (g_hfix58_browser.count <= 0) {
-        hfix58_draw_text_shadow(fb, 36, 106, "NO .MIVF FILES FOUND", 1, 250, 180, 70);
-        hfix58_draw_text_shadow(fb, 42, 132, "PUT FILES IN SDMC:/MIVF", 1, 210, 220, 230);
+        hfix58_blend_rect565(fb, 24, 98, 138, 52, 10, 14, 26, 230);
+        hfix58_rect565(fb, 24, 98, 4, 52, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+        hfix58_draw_text_shadow(fb, 34, 108, "NO .MIVF FILES FOUND", 1, 250, 186, 86);
+        hfix58_draw_text_shadow(fb, 38, 132, "PUT FILES IN SDMC:/MIVF", 1, 216, 226, 236);
     } else {
         int first = g_hfix58_browser.scroll;
         int last = first + HFIX58_BROWSER_VISIBLE_ROWS;
@@ -6515,11 +6557,11 @@ static void hfix58_draw_browser(u8 *fb) {
             last = g_hfix58_browser.count;
         }
 
-        hfix58_draw_text_shadow(fb, 28, 70,
+        hfix58_draw_text_shadow(fb, 28, 72,
             (first == 0 && g_hfix58_browser.entries[0].quick) ? "QUICK ACCESS" : "FILES",
             1, 140, 175, 210);
 
-        int y = 82;
+        int y = 84;
 
         for (int i = first; i < last; i++) {
             bool selected = (i == g_hfix58_browser.selected);
@@ -6551,7 +6593,19 @@ static void hfix58_draw_browser(u8 *fb) {
             */
             line[16] = '\0';
 
-            hfix58_rect565(fb, 30, y - 2, 22, 10, br, bg, bb);
+            hfix58_blend_rect565(fb, 29, y - 3, 24, 12,
+                selected ? br + 20 : br,
+                selected ? bg + 20 : bg,
+                selected ? bb + 18 : bb,
+                selected ? 242 : 228);
+            hfix58_rect565(fb, 30, y - 2, 22, 1,
+                selected ? 255 : 220,
+                selected ? 255 : 235,
+                selected ? 255 : 248);
+            hfix58_rect565(fb, 30, y + 7, 22, 1,
+                br > 10 ? br - 10 : br,
+                bg > 10 ? bg - 10 : bg,
+                bb > 12 ? bb - 12 : bb);
             hfix58_draw_text_shadow(fb, 33, y, badge, 1, 235, 245, 255);
 
             hfix58_draw_text_shadow(
@@ -6577,7 +6631,7 @@ static void hfix58_draw_browser(u8 *fb) {
             Scroll bar.
         */
         if (g_hfix58_browser.count > HFIX58_BROWSER_VISIBLE_ROWS) {
-            int track_y = 82;
+            int track_y = 84;
             int track_h = HFIX58_BROWSER_VISIBLE_ROWS * 14;
             int knob_h = (track_h * HFIX58_BROWSER_VISIBLE_ROWS) / g_hfix58_browser.count;
 
@@ -6596,7 +6650,8 @@ static void hfix58_draw_browser(u8 *fb) {
     }
 
     hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
-    hfix58_draw_text_shadow(fb, 24, 212, "A OPEN   Y FAVORITE   B BACK   START EXIT", 1, 210, 225, 245);
+    hfix58_rect565(fb, 22, 205, 276, 1, 40, 62, 94);
+    hfix58_draw_text_shadow(fb, 24, 212, "A OPEN   Y FAVORITE   B BACK   START EXIT", 1, 222, 236, 252);
 
     hfix58_draw_alert(fb);
 }
@@ -6658,7 +6713,9 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                     g_hfix58_browser.scroll = g_hfix58_browser.selected - HFIX58_BROWSER_VISIBLE_ROWS + 1;
                 }
 
-                hfix58_preview_clear();
+                /* Defer preview load until selection is stable. */
+                g_hfix58_preview_deadline = svcGetSystemTick() +
+                    (u64)SYSCLOCK_ARM11 / 5ULL;
 
                 hfix58_browser_redraw();
             }
@@ -6678,7 +6735,9 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                     g_hfix58_browser.scroll = g_hfix58_browser.selected - HFIX58_BROWSER_VISIBLE_ROWS + 1;
                 }
 
-                hfix58_preview_clear();
+                /* Defer preview load until selection is stable. */
+                g_hfix58_preview_deadline = svcGetSystemTick() +
+                    (u64)SYSCLOCK_ARM11 / 5ULL;
 
                 hfix58_browser_redraw();
             }
@@ -6688,7 +6747,9 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                 if (g_mivf_settings.remember_favorites) {
                     hfix60_fav_toggle(g_hfix58_browser.entries[g_hfix58_browser.selected].path);
                     hfix58_browser_promote_quick_access();
-                    hfix58_preview_clear();
+                    /* Defer preview reload after list reorder. */
+                    g_hfix58_preview_deadline = svcGetSystemTick() +
+                        (u64)SYSCLOCK_ARM11 / 5ULL;
                     hfix58_browser_redraw();
                 }
             }
@@ -6710,6 +6771,14 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                 hfix60_recent_note(selected_path);
                 return true;
             }
+        }
+
+        /* Load preview once selection has been stable long enough. */
+        if (g_hfix58_preview_deadline != 0 &&
+            svcGetSystemTick() >= g_hfix58_preview_deadline) {
+            g_hfix58_preview_deadline = 0;
+            hfix58_browser_refresh_preview();
+            hfix58_browser_redraw();
         }
 
         gspWaitForVBlank();
@@ -7535,7 +7604,8 @@ static void hfix58d_draw_fluent_panel(u8 *fb, int panel_y) {
 
     int footer_y = panel_y + 120;
     if (footer_y < 232) {
-        hfix58_draw_text_shadow(fb, 22, footer_y, "D-PAD SELECT   A PRESS   L+D-PAD AUDIO", 1, 170, 190, 215);
+        hfix58_rect565(fb, 22, footer_y - 4, 276, 1, 40, 62, 94);
+        hfix58_draw_text_shadow(fb, 22, footer_y, "D-PAD SELECT   A PRESS   L+D-PAD AUDIO", 1, 202, 222, 244);
     }
 }
 
@@ -7606,7 +7676,7 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         hfix58_draw_text_shadow(fb, 31, 78, speed_t, 1, 190, 220, 255);
 
         hfix58_rect565(fb, 74, 76, 42, 10, 20, 30, 48);
-        hfix58_draw_text_shadow(fb, 79, 78, hfix60_aspect_name(g_mivf_settings.aspect_mode), 1, 190, 220, 255);
+        hfix58_draw_text_shadow(fb, 79, 78, hfix60_aspect_name(g_mivf_settings.aspect_mode), 1, 206, 228, 255);
 
         hfix58_rect565(fb, 122, 76, 38, 10, 20, 30, 48);
         hfix58_draw_text_shadow(fb, 127, 78,
@@ -7617,7 +7687,7 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
             (g_mivf_settings.show_subtitle_tracks && g_hfix58s_subtitles_ready) ? 210 : 175);
 
         hfix58_rect565(fb, 166, 76, 36, 10, 20, 30, 48);
-        hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 190, 220, 255);
+        hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 206, 228, 255);
 
         int meter_x = 222;
         int meter_y = 74;
@@ -7630,7 +7700,7 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
 
         char vol_txt[32];
         snprintf(vol_txt, sizeof(vol_txt), "VOL %d%%", vol);
-        hfix58_draw_text_shadow(fb, 222, 62, vol_txt, 1, 230, 240, 250);
+        hfix58_draw_text_shadow(fb, 222, 62, vol_txt, 1, 238, 246, 255);
 
         hfix58_rect565(fb, meter_x, meter_y, meter_w, meter_h, 19, 27, 40);
         hfix58_rect565(fb, meter_x, meter_y, fill, meter_h, 70, 210, 130);
@@ -8197,6 +8267,7 @@ typedef struct {
 } Hfix58FSeekIndex;
 
 static Hfix58FSeekIndex g_hfix58f_seek;
+static u64 g_hfix58f_media_end_offset = 0;
 
 
 
@@ -8771,6 +8842,11 @@ static void hfix58i_save_seek_cache(const char *cache_path, u64 file_size, u32 f
 #define HFIX58J_IDX_MAGIC   0x314A4458u
 #define HFIX58J_IDX_VERSION 2u
 
+/* Embedded seek-index footer: [index payload][MIDX footer trailer]. */
+#define MIVF_EMBED_IDX_FOOTER_MAGIC   0x5844494Du /* "MIDX" little-endian */
+#define MIVF_EMBED_IDX_FOOTER_VERSION 1u
+#define MIVF_EMBED_IDX_FOOTER_SIZE    32u
+
 static bool hfix58j_make_idx_path(char *out, size_t out_sz, const char *mivf_path) {
     if (!out || out_sz == 0 || !mivf_path) {
         return false;
@@ -8889,6 +8965,110 @@ static void hfix58j_save_seek_cache(const char *cache_path, u64 file_size, u32 f
     }
 }
 
+static bool hfix58f_try_load_embedded_index(FILE *f, u32 first_offset) {
+    if (!f) {
+        return false;
+    }
+
+    long saved_pos = ftell(f);
+    bool loaded = false;
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        goto out;
+    }
+
+    long end_pos_l = ftell(f);
+    if (end_pos_l <= 0) {
+        goto out;
+    }
+
+    u64 file_size = (u64)end_pos_l;
+    if (file_size < MIVF_EMBED_IDX_FOOTER_SIZE) {
+        goto out;
+    }
+
+    if (fseek(f, (long)(file_size - MIVF_EMBED_IDX_FOOTER_SIZE), SEEK_SET) != 0) {
+        goto out;
+    }
+
+    u8 footer[MIVF_EMBED_IDX_FOOTER_SIZE];
+    if (fread(footer, 1, sizeof(footer), f) != sizeof(footer)) {
+        goto out;
+    }
+
+    u32 footer_magic = le32(footer + 0);
+    u32 footer_version = le32(footer + 4);
+    u64 index_offset = le64(footer + 8);
+    u32 index_size = le32(footer + 16);
+    u32 idx_magic = le32(footer + 20);
+    u32 idx_version = le32(footer + 24);
+
+    if (footer_magic != MIVF_EMBED_IDX_FOOTER_MAGIC ||
+        footer_version != MIVF_EMBED_IDX_FOOTER_VERSION ||
+        idx_magic != HFIX58J_IDX_MAGIC ||
+        idx_version != HFIX58J_IDX_VERSION) {
+        goto out;
+    }
+
+    if (index_size < 28u ||
+        index_offset >= file_size ||
+        index_offset + (u64)index_size > file_size - (u64)MIVF_EMBED_IDX_FOOTER_SIZE) {
+        goto out;
+    }
+
+    if (fseek(f, (long)index_offset, SEEK_SET) != 0) {
+        goto out;
+    }
+
+    u32 magic = 0;
+    u32 version = 0;
+    u64 cached_file_size = 0;
+    u32 cached_first = 0;
+    u32 total_frames = 0;
+    u32 count = 0;
+
+    bool ok =
+        hfix58j_read_u32(f, &magic) &&
+        hfix58j_read_u32(f, &version) &&
+        hfix58j_read_u64(f, &cached_file_size) &&
+        hfix58j_read_u32(f, &cached_first) &&
+        hfix58j_read_u32(f, &total_frames) &&
+        hfix58j_read_u32(f, &count);
+
+    if (!ok ||
+        magic != HFIX58J_IDX_MAGIC ||
+        version != HFIX58J_IDX_VERSION ||
+        cached_file_size != file_size ||
+        cached_first != first_offset ||
+        count == 0 ||
+        count > HFIX58F_MAX_SEEK_POINTS) {
+        goto out;
+    }
+
+    size_t bytes = (size_t)count * sizeof(g_hfix58f_seek.points[0]);
+    if ((u64)index_size < 28ull + (u64)bytes) {
+        goto out;
+    }
+
+    if (fread(g_hfix58f_seek.points, 1, bytes, f) != bytes) {
+        goto out;
+    }
+
+    g_hfix58f_seek.count = count;
+    g_hfix58f_seek.total_frames = total_frames;
+    g_hfix58f_seek.ready = true;
+    g_media_ctl.total_frames = total_frames;
+    g_hfix58f_media_end_offset = index_offset;
+
+    loaded = true;
+
+out:
+    if (saved_pos >= 0) {
+        fseek(f, saved_pos, SEEK_SET);
+    }
+    return loaded;
+}
+
 static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v) {
     memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
 
@@ -8913,6 +9093,14 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
 
     u64 file_size = (u64)end_pos_l;
     char cache_path[512];
+
+    /* Prefer embedded footer index when present. */
+    if (hfix58f_try_load_embedded_index(f, first_offset)) {
+        if (saved >= 0) {
+            fseek(f, saved, SEEK_SET);
+        }
+        return true;
+    }
 
     if (hfix58j_make_idx_path(cache_path, sizeof(cache_path), MIVF_PATH)) {
         /*
@@ -9242,6 +9430,8 @@ static bool hfix58f_execute_pending_seek(
             hfix58_alert_set("STREAM REOPEN FAIL", 2);
             return false;
         }
+
+        mivf_stream_set_media_end_offset(stream, g_hfix58f_media_end_offset);
     }
 
     /* HFIX58I_ZERO_WAIT_SEEK: do not block after seek; reader fills asynchronously. */
@@ -9350,8 +9540,15 @@ static void hfix58f_draw_timeline(u8 *fb, int panel_y) {
         hfix58f_draw_mmss(fb, 254, text_y, total_secs);
     }
 
+    /* Track: background + subtle top edge for depth. */
     hfix58_rect565(fb, x, y, w, h, 20, 28, 42);
+    hfix58_rect565(fb, x, y, w, 1, 32, 42, 60);
+
+    /* Progress fill + subtle bottom shade edge. */
     hfix58_rect565(fb, x, y, fill_w, h, 0, 140, 255);
+    if (fill_w > 0) {
+        hfix58_rect565(fb, x, y + h - 1, fill_w, 1, 0, 100, 190);
+    }
 
     /* HFIX60: chapter tick markers along the timeline. */
     if (g_mivf_chapters_count > 0 && total > 0) {
@@ -9368,7 +9565,11 @@ static void hfix58f_draw_timeline(u8 *fb, int panel_y) {
             if (mx < x) mx = x;
             if (mx > x + w - 1) mx = x + w - 1;
 
-            hfix58_rect565(fb, mx, y - 2, 1, h + 4, 250, 220, 90);
+            /* Subtle dim glow behind the tick for readability. */
+            hfix58_blend_rect565(fb, mx - 1, y - 3, 3, h + 6,
+                34, 38, 52, 180);
+            /* Bright chapter tick. */
+            hfix58_rect565(fb, mx, y - 3, 1, h + 6, 252, 228, 110);
         }
     }
 
@@ -9562,6 +9763,8 @@ static int play(void) {
         printf("no audio stream\n");
     }
 
+    g_hfix58f_media_end_offset = 0;
+
     g_hfix59r2_video_fps_num = v.fpsn ? v.fpsn : 30;
     g_hfix59r2_video_fps_den = v.fpsd ? v.fpsd : 1;
 
@@ -9581,6 +9784,8 @@ static int play(void) {
         fclose(f);
         return -5;
     }
+
+    mivf_stream_set_media_end_offset(&stream, g_hfix58f_media_end_offset);
 
     size_t fsz = (size_t)v.w * (size_t)v.h * 2u;
 
@@ -10280,6 +10485,7 @@ static int play(void) {
         }
 
         if (g_mivf_diag && got_video) {
+            diag_ring_kb = stream.ring.fill >> 10;
             u64 total_us = ticks_to_us(svcGetSystemTick() - frame_start_tick);
 
             fprintf(g_mivf_diag,
