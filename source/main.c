@@ -2921,7 +2921,9 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
 
     MIVF_SettingsClamp(&g_mivf_settings);
     hfix59r3_sync_runtime_settings();
-    MIVF_SettingsSave(&g_mivf_settings);
+    /* Settings are saved on close (hfix59r3_set_settings_open(false));
+       saving on every value change + held-key repeat causes SD I/O stalls
+       on Old 3DS hardware. */
     hfix59r3_note_activity();
     return true;
 }
