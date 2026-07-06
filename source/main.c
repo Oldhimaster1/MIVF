@@ -4983,6 +4983,11 @@ typedef struct {
 static Hfix58FileBrowser g_hfix58_browser;
 static Hfix58BrowserPreview g_hfix58_preview;
 
+/* HFIX60: preview debounce deadline in system ticks (0 = disabled).
+   Cursor movement sets a ~200 ms deadline; the preview is only loaded
+   once the selection has been stable for that interval. */
+static u64 g_hfix58_preview_deadline = 0;
+
 static char g_hfix58_alert_text[96] = "";
 static int  g_hfix58_alert_level = 0;
 static u32  g_hfix58_alert_frames = 0;
@@ -5870,6 +5875,7 @@ static void hfix58_browser_promote_quick_access(void) {
 
 static void hfix58_preview_clear(void) {
     memset(&g_hfix58_preview, 0, sizeof(g_hfix58_preview));
+    g_hfix58_preview_deadline = 0;
 }
 
 static const char *hfix58_preview_basename(const char *path) {
@@ -6299,6 +6305,15 @@ static void hfix58_browser_refresh_preview(void) {
         return;
     }
 
+    /* Debounce: defer preview load until selection is stable (~200 ms).
+       The caller in the browser loop triggers a redraw once the
+       deadline expires. */
+    if (g_hfix58_preview_deadline != 0 &&
+        svcGetSystemTick() < g_hfix58_preview_deadline) {
+        return;
+    }
+    g_hfix58_preview_deadline = 0;
+
     hfix58_browser_load_preview(g_hfix58_browser.entries[g_hfix58_browser.selected].path);
 }
 
@@ -6698,7 +6713,9 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                     g_hfix58_browser.scroll = g_hfix58_browser.selected - HFIX58_BROWSER_VISIBLE_ROWS + 1;
                 }
 
-                hfix58_preview_clear();
+                /* Defer preview load until selection is stable. */
+                g_hfix58_preview_deadline = svcGetSystemTick() +
+                    (u64)SYSCLOCK_ARM11 / 5ULL;
 
                 hfix58_browser_redraw();
             }
@@ -6718,7 +6735,9 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                     g_hfix58_browser.scroll = g_hfix58_browser.selected - HFIX58_BROWSER_VISIBLE_ROWS + 1;
                 }
 
-                hfix58_preview_clear();
+                /* Defer preview load until selection is stable. */
+                g_hfix58_preview_deadline = svcGetSystemTick() +
+                    (u64)SYSCLOCK_ARM11 / 5ULL;
 
                 hfix58_browser_redraw();
             }
@@ -6728,7 +6747,9 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                 if (g_mivf_settings.remember_favorites) {
                     hfix60_fav_toggle(g_hfix58_browser.entries[g_hfix58_browser.selected].path);
                     hfix58_browser_promote_quick_access();
-                    hfix58_preview_clear();
+                    /* Defer preview reload after list reorder. */
+                    g_hfix58_preview_deadline = svcGetSystemTick() +
+                        (u64)SYSCLOCK_ARM11 / 5ULL;
                     hfix58_browser_redraw();
                 }
             }
@@ -6750,6 +6771,14 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
                 hfix60_recent_note(selected_path);
                 return true;
             }
+        }
+
+        /* Load preview once selection has been stable long enough. */
+        if (g_hfix58_preview_deadline != 0 &&
+            svcGetSystemTick() >= g_hfix58_preview_deadline) {
+            g_hfix58_preview_deadline = 0;
+            hfix58_browser_refresh_preview();
+            hfix58_browser_redraw();
         }
 
         gspWaitForVBlank();
