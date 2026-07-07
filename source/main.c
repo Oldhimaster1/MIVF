@@ -4969,7 +4969,6 @@ typedef struct {
     char name[256];
     char path[HFIX58_MAX_PATH];
     u8 quick; /* 0 = library, 1 = recent, 2 = favorite */
-    u32 file_size_kb; /* populated once at scan time, zero if unknown */
 } Hfix58FileEntry;
 
 typedef struct {
@@ -4992,6 +4991,7 @@ typedef struct {
     char synopsis1[24];
     char synopsis2[24];
     u16 thumb[HFIX58_PREVIEW_W * HFIX58_PREVIEW_H];
+    u32 file_size_kb; /* populated lazily when this path is previewed, zero if unknown */
 } Hfix58BrowserPreview;
 
 static Hfix58FileBrowser g_hfix58_browser;
@@ -6231,6 +6231,17 @@ static bool hfix58_browser_load_preview(const char *path) {
 
     snprintf(g_hfix58_preview.path, sizeof(g_hfix58_preview.path), "%s", path);
 
+    /* HFIX_BROWSERPERF: compute file size lazily, only for the single
+       previewed entry, once selection has settled (see the debounce in
+       hfix58_browser_refresh_preview) — instead of stat()-ing every
+       matched media file during the full directory scan. */
+    {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0) {
+            g_hfix58_preview.file_size_kb = (u32)((u64)st.st_size / 1024u);
+        }
+    }
+
     if (hfix58_media_kind(path) == HFIX58_MEDIA_MOFLEX) {
         long long resume_us = moflex_resume_get(path);
 
@@ -6405,15 +6416,11 @@ static void hfix58_draw_browser_preview(u8 *fb) {
         }
     }
 
-    /* HFIX60: compact file-size badge from scan-time entry data.
-       Zero draw-time I/O — the size was captured once during
-       hfix58_scan_dir via stat(). */
+    /* HFIX60: compact file-size badge. Zero draw-time I/O here — the
+       size was already captured when the preview was (lazily) loaded
+       for this path (see hfix58_browser_load_preview). */
     {
-        u32 kb = 0;
-        if (g_hfix58_browser.selected >= 0 &&
-            g_hfix58_browser.selected < g_hfix58_browser.count) {
-            kb = g_hfix58_browser.entries[g_hfix58_browser.selected].file_size_kb;
-        }
+        u32 kb = g_hfix58_preview.file_size_kb;
         if (kb > 0) {
             char sz[24];
             if (kb >= 1024) {
@@ -6489,15 +6496,6 @@ static bool hfix58_scan_dir(const char *dir) {
             snprintf(out->path, sizeof(out->path), "%s%s", dir, ent->d_name);
         } else {
             snprintf(out->path, sizeof(out->path), "%s/%s", dir, ent->d_name);
-        }
-
-        /* Capture file size once at scan time — cheap stat() call,
-           never repeated during draw or selection changes. */
-        {
-            struct stat st;
-            if (stat(out->path, &st) == 0 && st.st_size > 0) {
-                out->file_size_kb = (u32)((u64)st.st_size / 1024u);
-            }
         }
     }
 
