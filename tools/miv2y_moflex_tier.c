@@ -357,6 +357,8 @@ static void usage(void) {
         "  --lambda N          RDO lambda, default 4.0; higher = smaller/lossier\n"
         "  --c-lambda N        chroma RDO lambda, default matches luma lambda\n"
         "  --qp N              transform quantizer, 1..51, default 28\n  --c-qp-offset N     chroma transform QP offset, default 4 in HFIX54A\n"
+        "  --start-frame N     global frame index of the first --input frame, default 0\n"
+        "  --dump-last-recon PATH  write the final reconstructed frame (Y+Cb+Cr, raw) to PATH\n"
     );
 }
 
@@ -2202,6 +2204,15 @@ int main(int argc, char **argv) {
     ep.qp = arg_int(argc, argv, "--qp", 35);
         ep.c_qp_offset = arg_int(argc, argv, "--c-qp-offset", 4);
     u32 start_frame = (u32)arg_int(argc, argv, "--start-frame", 0);
+
+    /* HFIX_WARMSTART: opt-in raw dump of the final closed-loop reconstructed
+       frame (Y+Cb+Cr planes, same layout as --input), written after encoding
+       finishes. Used by encode_mivf.py's --warm-start-chunks: the next chunk's
+       subprocess is fed this exact reconstruction as a throwaway first frame,
+       so its real first frame can predict from a bit-exact reference instead
+       of being forced into a QP/keep-insensitive keyframe. Never touches the
+       .mivf bitstream/format -- purely a side artifact for the next process. */
+    const char *dump_last_recon_path = arg_str(argc, argv, "--dump-last-recon", NULL);
 if (ep.qp < 1) ep.qp = 1;
     if (ep.qp > 51) ep.qp = 51;
 
@@ -2502,6 +2513,23 @@ frames = fi + 1;
 
 if (frames <= 0) {
         die("no frames encoded");
+    }
+
+    if (dump_last_recon_path) {
+        FILE *fdump = fopen(dump_last_recon_path, "wb");
+
+        if (!fdump) {
+            die("failed to open --dump-last-recon output");
+        }
+
+        if (fwrite(prev_y, 1, (size_t)y_size, fdump) != (size_t)y_size ||
+            fwrite(prev_cb, 1, (size_t)c_size, fdump) != (size_t)c_size ||
+            fwrite(prev_cr, 1, (size_t)c_size, fdump) != (size_t)c_size) {
+            fclose(fdump);
+            die("failed to write --dump-last-recon output");
+        }
+
+        fclose(fdump);
     }
 
     if (!input_is_stdin) {
