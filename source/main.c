@@ -5007,6 +5007,25 @@ static u64 g_hfix58_preview_deadline = 0;
    Toggled with SELECT in the file browser. */
 static bool g_hfix58_show_all_dirs = false;
 
+/* HFIX60: lightweight performance counters for debug overlay.
+   Updated every frame; max/last values shown when debug overlay
+   is enabled in Settings.  No file I/O, negligible overhead. */
+static u64 g_perf_decode_us_max = 0;
+static u64 g_perf_blit_us_max = 0;
+static u64 g_perf_page_us_max = 0;
+static u64 g_perf_audio_gap_ms_max = 0;
+static u64 g_perf_audio_gap_tick = 0;
+static u32 g_perf_late_count = 0;
+
+static void hfix58_perf_diag_reset(void) {
+    g_perf_decode_us_max = 0;
+    g_perf_blit_us_max = 0;
+    g_perf_page_us_max = 0;
+    g_perf_audio_gap_ms_max = 0;
+    g_perf_audio_gap_tick = 0;
+    g_perf_late_count = 0;
+}
+
 static char g_hfix58_alert_text[96] = "";
 static int  g_hfix58_alert_level = 0;
 static u32  g_hfix58_alert_frames = 0;
@@ -7793,6 +7812,20 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         hfix58_rect565(fb, 166, 76, 36, 10, 20, 30, 48);
         hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 206, 228, 255);
 
+        /* HFIX60: performance debug overlay line — only when enabled. */
+        if (g_mivf_settings.debug_overlay_enabled) {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg),
+                "D%5llu B%4llu P%4llu Ag%4llu Dr%-3u L%-3u",
+                (unsigned long long)g_perf_decode_us_max,
+                (unsigned long long)g_perf_blit_us_max,
+                (unsigned long long)g_perf_page_us_max,
+                (unsigned long long)g_perf_audio_gap_ms_max,
+                (unsigned int)g_audio_drop,
+                (unsigned int)g_perf_late_count);
+            hfix58_draw_text_shadow(fb, 222, 90, dbg, 1, 200, 220, 255);
+        }
+
         int meter_x = 222;
         int meter_y = 74;
         int meter_w = 72;
@@ -8340,6 +8373,7 @@ static void hfix59r3_present_video_frame(
 
     if (now_tick > *next_frame_tick + frame_ticks_abs * 2) {
         *next_frame_tick = now_tick + frame_ticks_abs;
+        g_perf_late_count++;
     } else {
         *next_frame_tick += frame_ticks_abs;
     }
@@ -9972,6 +10006,10 @@ static int play(void) {
     g_hfix58f_seek_catchup_target = 0;
     g_hfix58f_seek_preview_decode_pending = false;
 
+    /* Reset per-playback-session perf counters so max values from
+       a previous file don't mislead the debug overlay. */
+    hfix58_perf_diag_reset();
+
     if (g_mivf_settings.resume_enabled) {
         MivfBookmark bookmark;
         if (MIVF_BookmarkLoad(MIVF_PATH, &bookmark) &&
@@ -10322,6 +10360,7 @@ static int play(void) {
 
         u64 page_t1 = svcGetSystemTick();
         page_wait_us = ticks_to_us(page_t1 - page_t0);
+        if (page_wait_us > g_perf_page_us_max) g_perf_page_us_max = page_wait_us;
 
         MivfPage pg = page.pg;
         u8 *cur_page = page.data;
@@ -10367,6 +10406,12 @@ static int play(void) {
 
                 audio_off += ak.hsize + ak.psize;
             }
+            /* Track longest gap between audio queue calls. */
+            if (g_perf_audio_gap_tick) {
+                u64 gap_ms = ticks_to_us(svcGetSystemTick() - g_perf_audio_gap_tick) / 1000u;
+                if (gap_ms > g_perf_audio_gap_ms_max) g_perf_audio_gap_ms_max = gap_ms;
+            }
+            g_perf_audio_gap_tick = svcGetSystemTick();
         }
 
         for (u16 i = 0; i < pg.packets; i++) {
@@ -10555,6 +10600,7 @@ static int play(void) {
 
         u64 parse_t1 = svcGetSystemTick();
         parse_us = ticks_to_us(parse_t1 - parse_t0);
+        if (parse_us > g_perf_decode_us_max) g_perf_decode_us_max = parse_us;
 
         mivf_stream_release_page(&stream, &page);
 
@@ -10579,6 +10625,7 @@ static int play(void) {
 
             g_hfix58f_seek_preview_decode_pending = false;
             blit_us = ticks_to_us(svcGetSystemTick() - blit_t0);
+            if (blit_us > g_perf_blit_us_max) g_perf_blit_us_max = blit_us;
 
             if (g_mivf_ab_state == 2 &&
                 g_mivf_ab_b != MIVF_AB_UNSET &&
