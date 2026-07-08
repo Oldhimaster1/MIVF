@@ -186,7 +186,7 @@ class EncodeSettings:
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
     max_video_packet_kb: int = 0  # 0 = disabled (default, unchanged behavior)
     warm_start_chunks: bool = False  # experimental, opt-in (see --warm-start-chunks)
-    motion_search: str = "full"  # full (default, unchanged) | diamond | fast (both experimental)
+    motion_search: str = "full"  # full (default, unchanged) | diamond | fast | hybrid (all experimental)
 
 
 @dataclass
@@ -2197,11 +2197,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mv-range", type=int, default=DEFAULT_MV_RANGE)
     parser.add_argument(
         "--motion-search",
-        choices=["full", "diamond", "fast"],
+        choices=["full", "diamond", "fast", "hybrid"],
         default="full",
         help="per-block motion search algorithm: full = exhaustive, slowest, best quality "
              "(default, unchanged behavior); diamond = experimental iterative search, faster, "
-             "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk",
+             "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk; "
+             "hybrid = experimental, two-seed diamond plus capped local refine, aims for diamond-ish "
+             "speed with less of its quality/size cost",
     )
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, choices=[4, 8, 16], help="transform coefficients kept per 4x4 quadrant: 16=HD detail (default), 4=small legacy files")
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel encoder workers, default {DEFAULT_JOBS}")

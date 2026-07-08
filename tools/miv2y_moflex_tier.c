@@ -150,9 +150,12 @@ typedef struct {
 
 /* --motion-search: full is the original exhaustive mvlist scan (default,
    unchanged behavior). diamond/fast are experimental iterative searches --
-   see find_best_mv_64_diamond(). None of these change the packed MVCOPY
-   token format; the decoder only ever sees the final chosen (mx,my). */
-enum { MS_FULL = 0, MS_DIAMOND = 1, MS_FAST = 2 };
+   see find_best_mv_64_diamond(). hybrid runs the same bounded diamond walk
+   from two seeds (zero and the frame's global MV) and, only for blocks that
+   still look unreliable, a small capped local refine -- see
+   find_best_mv_64_hybrid(). None of these change the packed MVCOPY token
+   format; the decoder only ever sees the final chosen (mx,my). */
+enum { MS_FULL = 0, MS_DIAMOND = 1, MS_FAST = 2, MS_HYBRID = 3 };
 
 typedef struct {
     int w;
@@ -359,8 +362,9 @@ static void usage(void) {
         "  --c-solid N          default 32\n"
         "  --c-qres N           default 300\n"
         "  --mv-range N         default 8\n"
-        "  --motion-search MODE full (exhaustive, default) | diamond | fast "
-        "(both experimental, faster but may cost quality/size)\n"
+        "  --motion-search MODE full (exhaustive, default) | diamond | fast | hybrid "
+        "(all experimental, faster but may cost quality/size; hybrid recovers some "
+        "of that cost with a second seeded search plus capped local refine)\n"
         "  --y-mv-thresh N      default 768\n"
         "  --c-mv-thresh N      default 1024\n"
         "  --lambda N          RDO lambda, default 4.0; higher = smaller/lossier\n"
@@ -1016,6 +1020,290 @@ static bool find_best_mv_64_diamond(
     }
 
     if (best_sad < 0) {
+        return false;
+    }
+
+    for (int yy = 0; yy < 8; yy++) {
+        memcpy(
+            out_pred + yy * 8,
+            prev_plane + (dst_y0 + best_my + yy) * w + (dst_x0 + best_mx),
+            8
+        );
+    }
+
+    *out_mx = best_mx;
+    *out_my = best_my;
+    *out_sad = best_sad;
+
+    return true;
+}
+
+/* --motion-search hybrid: identical cross/diamond walk to
+   find_best_mv_64_diamond, but starting from a caller-supplied seed vector
+   instead of always the zero vector. Used by find_best_mv_64_hybrid() below
+   to also try descending from the frame's global MV estimate, which can
+   land much closer to the true optimum on panning/high-motion content where
+   a zero-seeded walk's coarse steps risk settling in the wrong local
+   minimum. Bounds/range-checked the same way: the seed is clamped to
+   +-mv_range, and if the clamped seed still lands outside the plane (can
+   happen near edges with a large global MV), this falls back to the zero
+   vector for the initial probe -- so it can never emit an out-of-range or
+   out-of-bounds motion vector, exactly like find_best_mv_64_diamond. */
+static bool find_best_mv_64_seeded(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int bx,
+    int by,
+    int mv_range,
+    int search_cutoff,
+    int start_step,
+    bool recenter_at_same_step,
+    int seed_mx,
+    int seed_my,
+    int *out_mx,
+    int *out_my,
+    u8 out_pred[64],
+    int *out_sad
+) {
+    if (!prev_plane) {
+        return false;
+    }
+
+    if (mv_range < 0) {
+        mv_range = 0;
+    }
+
+    if (search_cutoff <= 0) {
+        search_cutoff = 4096;
+    }
+
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int cur_mx = clamp_int(seed_mx, -mv_range, mv_range);
+    int cur_my = clamp_int(seed_my, -mv_range, mv_range);
+
+    int seed_sx = dst_x0 + cur_mx;
+    int seed_sy = dst_y0 + cur_my;
+
+    int best_sad;
+    int best_mx;
+    int best_my;
+
+    if (seed_sx >= 0 && seed_sy >= 0 && seed_sx + 8 <= w && seed_sy + 8 <= h) {
+        best_sad = sad8x8_capped(cur, prev_plane, w, seed_sx, seed_sy, search_cutoff);
+        best_mx = cur_mx;
+        best_my = cur_my;
+    } else {
+        cur_mx = 0;
+        cur_my = 0;
+        best_sad = sad8x8_capped(cur, prev_plane, w, dst_x0, dst_y0, search_cutoff);
+        best_mx = 0;
+        best_my = 0;
+    }
+
+    int step = start_step;
+    if (step > mv_range) step = mv_range;
+    if (step < 1) step = 0;
+
+    while (step >= 1 && best_sad != 0) {
+        int cand_mx[4] = { cur_mx + step, cur_mx - step, cur_mx, cur_mx };
+        int cand_my[4] = { cur_my, cur_my, cur_my + step, cur_my - step };
+        bool improved = false;
+
+        for (int k = 0; k < 4; k++) {
+            int mx = clamp_int(cand_mx[k], -mv_range, mv_range);
+            int my = clamp_int(cand_my[k], -mv_range, mv_range);
+
+            if (mx == cur_mx && my == cur_my) {
+                continue;
+            }
+
+            int sx = dst_x0 + mx;
+            int sy = dst_y0 + my;
+
+            if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
+                continue;
+            }
+
+            int limit = (best_sad >= 0) ? best_sad : search_cutoff;
+            int sad = sad8x8_capped(cur, prev_plane, w, sx, sy, limit);
+
+            if (sad < 0) {
+                continue;
+            }
+
+            if (best_sad < 0 || sad < best_sad) {
+                best_sad = sad;
+                best_mx = mx;
+                best_my = my;
+                improved = true;
+            }
+        }
+
+        cur_mx = best_mx;
+        cur_my = best_my;
+
+        if (!(improved && recenter_at_same_step)) {
+            step /= 2;
+        }
+    }
+
+    if (best_sad < 0) {
+        return false;
+    }
+
+    for (int yy = 0; yy < 8; yy++) {
+        memcpy(
+            out_pred + yy * 8,
+            prev_plane + (dst_y0 + best_my + yy) * w + (dst_x0 + best_mx),
+            8
+        );
+    }
+
+    *out_mx = best_mx;
+    *out_my = best_my;
+    *out_sad = best_sad;
+
+    return true;
+}
+
+/* --motion-search hybrid: run find_best_mv_64_seeded from both the zero
+   vector and the frame's global MV estimate (g_mx,g_my), keep whichever
+   converges to the lower SAD. Costs roughly 2x a single diamond search per
+   block (still tens of probes, nowhere near find_best_mv_64's O(mv_range^2)
+   exhaustive scan) in exchange for recovering much of full search's quality
+   on panning/high-motion content. */
+static bool find_best_mv_64_hybrid(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int bx,
+    int by,
+    int mv_range,
+    int search_cutoff,
+    int g_mx,
+    int g_my,
+    int *out_mx,
+    int *out_my,
+    u8 out_pred[64],
+    int *out_sad
+) {
+    int zero_mx = 0, zero_my = 0, zero_sad = 0;
+    u8 zero_pred[64];
+    bool zero_found = find_best_mv_64_seeded(
+        cur, prev_plane, w, h, bx, by, mv_range, search_cutoff,
+        4, true, 0, 0, &zero_mx, &zero_my, zero_pred, &zero_sad
+    );
+
+    if (g_mx == 0 && g_my == 0) {
+        /* Global-seeded search would repeat the zero-seeded one above --
+           skip the redundant second search. */
+        if (!zero_found) {
+            return false;
+        }
+
+        *out_mx = zero_mx;
+        *out_my = zero_my;
+        *out_sad = zero_sad;
+        memcpy(out_pred, zero_pred, 64);
+        return true;
+    }
+
+    int gmv_mx = 0, gmv_my = 0, gmv_sad = 0;
+    u8 gmv_pred[64];
+    bool gmv_found = find_best_mv_64_seeded(
+        cur, prev_plane, w, h, bx, by, mv_range, search_cutoff,
+        4, true, g_mx, g_my, &gmv_mx, &gmv_my, gmv_pred, &gmv_sad
+    );
+
+    if (!zero_found && !gmv_found) {
+        return false;
+    }
+
+    if (zero_found && (!gmv_found || zero_sad <= gmv_sad)) {
+        *out_mx = zero_mx;
+        *out_my = zero_my;
+        *out_sad = zero_sad;
+        memcpy(out_pred, zero_pred, 64);
+    } else {
+        *out_mx = gmv_mx;
+        *out_my = gmv_my;
+        *out_sad = gmv_sad;
+        memcpy(out_pred, gmv_pred, 64);
+    }
+
+    return true;
+}
+
+/* --motion-search hybrid: bounded +-refine_range local search around an
+   existing MV candidate. Only invoked (see encode_plane) when the hybrid
+   search's result still looks unreliable and the per-plane escalation
+   budget hasn't been exhausted, so this can never degrade toward anything
+   resembling the full O(mv_range^2) scan -- worst case is a small fixed
+   window (2*refine_range+1)^2 - 1 probes, capped in count by the budget. */
+static bool find_best_mv_64_local_refine(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int bx,
+    int by,
+    int mv_range,
+    int refine_range,
+    int center_mx,
+    int center_my,
+    int center_sad,
+    int *out_mx,
+    int *out_my,
+    u8 out_pred[64],
+    int *out_sad
+) {
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    int best_mx = center_mx;
+    int best_my = center_my;
+    int best_sad = center_sad;
+
+    for (int dy = -refine_range; dy <= refine_range; dy++) {
+        for (int dx = -refine_range; dx <= refine_range; dx++) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+
+            int mx = clamp_int(center_mx + dx, -mv_range, mv_range);
+            int my = clamp_int(center_my + dy, -mv_range, mv_range);
+
+            if (mx == best_mx && my == best_my) {
+                continue;
+            }
+
+            int sx = dst_x0 + mx;
+            int sy = dst_y0 + my;
+
+            if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
+                continue;
+            }
+
+            int sad = sad8x8_capped(cur, prev_plane, w, sx, sy, best_sad);
+
+            if (sad < 0) {
+                continue;
+            }
+
+            if (sad < best_sad) {
+                best_sad = sad;
+                best_mx = mx;
+                best_my = my;
+            }
+        }
+    }
+
+    if (best_mx == center_mx && best_my == center_my) {
         return false;
     }
 
@@ -1793,6 +2081,14 @@ static void encode_plane(
     */
     int active_dqp = 0;
 
+    /* --motion-search hybrid: per-plane-per-frame budget for the optional
+       local-refine escalation (see the MS_HYBRID branch below). Reset each
+       encode_plane() call (i.e. per plane per frame), so no more than a
+       fixed fraction of this plane's blocks can ever pay the extra refine
+       cost, regardless of content. */
+    int hybrid_refine_count = 0;
+    int hybrid_refine_budget = (bxcount * bycount) / 4;
+
     for (int by = 0; by < bycount; by++) {
         for (int bx = 0; bx < bxcount; bx++) {
             get_block(cur, w, bx, by, b);
@@ -1972,6 +2268,64 @@ static void encode_plane(
                             pred,
                             &best_mv_sad
                         );
+                    } else if (motion_search_mode == MS_HYBRID) {
+                        /* --motion-search hybrid: two-seed bounded diamond
+                           (zero + global MV), then -- only for blocks whose
+                           result still looks unreliable, and only up to a
+                           fixed per-plane budget -- a small capped local
+                           refine. See find_best_mv_64_hybrid() /
+                           find_best_mv_64_local_refine(). */
+                        found_mv = find_best_mv_64_hybrid(
+                            b,
+                            prev,
+                            w,
+                            h,
+                            bx,
+                            by,
+                            mv_range,
+                            mv_search_cutoff,
+                            g_mx,
+                            g_my,
+                            &best_mx,
+                            &best_my,
+                            pred,
+                            &best_mv_sad
+                        );
+
+                        if (found_mv &&
+                            best_mv_sad > mv_thresh &&
+                            block_var_dqp > 80 &&
+                            hybrid_refine_count < hybrid_refine_budget) {
+                            int refined_mx;
+                            int refined_my;
+                            int refined_sad;
+                            u8 refined_pred[64];
+
+                            hybrid_refine_count++;
+
+                            if (find_best_mv_64_local_refine(
+                                    b,
+                                    prev,
+                                    w,
+                                    h,
+                                    bx,
+                                    by,
+                                    mv_range,
+                                    2,
+                                    best_mx,
+                                    best_my,
+                                    best_mv_sad,
+                                    &refined_mx,
+                                    &refined_my,
+                                    refined_pred,
+                                    &refined_sad
+                                )) {
+                                best_mx = refined_mx;
+                                best_my = refined_my;
+                                best_mv_sad = refined_sad;
+                                memcpy(pred, refined_pred, 64);
+                            }
+                        }
                     } else {
                         int start_step = (motion_search_mode == MS_FAST) ? 2 : 4;
                         bool recenter = (motion_search_mode != MS_FAST);
@@ -2404,8 +2758,10 @@ int main(int argc, char **argv) {
             ep.motion_search_mode = MS_DIAMOND;
         } else if (!strcmp(ms_str, "fast")) {
             ep.motion_search_mode = MS_FAST;
+        } else if (!strcmp(ms_str, "hybrid")) {
+            ep.motion_search_mode = MS_HYBRID;
         } else {
-            die("--motion-search must be full, diamond, or fast");
+            die("--motion-search must be full, diamond, fast, or hybrid");
         }
     }
 
