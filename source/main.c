@@ -366,8 +366,10 @@ static bool app_audio_system_init(void) {
 
 static void app_audio_system_shutdown(void) {
     if (g_ndsp_ready) {
+        printf("lifecycle: calling ndspExit\n");
         ndspExit();
         g_ndsp_ready = false;
+        printf("lifecycle: ndspExit returned\n");
     }
 }
 
@@ -2659,6 +2661,7 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
             }
             break;
         case APTHOOK_ONEXIT:
+            printf("lifecycle: APTHOOK_ONEXIT fired (state=%d)\n", (int)g_media_ctl.state);
             GSPLCD_PowerOffAllBacklights();
             break;
         default:
@@ -10773,6 +10776,8 @@ static int play(void) {
 
     }
 
+    printf("lifecycle: play() loop exited, starting cleanup\n");
+
     g_media_ctl.state = STATE_PLAYING;
     g_media_ctl.current_frame_idx = 0;
     g_media_ctl.dummy_seek_state = 0;
@@ -10787,7 +10792,9 @@ static int play(void) {
         2. Shut down audio.
         3. Close FILE* after reader thread is gone.
     */
+    printf("lifecycle: play() calling mivf_stream_close (stops/joins reader thread)\n");
     mivf_stream_close(&stream);
+    printf("lifecycle: play() mivf_stream_close returned\n");
     hfix52a_y2r_shutdown();
     audio_shutdown();
     hfix58s_subtitles_unload();
@@ -10842,7 +10849,11 @@ int main(void) {
             MIVF_PATH is redirected to g_hfix58_selected_media above.
         */
         if (!g_hfix58_has_selected_media) {
-            if (!hfix58_file_browser_select(g_hfix58_selected_media, sizeof(g_hfix58_selected_media))) {
+            printf("lifecycle: entering file browser\n");
+            bool browser_r = hfix58_file_browser_select(g_hfix58_selected_media, sizeof(g_hfix58_selected_media));
+            printf("lifecycle: file browser returned (%s)\n", browser_r ? "selected" : "exit");
+
+            if (!browser_r) {
                 break;
             }
 
@@ -10850,7 +10861,9 @@ int main(void) {
         }
 
         if (hfix58_media_kind(MIVF_PATH) == HFIX58_MEDIA_MOFLEX) {
+            printf("lifecycle: entering moflex playback: %s\n", MIVF_PATH);
             MoflexResult result = play_moflex_selected_media(MIVF_PATH);
+            printf("lifecycle: moflex playback returned (%d)\n", (int)result);
 
             if (result == MOFLEX_QUIT_EXIT) {
                 break;
@@ -10860,7 +10873,9 @@ int main(void) {
             continue;
         }
 
+        printf("lifecycle: entering play(): %s\n", MIVF_PATH);
         int r = play();
+        printf("lifecycle: play() returned (%d)\n", r);
 
         if (r == 1) {
             break;
@@ -10887,13 +10902,18 @@ int main(void) {
         g_hfix58_has_selected_media = false;
     }
 
+    printf("lifecycle: main() outer loop exited, shutting down\n");
+
     MIVF_SettingsSave(&g_mivf_settings);
     audio_shutdown();
     app_audio_system_shutdown();
     gspLcdExit();
+    printf("lifecycle: calling aptExit\n");
     aptExit();
+    printf("lifecycle: aptExit returned\n");
     ptmuExit();
     mivf_diag_close();
+    printf("lifecycle: main() returning cleanly\n");
     mivf_log_close();
     gfxExit();
     return 0;
