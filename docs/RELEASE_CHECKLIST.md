@@ -33,6 +33,7 @@ Steps to prepare and publish a MIVF Player release.
 - [ ] Copy `mivf_player_3ds.3dsx` to release artifacts
 - [ ] Copy `mivf_player_3ds.cia` to release artifacts (if built)
 - [ ] Optionally bundle `encode_mivf.py` and encoder binaries for PC
+  - [ ] **Rebuild `miv2y_moflex_tier.exe` from the current `tools/miv2y_moflex_tier.c`** before bundling — it is a local/generated artifact, not tracked in source control, so a stale bundled binary can silently lag behind `encode_mivf.py`'s CLI (e.g. accepting a `--motion-search` mode the bundled helper doesn't actually implement)
 
 ## GitHub Release
 
