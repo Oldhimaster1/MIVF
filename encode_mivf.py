@@ -101,6 +101,7 @@ class EncodeSettings:
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
     max_video_packet_kb: int = 0  # 0 = disabled (default, unchanged behavior)
     warm_start_chunks: bool = False  # experimental, opt-in (see --warm-start-chunks)
+    motion_search: str = "full"  # full (default, unchanged) | diamond | fast (both experimental)
 
 
 @dataclass
@@ -1015,6 +1016,8 @@ def encoder_segment_cmd(
         str(settings.c_delta),
         "--mv-range",
         str(settings.mv_range),
+        "--motion-search",
+        settings.motion_search,
         "--keep",
         str(settings.keep),
         "--start-frame",
@@ -1573,6 +1576,8 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
             str(settings.c_delta),
             "--mv-range",
             str(settings.mv_range),
+            "--motion-search",
+            settings.motion_search,
             "--keep",
             str(settings.keep),
         ]
@@ -1976,6 +1981,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--y-delta", type=int, default=DEFAULT_Y_DELTA)
     parser.add_argument("--c-delta", type=int, default=DEFAULT_C_DELTA)
     parser.add_argument("--mv-range", type=int, default=DEFAULT_MV_RANGE)
+    parser.add_argument(
+        "--motion-search",
+        choices=["full", "diamond", "fast"],
+        default="full",
+        help="per-block motion search algorithm: full = exhaustive, slowest, best quality "
+             "(default, unchanged behavior); diamond = experimental iterative search, faster, "
+             "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk",
+    )
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, choices=[4, 8, 16], help="transform coefficients kept per 4x4 quadrant: 16=HD detail (default), 4=small legacy files")
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel encoder workers, default {DEFAULT_JOBS}")
     parser.add_argument("--chunk-frames", type=int, default=DEFAULT_CHUNK_FRAMES, help=f"frames per streaming worker chunk, default {DEFAULT_CHUNK_FRAMES}")
@@ -2033,6 +2046,7 @@ def main() -> None:
         chunk_frames=args.chunk_frames,
         max_video_packet_kb=args.max_video_packet_kb,
         warm_start_chunks=args.warm_start_chunks,
+        motion_search=args.motion_search,
     )
 
     if settings.max_video_packet_kb < 0:
@@ -2077,6 +2091,8 @@ def main() -> None:
     print(f"  y_delta:         {settings.y_delta}")
     print(f"  c_delta:         {settings.c_delta}")
     print(f"  mv_range:        {settings.mv_range}")
+    motion_search_desc = settings.motion_search if settings.motion_search == "full" else f"{settings.motion_search} (experimental)"
+    print(f"  motion_search:   {motion_search_desc}")
     print(f"  audio:           {settings.audio_codec.upper()} {settings.audio_rate}Hz ch={settings.audio_channels}")
     cap_desc = f"{settings.max_video_packet_kb} KB" if settings.max_video_packet_kb > 0 else "disabled"
     print(f"  max_video_pkt:   {cap_desc}")
