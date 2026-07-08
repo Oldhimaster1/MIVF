@@ -6898,7 +6898,13 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
 
     hfix58_alert_clear();
 
-    if (!hfix58_scan_default_dirs()) {
+    u64 scan_t0 = svcGetSystemTick();
+    bool scan_ok = hfix58_scan_default_dirs();
+    printf("lifecycle: browser dir scan took %llu us (ok=%d, entries=%u)\n",
+        (unsigned long long)ticks_to_us(svcGetSystemTick() - scan_t0),
+        (int)scan_ok, (unsigned int)g_hfix58_browser.count);
+
+    if (!scan_ok) {
         /*
             Still show a no-files screen so the user gets feedback.
         */
@@ -10815,6 +10821,8 @@ static int play(void) {
 /* ------------------------------------------------------------------------- */
 
 int main(void) {
+    u64 lifecycle_start_tick = svcGetSystemTick();
+
     gfxInitDefault();
     ptmuInit();
     aptInit();
@@ -10827,7 +10835,17 @@ int main(void) {
     mivf_log_open();
     mivf_diag_open();
 
+    /* First log write of the run -- ticks_to_us() elapsed since main() started
+       covers gfxInitDefault/ptmuInit/aptInit/gspLcdInit above (the log file
+       itself isn't open yet during those, but the tick delta still captures
+       their cost). */
+    printf("lifecycle: startup t+%llu us -- gfx/ptmu/apt/gsp init done, log opened\n",
+        (unsigned long long)ticks_to_us(svcGetSystemTick() - lifecycle_start_tick));
+
     app_audio_system_init();
+
+    printf("lifecycle: startup t+%llu us -- audio system init done\n",
+        (unsigned long long)ticks_to_us(svcGetSystemTick() - lifecycle_start_tick));
 
     MIVF_SettingsInit(&g_mivf_settings);
     MIVF_SettingsLoad(&g_mivf_settings);
@@ -10838,6 +10856,9 @@ int main(void) {
     hfix59r3_apply_runtime_settings();
     GSPLCD_PowerOnAllBacklights();
     hfix59r3_apply_screen_brightness(false);
+
+    printf("lifecycle: startup t+%llu us -- settings loaded, apt hook registered, entering main loop\n",
+        (unsigned long long)ticks_to_us(svcGetSystemTick() - lifecycle_start_tick));
 
     /* HFIX58D: scrubbed full bottom-console printf statement. */
     /* HFIX58D: scrubbed full bottom-console printf statement. */
