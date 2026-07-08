@@ -2508,12 +2508,22 @@ static const char *hfix60_subtitle_pos_name(u32 idx) {
 }
 
 static void hfix59r3_apply_screen_brightness(bool dimmed) {
-    u32 brightness = dimmed ? g_mivf_settings.autodim_brightness : g_mivf_brightness_active;
+    /* HFIX_BOTTOMDIM: playback autodim no longer scales hardware backlight
+       brightness (that hit GSPLCD_SCREEN_BOTH, dimming the top video along
+       with the bottom UI). Waking/restoring still sets real hardware
+       brightness for both screens as before; entering the dimmed state only
+       flips g_mivf_brightness_dimmed, which hfix51c_draw_bottom_ui uses to
+       draw a bottom-screen-only dark overlay -- the top screen's backlight
+       and video output are never touched. */
+    if (!dimmed) {
+        u32 brightness = g_mivf_brightness_active;
 
-    if (brightness < 1u) brightness = 1u;
-    if (brightness > 5u) brightness = 5u;
+        if (brightness < 1u) brightness = 1u;
+        if (brightness > 5u) brightness = 5u;
 
-    GSPLCD_SetBrightness(GSPLCD_SCREEN_BOTH, brightness);
+        GSPLCD_SetBrightness(GSPLCD_SCREEN_BOTH, brightness);
+    }
+
     g_mivf_brightness_dimmed = dimmed;
 }
 
@@ -3045,15 +3055,32 @@ static void hfix58f_request_relative_seek(int delta_frames);
 static void hfix58f_draw_timeline(u8 *fb, int panel_y);
 
 static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up);
+/* HFIX_BOTTOMDIM: halves every bottom-screen pixel's RGB565 channels in
+   place. Only ever called on the bottom framebuffer -- the top video
+   screen has its own separate framebuffer and is never passed here. */
+static void hfix59r3_dim_bottom_framebuffer(u8 *fb, u16 fw, u16 fh) {
+    u16 *px = (u16 *)fb;
+    size_t count = (size_t)fw * (size_t)fh;
+
+    for (size_t i = 0; i < count; i++) {
+        u16 c = px[i];
+        u16 r = (u16)((c >> 11) & 0x1Fu) >> 1;
+        u16 g = (u16)((c >> 5) & 0x3Fu) >> 1;
+        u16 b = (u16)(c & 0x1Fu) >> 1;
+        px[i] = (u16)((r << 11) | (g << 5) | b);
+    }
+}
+
 static void hfix51c_draw_bottom_ui(void) {
     u16 fw = 0;
     u16 fh = 0;
     u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
 
-    (void)fw;
-    (void)fh;
-
     hfix58d_draw_bottom_fluent_ui(fb);
+
+    if (g_mivf_brightness_dimmed) {
+        hfix59r3_dim_bottom_framebuffer(fb, fw, fh);
+    }
 }
 
 static void hfix51c_draw_bottom_ui_throttled(void) {
@@ -3065,6 +3092,7 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
     static bool last_settings_visible = false;
     static int last_settings_index = -1;
     static int force_redraw_frames = 2;
+    static bool last_dimmed = false;
 
     /* HFIX58D_THROTTLER_TICK */
     hfix58d_anim_tick();
@@ -3105,6 +3133,14 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
     if (g_hfix57_touch_button != last_hfix57_touch_button) {
         force_redraw_frames = 2;
         last_hfix57_touch_button = g_hfix57_touch_button;
+    }
+
+    /* HFIX_BOTTOMDIM: force a redraw as soon as the autodim state flips
+       so the bottom-screen dim overlay (or its removal on wake) shows up
+       promptly instead of waiting for an unrelated state change. */
+    if (g_mivf_brightness_dimmed != last_dimmed) {
+        force_redraw_frames = 2;
+        last_dimmed = g_mivf_brightness_dimmed;
     }
 
     if (!last_visible ||
