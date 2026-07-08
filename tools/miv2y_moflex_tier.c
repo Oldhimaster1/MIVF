@@ -148,6 +148,12 @@ typedef struct {
     s8 *my;
 } MVList;
 
+/* --motion-search: full is the original exhaustive mvlist scan (default,
+   unchanged behavior). diamond/fast are experimental iterative searches --
+   see find_best_mv_64_diamond(). None of these change the packed MVCOPY
+   token format; the decoder only ever sees the final chosen (mx,my). */
+enum { MS_FULL = 0, MS_DIAMOND = 1, MS_FAST = 2 };
+
 typedef struct {
     int w;
     int h;
@@ -172,6 +178,7 @@ typedef struct {
     double c_lambda;
     int qp;
     int c_qp_offset;
+    int motion_search_mode;
 } EncParams;
 
 static void die(const char *msg) {
@@ -352,11 +359,15 @@ static void usage(void) {
         "  --c-solid N          default 32\n"
         "  --c-qres N           default 300\n"
         "  --mv-range N         default 8\n"
+        "  --motion-search MODE full (exhaustive, default) | diamond | fast "
+        "(both experimental, faster but may cost quality/size)\n"
         "  --y-mv-thresh N      default 768\n"
         "  --c-mv-thresh N      default 1024\n"
         "  --lambda N          RDO lambda, default 4.0; higher = smaller/lossier\n"
         "  --c-lambda N        chroma RDO lambda, default matches luma lambda\n"
         "  --qp N              transform quantizer, 1..51, default 28\n  --c-qp-offset N     chroma transform QP offset, default 4 in HFIX54A\n"
+        "  --start-frame N     global frame index of the first --input frame, default 0\n"
+        "  --dump-last-recon PATH  write the final reconstructed frame (Y+Cb+Cr, raw) to PATH\n"
     );
 }
 
@@ -858,6 +869,160 @@ static bool find_best_mv_64(
         memcpy(
             out_pred + yy * 8,
             prev_plane + (best_y0 + yy) * w + best_x0,
+            8
+        );
+    }
+
+    *out_mx = best_mx;
+    *out_my = best_my;
+    *out_sad = best_sad;
+
+    return true;
+}
+
+/* --motion-search diamond/fast: SAD over an 8x8 block against a fixed
+   (sx,sy) source position, aborting (returns -1) as soon as the running
+   sum exceeds limit. Same formula and early-abort convention as the
+   exhaustive scan in find_best_mv_64 above, factored out so the new
+   iterative search below doesn't duplicate/diverge from it while also
+   not touching find_best_mv_64 itself (full mode stays byte-identical). */
+static int sad8x8_capped(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int sx,
+    int sy,
+    int limit
+) {
+    int sad = 0;
+
+    for (int yy = 0; yy < 8; yy++) {
+        const u8 *p = prev_plane + (sy + yy) * w + sx;
+        const u8 *c = cur + yy * 8;
+
+        for (int x = 0; x < 8; x++) {
+            int d = (int)c[x] - (int)p[x];
+            if (d < 0) d = -d;
+
+            sad += d;
+
+            if (sad > limit) {
+                return -1;
+            }
+        }
+    }
+
+    return sad;
+}
+
+/* --motion-search diamond/fast: iterative cross/diamond step search.
+   Starts at the zero vector, tests the 4 neighbors at +-step on each axis,
+   recenters on any improvement (walking across the search window while
+   recenter_at_same_step is true), and halves step when a round finds no
+   improvement, until step reaches 0. Bounded to a small, predictable
+   number of SAD probes (tens, not hundreds) instead of every vector in
+   +-mv_range -- unlike find_best_mv_64's exhaustive mvlist scan, this can
+   miss the true global-minimum vector on complex motion, which is the
+   quality/size tradeoff --motion-search diamond/fast opt into.
+   Bounds-checked the same way as find_best_mv_64: any candidate outside
+   the plane or outside +-mv_range is skipped, so this can never emit an
+   out-of-range or out-of-bounds motion vector. */
+static bool find_best_mv_64_diamond(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int bx,
+    int by,
+    int mv_range,
+    int search_cutoff,
+    int start_step,
+    bool recenter_at_same_step,
+    int *out_mx,
+    int *out_my,
+    u8 out_pred[64],
+    int *out_sad
+) {
+    if (!prev_plane) {
+        return false;
+    }
+
+    if (mv_range < 0) {
+        mv_range = 0;
+    }
+
+    if (search_cutoff <= 0) {
+        search_cutoff = 4096;
+    }
+
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    /* The zero vector always lands inside the block's own plane bounds,
+       so this initial probe is always valid (it may still come back -1
+       if it exceeds search_cutoff, exactly like find_best_mv_64 treats an
+       aborted probe as "no candidate yet"). */
+    int cur_mx = 0;
+    int cur_my = 0;
+    int best_sad = sad8x8_capped(cur, prev_plane, w, dst_x0, dst_y0, search_cutoff);
+    int best_mx = 0;
+    int best_my = 0;
+
+    int step = start_step;
+    if (step > mv_range) step = mv_range;
+    if (step < 1) step = 0;
+
+    while (step >= 1 && best_sad != 0) {
+        int cand_mx[4] = { cur_mx + step, cur_mx - step, cur_mx, cur_mx };
+        int cand_my[4] = { cur_my, cur_my, cur_my + step, cur_my - step };
+        bool improved = false;
+
+        for (int k = 0; k < 4; k++) {
+            int mx = clamp_int(cand_mx[k], -mv_range, mv_range);
+            int my = clamp_int(cand_my[k], -mv_range, mv_range);
+
+            if (mx == cur_mx && my == cur_my) {
+                continue;
+            }
+
+            int sx = dst_x0 + mx;
+            int sy = dst_y0 + my;
+
+            if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
+                continue;
+            }
+
+            int limit = (best_sad >= 0) ? best_sad : search_cutoff;
+            int sad = sad8x8_capped(cur, prev_plane, w, sx, sy, limit);
+
+            if (sad < 0) {
+                continue;
+            }
+
+            if (best_sad < 0 || sad < best_sad) {
+                best_sad = sad;
+                best_mx = mx;
+                best_my = my;
+                improved = true;
+            }
+        }
+
+        cur_mx = best_mx;
+        cur_my = best_my;
+
+        if (!(improved && recenter_at_same_step)) {
+            step /= 2;
+        }
+    }
+
+    if (best_sad < 0) {
+        return false;
+    }
+
+    for (int yy = 0; yy < 8; yy++) {
+        memcpy(
+            out_pred + yy * 8,
+            prev_plane + (dst_y0 + best_my + yy) * w + (dst_x0 + best_mx),
             8
         );
     }
@@ -1572,6 +1737,8 @@ static void encode_plane(
     int qp,
     int g_mx,
     int g_my,
+    int mv_range,
+    int motion_search_mode,
     PlaneEnc *out
 ) {
     /*
@@ -1782,8 +1949,16 @@ static void encode_plane(
                     int best_my = 0;
                     int best_mv_sad = 0;
                     int mv_search_cutoff = 4096;
+                    bool found_mv;
 
-                    if (find_best_mv_64(
+                    /* --motion-search: full keeps the exact original exhaustive
+                       scan (find_best_mv_64, untouched). diamond/fast use the
+                       new iterative search instead -- same candidate bounds,
+                       same SAD formula, same packed-token output shape, just
+                       far fewer probes per block. See find_best_mv_64_diamond
+                       for the speed/quality tradeoff this opts into. */
+                    if (motion_search_mode == MS_FULL) {
+                        found_mv = find_best_mv_64(
                             b,
                             prev,
                             w,
@@ -1796,7 +1971,30 @@ static void encode_plane(
                             &best_my,
                             pred,
                             &best_mv_sad
-                        )) {
+                        );
+                    } else {
+                        int start_step = (motion_search_mode == MS_FAST) ? 2 : 4;
+                        bool recenter = (motion_search_mode != MS_FAST);
+
+                        found_mv = find_best_mv_64_diamond(
+                            b,
+                            prev,
+                            w,
+                            h,
+                            bx,
+                            by,
+                            mv_range,
+                            mv_search_cutoff,
+                            start_step,
+                            recenter,
+                            &best_mx,
+                            &best_my,
+                            pred,
+                            &best_mv_sad
+                        );
+                    }
+
+                    if (found_mv) {
                         /*
                             HFIX37-REDUX:
                             Single-block Global Motion Vector copy.
@@ -2197,11 +2395,34 @@ int main(int argc, char **argv) {
     ep.y_mv_thresh = arg_int(argc, argv, "--y-mv-thresh", 768);
     ep.c_mv_thresh = arg_int(argc, argv, "--c-mv-thresh", 1024);
 
+    {
+        const char *ms_str = arg_str(argc, argv, "--motion-search", "full");
+
+        if (!strcmp(ms_str, "full")) {
+            ep.motion_search_mode = MS_FULL;
+        } else if (!strcmp(ms_str, "diamond")) {
+            ep.motion_search_mode = MS_DIAMOND;
+        } else if (!strcmp(ms_str, "fast")) {
+            ep.motion_search_mode = MS_FAST;
+        } else {
+            die("--motion-search must be full, diamond, or fast");
+        }
+    }
+
     ep.lambda = arg_double(argc, argv, "--lambda", 3.35);
     ep.c_lambda = arg_double(argc, argv, "--c-lambda", ep.lambda * 1.55);
     ep.qp = arg_int(argc, argv, "--qp", 35);
         ep.c_qp_offset = arg_int(argc, argv, "--c-qp-offset", 4);
     u32 start_frame = (u32)arg_int(argc, argv, "--start-frame", 0);
+
+    /* HFIX_WARMSTART: opt-in raw dump of the final closed-loop reconstructed
+       frame (Y+Cb+Cr planes, same layout as --input), written after encoding
+       finishes. Used by encode_mivf.py's --warm-start-chunks: the next chunk's
+       subprocess is fed this exact reconstruction as a throwaway first frame,
+       so its real first frame can predict from a bit-exact reference instead
+       of being forced into a QP/keep-insensitive keyframe. Never touches the
+       .mivf bitstream/format -- purely a side artifact for the next process. */
+    const char *dump_last_recon_path = arg_str(argc, argv, "--dump-last-recon", NULL);
 if (ep.qp < 1) ep.qp = 1;
     if (ep.qp > 51) ep.qp = 51;
 
@@ -2335,6 +2556,8 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
             ep.qp,
             g_mx,
             g_my,
+            ep.mv_range,
+            ep.motion_search_mode,
             &yenc
         );
 
@@ -2355,6 +2578,8 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
             clamp_int(ep.qp + ep.c_qp_offset, 1, 51),
             g_mx / 2,
             g_my / 2,
+            ep.mv_range,
+            ep.motion_search_mode,
             &cbenc
         );
 
@@ -2375,6 +2600,8 @@ size_t got = read_full_frame(fin, frame, (size_t)frame_size);
             clamp_int(ep.qp + ep.c_qp_offset, 1, 51),
             g_mx / 2,
             g_my / 2,
+            ep.mv_range,
+            ep.motion_search_mode,
             &crenc
         );
 
@@ -2502,6 +2729,23 @@ frames = fi + 1;
 
 if (frames <= 0) {
         die("no frames encoded");
+    }
+
+    if (dump_last_recon_path) {
+        FILE *fdump = fopen(dump_last_recon_path, "wb");
+
+        if (!fdump) {
+            die("failed to open --dump-last-recon output");
+        }
+
+        if (fwrite(prev_y, 1, (size_t)y_size, fdump) != (size_t)y_size ||
+            fwrite(prev_cb, 1, (size_t)c_size, fdump) != (size_t)c_size ||
+            fwrite(prev_cr, 1, (size_t)c_size, fdump) != (size_t)c_size) {
+            fclose(fdump);
+            die("failed to write --dump-last-recon output");
+        }
+
+        fclose(fdump);
     }
 
     if (!input_is_stdin) {

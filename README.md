@@ -151,7 +151,13 @@ make cia      # builds mivf_player_3ds.cia (requires makerom + bannertool)
 
 Built with devkitPro / devkitARM and libctru. CIA packaging uses makerom and bannertool. MoFlex demuxer and decoder are adapted from FFmpeg (LGPL).
 
-## License
+## License and Attribution
 
-Released under the MIT License. Bundled FFmpeg-derived components retain their original LGPL licensing.
+MIVF Player is released under the **MIT License**. See [LICENSE](LICENSE) for the full terms.
+
+**Attribution is required.** If you copy, modify, redistribute, or include substantial portions of this project's source code, documentation, assets, or derived materials in another project, you must preserve the copyright notice and license text, and provide reasonable credit to Micah Lagger / MIVF Player for Nintendo 3DS.
+
+See [NOTICE.md](NOTICE.md) for detailed attribution requirements and [CREDITS.md](CREDITS.md) for project and third-party credits.
+
+Bundled FFmpeg-derived components under `source/moflex/ffmpeg_support/` retain their original LGPL licensing and must be distributed in compliance with those terms.
 

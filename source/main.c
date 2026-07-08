@@ -1,4 +1,5 @@
 #include <3ds.h>
+#include <sys/stat.h>
 
 /* ------------------------------------------------------------------------- */
 /* HFIX58J_RETAIL_UX_AND_IO                                                   */
@@ -2507,12 +2508,22 @@ static const char *hfix60_subtitle_pos_name(u32 idx) {
 }
 
 static void hfix59r3_apply_screen_brightness(bool dimmed) {
-    u32 brightness = dimmed ? g_mivf_settings.autodim_brightness : g_mivf_brightness_active;
+    /* HFIX_BOTTOMDIM: playback autodim no longer scales hardware backlight
+       brightness (that hit GSPLCD_SCREEN_BOTH, dimming the top video along
+       with the bottom UI). Waking/restoring still sets real hardware
+       brightness for both screens as before; entering the dimmed state only
+       flips g_mivf_brightness_dimmed, which hfix51c_draw_bottom_ui uses to
+       draw a bottom-screen-only dark overlay -- the top screen's backlight
+       and video output are never touched. */
+    if (!dimmed) {
+        u32 brightness = g_mivf_brightness_active;
 
-    if (brightness < 1u) brightness = 1u;
-    if (brightness > 5u) brightness = 5u;
+        if (brightness < 1u) brightness = 1u;
+        if (brightness > 5u) brightness = 5u;
 
-    GSPLCD_SetBrightness(GSPLCD_SCREEN_BOTH, brightness);
+        GSPLCD_SetBrightness(GSPLCD_SCREEN_BOTH, brightness);
+    }
+
     g_mivf_brightness_dimmed = dimmed;
 }
 
@@ -2611,8 +2622,20 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
 
     switch (hook) {
         case APTHOOK_ONSUSPEND:
+            /* HOME menu / app suspend: park playback but leave the
+               screen on so the HOME menu is visible.  Only real sleep
+               (ONSLEEP / lid close) powers off backlights. */
+            if (g_media_ctl.state == STATE_PLAYING) {
+                g_media_ctl.state = STATE_PAUSED;
+                g_mivf_park_resume_audio = true;
+                if (audio_can_use_ndsp()) {
+                    ndspChnSetPaused(0, true);
+                }
+            }
+            break;
         case APTHOOK_ONSLEEP:
-            /* Lid close / suspend: park playback so A/V resume cleanly on wake. */
+            /* Lid close / real sleep: park playback and power off
+               backlights to save power. */
             if (g_media_ctl.state == STATE_PLAYING) {
                 g_media_ctl.state = STATE_PAUSED;
                 g_mivf_park_resume_audio = true;
@@ -3032,15 +3055,32 @@ static void hfix58f_request_relative_seek(int delta_frames);
 static void hfix58f_draw_timeline(u8 *fb, int panel_y);
 
 static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up);
+/* HFIX_BOTTOMDIM: halves every bottom-screen pixel's RGB565 channels in
+   place. Only ever called on the bottom framebuffer -- the top video
+   screen has its own separate framebuffer and is never passed here. */
+static void hfix59r3_dim_bottom_framebuffer(u8 *fb, u16 fw, u16 fh) {
+    u16 *px = (u16 *)fb;
+    size_t count = (size_t)fw * (size_t)fh;
+
+    for (size_t i = 0; i < count; i++) {
+        u16 c = px[i];
+        u16 r = (u16)((c >> 11) & 0x1Fu) >> 1;
+        u16 g = (u16)((c >> 5) & 0x3Fu) >> 1;
+        u16 b = (u16)(c & 0x1Fu) >> 1;
+        px[i] = (u16)((r << 11) | (g << 5) | b);
+    }
+}
+
 static void hfix51c_draw_bottom_ui(void) {
     u16 fw = 0;
     u16 fh = 0;
     u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
 
-    (void)fw;
-    (void)fh;
-
     hfix58d_draw_bottom_fluent_ui(fb);
+
+    if (g_mivf_brightness_dimmed) {
+        hfix59r3_dim_bottom_framebuffer(fb, fw, fh);
+    }
 }
 
 static void hfix51c_draw_bottom_ui_throttled(void) {
@@ -3052,6 +3092,7 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
     static bool last_settings_visible = false;
     static int last_settings_index = -1;
     static int force_redraw_frames = 2;
+    static bool last_dimmed = false;
 
     /* HFIX58D_THROTTLER_TICK */
     hfix58d_anim_tick();
@@ -3092,6 +3133,14 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
     if (g_hfix57_touch_button != last_hfix57_touch_button) {
         force_redraw_frames = 2;
         last_hfix57_touch_button = g_hfix57_touch_button;
+    }
+
+    /* HFIX_BOTTOMDIM: force a redraw as soon as the autodim state flips
+       so the bottom-screen dim overlay (or its removal on wake) shows up
+       promptly instead of waiting for an unrelated state change. */
+    if (g_mivf_brightness_dimmed != last_dimmed) {
+        force_redraw_frames = 2;
+        last_dimmed = g_mivf_brightness_dimmed;
     }
 
     if (!last_visible ||
@@ -4978,6 +5027,7 @@ typedef struct {
     char synopsis1[24];
     char synopsis2[24];
     u16 thumb[HFIX58_PREVIEW_W * HFIX58_PREVIEW_H];
+    u32 file_size_kb; /* populated lazily when this path is previewed, zero if unknown */
 } Hfix58BrowserPreview;
 
 static Hfix58FileBrowser g_hfix58_browser;
@@ -4987,6 +5037,30 @@ static Hfix58BrowserPreview g_hfix58_preview;
    Cursor movement sets a ~200 ms deadline; the preview is only loaded
    once the selection has been stable for that interval. */
 static u64 g_hfix58_preview_deadline = 0;
+
+/* HFIX60: show-all toggle — when true the browser scans the SD root
+   first so files outside the dedicated media folders are visible.
+   Toggled with SELECT in the file browser. */
+static bool g_hfix58_show_all_dirs = false;
+
+/* HFIX60: lightweight performance counters for debug overlay.
+   Updated every frame; max/last values shown when debug overlay
+   is enabled in Settings.  No file I/O, negligible overhead. */
+static u64 g_perf_decode_us_max = 0;
+static u64 g_perf_blit_us_max = 0;
+static u64 g_perf_page_us_max = 0;
+static u64 g_perf_audio_gap_ms_max = 0;
+static u64 g_perf_audio_gap_tick = 0;
+static u32 g_perf_late_count = 0;
+
+static void hfix58_perf_diag_reset(void) {
+    g_perf_decode_us_max = 0;
+    g_perf_blit_us_max = 0;
+    g_perf_page_us_max = 0;
+    g_perf_audio_gap_ms_max = 0;
+    g_perf_audio_gap_tick = 0;
+    g_perf_late_count = 0;
+}
 
 static char g_hfix58_alert_text[96] = "";
 static int  g_hfix58_alert_level = 0;
@@ -6193,6 +6267,17 @@ static bool hfix58_browser_load_preview(const char *path) {
 
     snprintf(g_hfix58_preview.path, sizeof(g_hfix58_preview.path), "%s", path);
 
+    /* HFIX_BROWSERPERF: compute file size lazily, only for the single
+       previewed entry, once selection has settled (see the debounce in
+       hfix58_browser_refresh_preview) — instead of stat()-ing every
+       matched media file during the full directory scan. */
+    {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0) {
+            g_hfix58_preview.file_size_kb = (u32)((u64)st.st_size / 1024u);
+        }
+    }
+
     if (hfix58_media_kind(path) == HFIX58_MEDIA_MOFLEX) {
         long long resume_us = moflex_resume_get(path);
 
@@ -6366,6 +6451,44 @@ static void hfix58_draw_browser_preview(u8 *fb) {
             hfix58_draw_text_shadow(fb, x + 8, y + 150, g_hfix58_preview.synopsis2, 1, 200, 215, 235);
         }
     }
+
+    /* HFIX60: compact file-size badge. Zero draw-time I/O here — the
+       size was already captured when the preview was (lazily) loaded
+       for this path (see hfix58_browser_load_preview). */
+    {
+        u32 kb = g_hfix58_preview.file_size_kb;
+        if (kb > 0) {
+            char sz[24];
+            if (kb >= 1024) {
+                snprintf(sz, sizeof(sz), "%lu.%lu MB",
+                    (unsigned long)(kb / 1024u),
+                    (unsigned long)((kb % 1024u) * 10u / 1024u));
+            } else {
+                snprintf(sz, sizeof(sz), "%lu KB", (unsigned long)kb);
+            }
+            int sy = g_hfix58_preview.synopsis2[0] ? y + 158 :
+                     g_hfix58_preview.synopsis1[0] ? y + 148 : y + 134;
+            hfix58_draw_text_shadow(fb, x + 8, sy, sz, 1, 155, 195, 235);
+        }
+    }
+}
+
+/* HFIX60: known system-folder names to skip when show-all is off.
+   These are directory names (case-insensitive match), not full paths.
+   In MIVF's flat browser model directories already fail the extension
+   check, so this is an explicit belt-and-suspenders filter plus a
+   foundation for any future folder-browsing UI. */
+static bool hfix58_is_system_folder_name(const char *name) {
+    static const char *sys[] = {
+        "nintendo 3ds", "dcim", "3ds", "luma", "gm9", "cias",
+        "private", "boot9strap", "themes", "fbi", "updates",
+        NULL
+    };
+    if (!name || !*name) return false;
+    for (int i = 0; sys[i]; i++) {
+        if (!strcasecmp(name, sys[i])) return true;
+    }
+    return false;
 }
 
 static bool hfix58_scan_dir(const char *dir) {
@@ -6385,6 +6508,14 @@ static bool hfix58_scan_dir(const char *dir) {
     while ((ent = readdir(d)) != NULL) {
         if (g_hfix58_browser.count >= HFIX58_MAX_BROWSER_FILES) {
             break;
+        }
+
+        /* HFIX60: when show-all is off, skip entries whose names
+           match known system folders — belt-and-suspenders on top
+           of the extension filter (directories already fail it). */
+        if (!g_hfix58_show_all_dirs &&
+            hfix58_is_system_folder_name(ent->d_name)) {
+            continue;
         }
 
         if (!hfix58_is_supported_media(ent->d_name)) {
@@ -6470,12 +6601,23 @@ static bool mivf_find_next_in_folder(const char *cur_path, char *out, size_t out
 }
 
 static bool hfix58_scan_default_dirs(void) {
-    static const char *dirs[] = {
+    /* When show-all is off (default), dedicated media folders are
+       scanned first; the SD root is only a fallback.  When show-all
+       is on the root is scanned first so files placed at the top
+       level are visible immediately. */
+    static const char *hidden_dirs[] = {
         "sdmc:/mivf",
         "sdmc:/3ds/mivf_player_3ds",
         "sdmc:/",
         NULL
     };
+    static const char *show_all_dirs[] = {
+        "sdmc:/",
+        "sdmc:/mivf",
+        "sdmc:/3ds/mivf_player_3ds",
+        NULL
+    };
+    const char **dirs = g_hfix58_show_all_dirs ? show_all_dirs : hidden_dirs;
 
     for (int i = 0; dirs[i]; i++) {
         if (hfix58_scan_dir(dirs[i])) {
@@ -6651,7 +6793,12 @@ static void hfix58_draw_browser(u8 *fb) {
 
     hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
     hfix58_rect565(fb, 22, 205, 276, 1, 40, 62, 94);
-    hfix58_draw_text_shadow(fb, 24, 212, "A OPEN   Y FAVORITE   B BACK   START EXIT", 1, 222, 236, 252);
+    {
+        char footer[56];
+        snprintf(footer, sizeof(footer), "A OPEN  Y FAV  %s  B BACK  START EXIT",
+            g_hfix58_show_all_dirs ? "SEL:HIDE SYS" : "SEL:SHOW SYS");
+        hfix58_draw_text_shadow(fb, 24, 212, footer, 1, 222, 236, 252);
+    }
 
     hfix58_draw_alert(fb);
 }
@@ -6695,6 +6842,16 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
 
         if (down & KEY_B) {
             return false;
+        }
+
+        /* HFIX60: SELECT toggles show-all mode — rescans with the
+           alternate directory order so the user can see files at
+           the SD root (or hide them again). */
+        if (down & KEY_SELECT) {
+            g_hfix58_show_all_dirs = !g_hfix58_show_all_dirs;
+            hfix58_scan_default_dirs();
+            hfix58_preview_clear();
+            hfix58_browser_redraw();
         }
 
         if (g_hfix58_browser.count > 0) {
@@ -7689,6 +7846,20 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         hfix58_rect565(fb, 166, 76, 36, 10, 20, 30, 48);
         hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 206, 228, 255);
 
+        /* HFIX60: performance debug overlay line — only when enabled. */
+        if (g_mivf_settings.debug_overlay_enabled) {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg),
+                "D%5llu B%4llu P%4llu Ag%4llu Dr%-3u L%-3u",
+                (unsigned long long)g_perf_decode_us_max,
+                (unsigned long long)g_perf_blit_us_max,
+                (unsigned long long)g_perf_page_us_max,
+                (unsigned long long)g_perf_audio_gap_ms_max,
+                (unsigned int)g_audio_drop,
+                (unsigned int)g_perf_late_count);
+            hfix58_draw_text_shadow(fb, 222, 90, dbg, 1, 200, 220, 255);
+        }
+
         int meter_x = 222;
         int meter_y = 74;
         int meter_w = 72;
@@ -8236,6 +8407,7 @@ static void hfix59r3_present_video_frame(
 
     if (now_tick > *next_frame_tick + frame_ticks_abs * 2) {
         *next_frame_tick = now_tick + frame_ticks_abs;
+        g_perf_late_count++;
     } else {
         *next_frame_tick += frame_ticks_abs;
     }
@@ -9868,6 +10040,10 @@ static int play(void) {
     g_hfix58f_seek_catchup_target = 0;
     g_hfix58f_seek_preview_decode_pending = false;
 
+    /* Reset per-playback-session perf counters so max values from
+       a previous file don't mislead the debug overlay. */
+    hfix58_perf_diag_reset();
+
     if (g_mivf_settings.resume_enabled) {
         MivfBookmark bookmark;
         if (MIVF_BookmarkLoad(MIVF_PATH, &bookmark) &&
@@ -10218,6 +10394,7 @@ static int play(void) {
 
         u64 page_t1 = svcGetSystemTick();
         page_wait_us = ticks_to_us(page_t1 - page_t0);
+        if (page_wait_us > g_perf_page_us_max) g_perf_page_us_max = page_wait_us;
 
         MivfPage pg = page.pg;
         u8 *cur_page = page.data;
@@ -10263,6 +10440,12 @@ static int play(void) {
 
                 audio_off += ak.hsize + ak.psize;
             }
+            /* Track longest gap between audio queue calls. */
+            if (g_perf_audio_gap_tick) {
+                u64 gap_ms = ticks_to_us(svcGetSystemTick() - g_perf_audio_gap_tick) / 1000u;
+                if (gap_ms > g_perf_audio_gap_ms_max) g_perf_audio_gap_ms_max = gap_ms;
+            }
+            g_perf_audio_gap_tick = svcGetSystemTick();
         }
 
         for (u16 i = 0; i < pg.packets; i++) {
@@ -10451,6 +10634,7 @@ static int play(void) {
 
         u64 parse_t1 = svcGetSystemTick();
         parse_us = ticks_to_us(parse_t1 - parse_t0);
+        if (parse_us > g_perf_decode_us_max) g_perf_decode_us_max = parse_us;
 
         mivf_stream_release_page(&stream, &page);
 
@@ -10475,6 +10659,7 @@ static int play(void) {
 
             g_hfix58f_seek_preview_decode_pending = false;
             blit_us = ticks_to_us(svcGetSystemTick() - blit_t0);
+            if (blit_us > g_perf_blit_us_max) g_perf_blit_us_max = blit_us;
 
             if (g_mivf_ab_state == 2 &&
                 g_mivf_ab_b != MIVF_AB_UNSET &&

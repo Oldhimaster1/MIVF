@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing import cpu_count
 from pathlib import Path
 import os
@@ -37,6 +37,12 @@ DEFAULT_C_DELTA = 32
 DEFAULT_MV_RANGE = 4
 DEFAULT_JOBS = min(8, max(1, cpu_count()))
 DEFAULT_CHUNK_FRAMES = 240
+
+# --max-video-packet-kb retry ladder: bounded, deterministic, disabled unless the
+# flag is passed (max_video_packet_kb == 0).
+PACKET_CAP_MAX_RETRIES = 3
+PACKET_CAP_QP_STEP = 6
+PACKET_CAP_MAX_QP = 51
 
 HEADER_SIZE = 64
 STREAM_DESC_SIZE = 32
@@ -93,6 +99,9 @@ class EncodeSettings:
     keep: int = DEFAULT_KEEP
     jobs: int = DEFAULT_JOBS
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
+    max_video_packet_kb: int = 0  # 0 = disabled (default, unchanged behavior)
+    warm_start_chunks: bool = False  # experimental, opt-in (see --warm-start-chunks)
+    motion_search: str = "full"  # full (default, unchanged) | diamond | fast (both experimental)
 
 
 @dataclass
@@ -207,7 +216,57 @@ def parse_video_stream_desc(desc_blob: bytes) -> tuple[int, bytes, int, int]:
     raise RuntimeError("video stream descriptor not found")
 
 
-def report_packet_size_stats(mivf_path: Path) -> dict:
+def parse_video_packet_body(body: bytes) -> dict | None:
+    """Best-effort decode of the fixed 28-byte metadata header every M2Y1/M2Y2
+    video packet body already carries (see tools/miv2y_moflex_tier.c's
+    write_page() call site and tools/m2y2_transcode.c's byte-for-byte-copied
+    body layout comment). Read-only diagnostic over metadata the encoder
+    already writes -- does not require or touch the native encoder.
+
+    Returns None if the body is too short or doesn't match a known codec tag.
+    """
+    if len(body) < 28 or bytes(body[:4]) not in (b"M2Y1", b"M2Y2"):
+        return None
+
+    codec = bytes(body[:4]).decode("ascii")
+    frame_idx = le32(body, 8)
+    is_keyframe = body[12] == 1
+    y_size = le32(body, 16)
+    cb_size = le32(body, 20)
+    cr_size = le32(body, 24)
+
+    info = {
+        "codec": codec,
+        "frame_idx": frame_idx,
+        "is_keyframe": is_keyframe,
+        "y_size": y_size,
+        "cb_size": cb_size,
+        "cr_size": cr_size,
+        "nkeep": None,
+        "plane_qp": None,
+    }
+
+    if codec == "M2Y1":
+        # body[13] is only meaningful for M2Y1; M2Y2's transcoder copies it as 0.
+        info["nkeep"] = body[13]
+        # encode_plane() writes each plane's active QP as that plane payload's
+        # own byte 0 ("Plane payload byte 0 stores active transform QP" in
+        # tools/miv2y_moflex_tier.c) -- readable directly since M2Y1 plane
+        # payloads are uncompressed.
+        plane_off = 28
+        qps = []
+        for size in (y_size, cb_size, cr_size):
+            if size > 0 and plane_off < len(body):
+                qps.append(body[plane_off])
+            plane_off += size
+        info["plane_qp"] = qps
+    # M2Y2 plane payloads are range-coded (source/mivf_rc.h); the per-plane QP
+    # byte is inside the compressed blob and isn't readable without decompressing.
+
+    return info
+
+
+def report_packet_size_stats(mivf_path: Path, chunk_frames: int | None = None) -> dict:
     """Parse final .mivf and print per-video-packet size statistics.
 
     Returns a dict with all computed values for programmatic use.
@@ -233,6 +292,13 @@ def report_packet_size_stats(mivf_path: Path) -> dict:
         pos = first
         pages = 0
 
+        # Track the single largest video packet's diagnostic detail as we go
+        # (in original file order) instead of relying on `sizes` post-sort,
+        # since sorting below discards which page/frame each size came from.
+        worst_size = -1
+        worst_meta: dict | None = None
+        worst_page_seq: int | None = None
+
         while pos + PAGE_HEADER_SIZE <= file_size:
             f.seek(pos)
             page_hdr = f.read(PAGE_HEADER_SIZE)
@@ -242,6 +308,7 @@ def report_packet_size_stats(mivf_path: Path) -> dict:
             if page_hdr[:2] != b"MP":
                 break
 
+            page_seq = le32(page_hdr, 4)
             payload = le32(page_hdr, 16)
             packets = le16(page_hdr, 20)
 
@@ -273,6 +340,15 @@ def report_packet_size_stats(mivf_path: Path) -> dict:
 
                 if pkt_sid == video_sid:
                     sizes.append(psize)
+                    if psize > worst_size:
+                        body_start = pkt_pos + hsize
+                        body_head = b""
+                        if body_start + 28 <= page_end:
+                            f.seek(body_start)
+                            body_head = f.read(min(28, psize))
+                        worst_size = psize
+                        worst_meta = parse_video_packet_body(body_head)
+                        worst_page_seq = page_seq
 
                 pkt_pos += hsize + psize
 
@@ -356,6 +432,39 @@ def report_packet_size_stats(mivf_path: Path) -> dict:
         print()
         print("  Recommendation: consider --profile 3ds-fast or lower --qp / higher --lambda")
         print("  to keep video packet sizes below ~10-15 KB for smooth 3DS playback.")
+
+    print()
+    print("  Worst packet detail:")
+    if worst_meta is not None:
+        print(f"    frame index (from body): {worst_meta['frame_idx']}")
+        if worst_page_seq is not None and worst_page_seq != worst_meta["frame_idx"]:
+            print(f"    *** page seq ({worst_page_seq}) != body frame_idx ({worst_meta['frame_idx']}) -- investigate")
+        print(f"    packet size:              {worst_size} B ({worst_size / 1024:.1f} KB)")
+        print(f"    codec:                    {worst_meta['codec']}")
+        print(f"    keyframe (body flag):     {'YES' if worst_meta['is_keyframe'] else 'no'}")
+        print(
+            f"    y/cb/cr payload split:    {worst_meta['y_size']} / {worst_meta['cb_size']} / "
+            f"{worst_meta['cr_size']} B"
+        )
+        if worst_meta["nkeep"] is not None:
+            print(f"    keep (nkeep) at encode:   {worst_meta['nkeep']}")
+        if worst_meta["plane_qp"]:
+            print(f"    per-plane QP byte:        {worst_meta['plane_qp']} (Y, Cb, Cr)")
+        elif worst_meta["codec"] == "M2Y2":
+            print("    per-plane QP byte:        n/a (range-coded; not directly readable without decompressing)")
+        if chunk_frames:
+            boundary = (worst_meta["frame_idx"] % chunk_frames) == 0
+            print(
+                f"    chunk_frames setting:     {chunk_frames} "
+                f"(frame at chunk/segment boundary: {'YES' if boundary else 'no'})"
+            )
+        print(
+            "    note: the page-header KEYFRAME flag is always set by this encoder (not a "
+            "reliable signal) -- frame type above comes from the packet BODY flag instead."
+        )
+    else:
+        print("    unavailable -- packet body did not match a known M2Y1/M2Y2 layout")
+
     print()
     print(f"  total video payload: {total/1048576:.1f} MiB")
     print("============================================================")
@@ -371,6 +480,8 @@ def report_packet_size_stats(mivf_path: Path) -> dict:
         "p99": percentile(99),
         "bucket_counts": bucket_counts,
         "bucket_labels": bucket_labels,
+        "worst_meta": worst_meta,
+        "worst_page_seq": worst_page_seq,
     }
 
 
@@ -873,8 +984,9 @@ def encoder_segment_cmd(
     output_path: Path,
     settings: EncodeSettings,
     start_frame: int,
+    recon_dump_path: Path | None = None,
 ) -> list[str]:
-    return [
+    cmd = [
         str(helper),
         "--input",
         "-",
@@ -904,11 +1016,16 @@ def encoder_segment_cmd(
         str(settings.c_delta),
         "--mv-range",
         str(settings.mv_range),
+        "--motion-search",
+        settings.motion_search,
         "--keep",
         str(settings.keep),
         "--start-frame",
         str(start_frame),
     ]
+    if recon_dump_path is not None:
+        cmd += ["--dump-last-recon", str(recon_dump_path)]
+    return cmd
 
 
 def run_encoder_segment(
@@ -919,9 +1036,10 @@ def run_encoder_segment(
     frame_count: int,
     raw_frames: bytes,
     workdir: Path,
+    recon_dump_path: Path | None = None,
 ) -> Path:
     result = subprocess.run(
-        encoder_segment_cmd(helper, output_path, settings, start_frame),
+        encoder_segment_cmd(helper, output_path, settings, start_frame, recon_dump_path),
         input=raw_frames,
         capture_output=True,
         cwd=workdir,
@@ -937,6 +1055,170 @@ def run_encoder_segment(
     if not output_path.exists():
         raise RuntimeError(f"encoder segment did not create {output_path}")
     return output_path
+
+
+def scan_segment_video_packet_sizes(mivf_path: Path, skip_first_page: bool = False) -> list[int]:
+    """Return the list of video-packet payload sizes in a single-segment .mivf
+    file, before segments are merged into the final output. Segment files have
+    the same header/page/packet framing as a full .mivf (see inspect_video_segment
+    / copy_video_pages), so the same low-level scan applies.
+
+    skip_first_page: set when this segment has a --warm-start-chunks throwaway
+    warm-up page prepended, so the packet-cap retry loop judges/targets only the
+    packets that will actually reach the final output (the warm-up page is always
+    a forced, QP/keep-insensitive keyframe and would otherwise waste retries)."""
+    file_size = mivf_path.stat().st_size
+    with mivf_path.open("rb") as f:
+        header = f.read(HEADER_SIZE)
+        if len(header) != HEADER_SIZE or header[:4] != b"MIVF":
+            raise RuntimeError(f"{mivf_path}: not a valid MIVF file")
+
+        first = le64(header, 36)
+        if first <= HEADER_SIZE or first > 4096:
+            raise RuntimeError(f"{mivf_path}: invalid first page offset {first}")
+
+        desc_blob = f.read(first - HEADER_SIZE)
+        if len(desc_blob) != first - HEADER_SIZE:
+            raise RuntimeError(f"{mivf_path}: short stream descriptor block")
+
+        video_sid, _codec, _w, _h = parse_video_stream_desc(desc_blob)
+
+        sizes: list[int] = []
+        pos = first
+        first_page = True
+        while pos + PAGE_HEADER_SIZE <= file_size:
+            f.seek(pos)
+            page_hdr = f.read(PAGE_HEADER_SIZE)
+            if len(page_hdr) != PAGE_HEADER_SIZE or page_hdr[:2] != b"MP":
+                break
+
+            payload = le32(page_hdr, 16)
+            packets = le16(page_hdr, 20)
+            if payload == 0 or payload > (512 * 1024) or packets == 0 or packets > 128:
+                break
+
+            page_payload_start = pos + PAGE_HEADER_SIZE
+            page_end = page_payload_start + payload
+            if page_end > file_size:
+                break
+
+            if skip_first_page and first_page:
+                first_page = False
+                pos = page_end
+                continue
+            first_page = False
+
+            pkt_pos = page_payload_start
+            for _ in range(packets):
+                if pkt_pos + PACKET_HEADER_SIZE > page_end:
+                    break
+
+                f.seek(pkt_pos)
+                pkt_hdr = f.read(PACKET_HEADER_SIZE)
+                if len(pkt_hdr) != PACKET_HEADER_SIZE:
+                    break
+
+                pkt_sid = pkt_hdr[0]
+                hsize = le16(pkt_hdr, 2)
+                psize = le32(pkt_hdr, 8)
+                if hsize < PACKET_HEADER_SIZE or pkt_pos + hsize + psize > page_end:
+                    break
+
+                if pkt_sid == video_sid:
+                    sizes.append(psize)
+
+                pkt_pos += hsize + psize
+
+            pos = page_end
+
+    return sizes
+
+
+def run_encoder_segment_capped(
+    helper: Path,
+    output_path: Path,
+    settings: EncodeSettings,
+    start_frame: int,
+    frame_count: int,
+    raw_frames: bytes,
+    workdir: Path,
+    recon_dump_path: Path | None = None,
+    has_warmup_frame: bool = False,
+) -> dict:
+    """Encode one segment normally; if settings.max_video_packet_kb is set and the
+    segment's largest video packet exceeds it, retry that whole segment at a
+    higher QP (bounded retries), keeping whichever attempt actually produced the
+    smallest max packet. No-op (single normal encode, no scanning) when the cap
+    is disabled, so default behavior/perf is unchanged.
+
+    If recon_dump_path is given (--warm-start-chunks), the final reconstructed
+    frame is requested from whichever attempt is actually kept, and moved to
+    recon_dump_path -- so a QP retry can't silently leave a stale/mismatched
+    warm-start reference behind.
+
+    has_warmup_frame: this segment has a throwaway warm-up frame prepended
+    (raw_frames/frame_count include it), so the packet-cap scan must skip its
+    page -- the warm-up is always a forced keyframe and is discarded before
+    merging, so judging the cap against it would waste retries on a packet
+    that never reaches the final output."""
+    initial_dump = output_path.with_name(output_path.stem + "_cap0.recon") if recon_dump_path else None
+    run_encoder_segment(helper, output_path, settings, start_frame, frame_count, raw_frames, workdir, initial_dump)
+
+    cap_bytes = settings.max_video_packet_kb * 1024 if settings.max_video_packet_kb > 0 else 0
+
+    best_path = output_path
+    best_dump = initial_dump
+    best_max = -1
+    best_qp = settings.qp
+    cur_qp = settings.qp
+    attempts = 0
+
+    def finish(result: dict) -> dict:
+        if recon_dump_path is not None and best_dump is not None and best_dump.exists():
+            os.replace(best_dump, recon_dump_path)
+        return result
+
+    if cap_bytes <= 0:
+        return finish({"capped": False})
+
+    sizes = scan_segment_video_packet_sizes(output_path, skip_first_page=has_warmup_frame)
+    initial_max = max(sizes) if sizes else 0
+    best_max = initial_max
+    if initial_max <= cap_bytes:
+        return finish({"capped": False, "initial_max": initial_max, "final_max": initial_max, "retries": 0})
+
+    while best_max > cap_bytes and attempts < PACKET_CAP_MAX_RETRIES and cur_qp < PACKET_CAP_MAX_QP:
+        attempts += 1
+        cur_qp = min(PACKET_CAP_MAX_QP, cur_qp + PACKET_CAP_QP_STEP)
+        retry_settings = replace(settings, qp=cur_qp)
+        retry_path = output_path.with_name(output_path.stem + f"_cap{attempts}.mivf")
+        retry_dump = output_path.with_name(output_path.stem + f"_cap{attempts}.recon") if recon_dump_path else None
+        run_encoder_segment(helper, retry_path, retry_settings, start_frame, frame_count, raw_frames, workdir, retry_dump)
+        retry_max = max(scan_segment_video_packet_sizes(retry_path, skip_first_page=has_warmup_frame), default=0)
+
+        if retry_max < best_max:
+            if best_path != output_path:
+                best_path.unlink(missing_ok=True)
+            if best_dump is not None and best_dump.exists():
+                best_dump.unlink(missing_ok=True)
+            best_path, best_max, best_qp = retry_path, retry_max, cur_qp
+            best_dump = retry_dump
+        else:
+            retry_path.unlink(missing_ok=True)
+            if retry_dump is not None:
+                retry_dump.unlink(missing_ok=True)
+
+    if best_path != output_path:
+        os.replace(best_path, output_path)
+
+    return finish({
+        "capped": True,
+        "initial_max": initial_max,
+        "final_max": best_max,
+        "retries": attempts,
+        "qp_used": best_qp,
+        "still_over_cap": best_max > cap_bytes,
+    })
 
 
 def inspect_video_segment(path: Path) -> tuple[bytes, bytes, int, int, int]:
@@ -961,10 +1243,26 @@ def inspect_video_segment(path: Path) -> tuple[bytes, bytes, int, int, int]:
     return header, desc, first, fpsn, fpsd
 
 
-def copy_video_pages(path: Path, out_file, expected_frame: int, first: int) -> tuple[int, int]:
+def copy_video_pages(path: Path, out_file, expected_frame: int, first: int, skip_pages: int = 0) -> tuple[int, int]:
     copied = 0
     with path.open("rb") as f:
         f.seek(first)
+
+        # --warm-start-chunks: this segment has `skip_pages` throwaway warm-up
+        # page(s) prepended (see build_streaming_parallel_mivf) that must never
+        # reach the final output -- they duplicate a frame already copied from
+        # the previous segment. Skip them before the real frame-continuity copy.
+        for _ in range(skip_pages):
+            page_header = f.read(PAGE_HEADER_SIZE)
+            if not page_header:
+                raise RuntimeError(f"{path}: expected a warm-up page to skip, file too short")
+            if len(page_header) != PAGE_HEADER_SIZE or page_header[:2] != b"MP":
+                raise RuntimeError(f"{path}: bad warm-up page header")
+            payload_size = le32(page_header, 16)
+            skipped = f.read(payload_size)
+            if len(skipped) != payload_size:
+                raise RuntimeError(f"{path}: short warm-up page payload")
+
         while True:
             page_header = f.read(PAGE_HEADER_SIZE)
             if not page_header:
@@ -991,9 +1289,16 @@ def copy_video_pages(path: Path, out_file, expected_frame: int, first: int) -> t
     return copied, expected_frame
 
 
-def merge_video_segments(output_path: Path, segment_paths: list[Path], settings: EncodeSettings) -> int:
+def merge_video_segments(
+    output_path: Path,
+    segment_paths: list[Path],
+    settings: EncodeSettings,
+    warm_started_segments: set[int] | None = None,
+) -> int:
     if not segment_paths:
         raise RuntimeError("no video segments to merge")
+
+    warm_started_segments = warm_started_segments or set()
 
     header0, desc0, first0, fpsn0, fpsd0 = inspect_video_segment(segment_paths[0])
     header = bytearray(header0)
@@ -1017,7 +1322,8 @@ def merge_video_segments(output_path: Path, segment_paths: list[Path], settings:
             if fpsn != fpsn0 or fpsd != fpsd0:
                 raise RuntimeError(f"{segment}: FPS differs from segment 0")
 
-            copied, expected_frame = copy_video_pages(segment, out_file, expected_frame, first)
+            skip_pages = 1 if idx in warm_started_segments else 0
+            copied, expected_frame = copy_video_pages(segment, out_file, expected_frame, first, skip_pages)
             total_frames += copied
             print(f"merged segment {idx}: frames={copied}", flush=True)
 
@@ -1046,11 +1352,20 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
         raise RuntimeError("failed to open FFmpeg rawvideo pipe")
 
     segment_paths: dict[int, Path] = {}
-    pending: dict[Future[Path], tuple[int, Path, int, int]] = {}
+    pending: dict[Future[dict], tuple[int, Path, int, int, Path | None]] = {}
     next_segment = 0
     next_frame = 0
     completed_frames = 0
     start_time = time.time()
+    cap_stats: list[dict] = []
+
+    # --warm-start-chunks: chunk N>0 is fed the previous chunk's own closed-loop
+    # reconstructed last frame as a throwaway prepended frame, so its real first
+    # frame lands at local fi=1 (not fi=0) and can use ordinary QP/keep-responsive
+    # P-frame coding instead of being forced into a SOLID/RAW-only keyframe. The
+    # warm-up page is dropped before merging (see copy_video_pages/skip_pages).
+    warm_bytes_by_seg: dict[int, bytes] = {}
+    warm_started_segments: set[int] = set()
 
     def drain_one(block: bool) -> None:
         nonlocal completed_frames
@@ -1058,10 +1373,17 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
             return
         done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED if not block else FIRST_COMPLETED)
         for future in done:
-            seg_idx, seg_path, start_frame, frame_count = pending.pop(future)
-            future.result()
+            seg_idx, seg_path, start_frame, frame_count, recon_dump_path = pending.pop(future)
+            stats = future.result()
             segment_paths[seg_idx] = seg_path
             completed_frames += frame_count
+            if stats.get("capped"):
+                cap_stats.append({**stats, "seg_idx": seg_idx, "frame_count": frame_count})
+            if recon_dump_path is not None:
+                if not recon_dump_path.exists():
+                    raise RuntimeError(f"segment {seg_idx}: expected --dump-last-recon output at {recon_dump_path}")
+                warm_bytes_by_seg[seg_idx] = recon_dump_path.read_bytes()
+                recon_dump_path.unlink(missing_ok=True)
             elapsed = max(0.001, time.time() - start_time)
             print(
                 f"encoded segment {seg_idx}: start={start_frame} frames={frame_count} "
@@ -1083,17 +1405,40 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
 
                 seg_idx = next_segment
                 seg_path = workdir / f"segment_{seg_idx:05d}.mivf"
+
+                submit_raw = raw_chunk
+                submit_start_frame = next_frame
+                submit_frame_count = frame_count
+
+                if settings.warm_start_chunks and seg_idx > 0:
+                    # Needs chunk (seg_idx-1)'s reconstructed last frame, which only
+                    # exists once that chunk's subprocess has fully finished -- this
+                    # forces strict sequential ordering across chunk boundaries when
+                    # the flag is on (parallelism is inherently traded for a real,
+                    # bit-exact prediction reference; default behavior is unaffected).
+                    while seg_idx - 1 not in warm_bytes_by_seg:
+                        drain_one(block=True)
+                    warm_frame = warm_bytes_by_seg.pop(seg_idx - 1)
+                    submit_raw = warm_frame + raw_chunk
+                    submit_start_frame = next_frame - 1
+                    submit_frame_count = frame_count + 1
+                    warm_started_segments.add(seg_idx)
+
+                recon_dump_path = workdir / f"segment_{seg_idx:05d}.reconlast" if settings.warm_start_chunks else None
+
                 future = pool.submit(
-                    run_encoder_segment,
+                    run_encoder_segment_capped,
                     helper,
                     seg_path,
                     settings,
-                    next_frame,
-                    frame_count,
-                    raw_chunk,
+                    submit_start_frame,
+                    submit_frame_count,
+                    submit_raw,
                     workdir,
+                    recon_dump_path,
+                    seg_idx in warm_started_segments,
                 )
-                pending[future] = (seg_idx, seg_path, next_frame, frame_count)
+                pending[future] = (seg_idx, seg_path, next_frame, frame_count, recon_dump_path)
                 next_segment += 1
                 next_frame += frame_count
 
@@ -1108,9 +1453,56 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
         raise RuntimeError(f"FFmpeg rawvideo pipe failed (exit code {ffmpeg_rc})")
 
     ordered_segments = [segment_paths[idx] for idx in range(next_segment)]
-    merged_frames = merge_video_segments(temp_video_only, ordered_segments, settings)
+    merged_frames = merge_video_segments(temp_video_only, ordered_segments, settings, warm_started_segments)
     if merged_frames != next_frame:
         raise RuntimeError(f"merged {merged_frames} frames, expected {next_frame}")
+
+    if settings.warm_start_chunks:
+        print()
+        print("============================================================")
+        print("WARM-START CHUNK RESULTS (experimental)")
+        print("============================================================")
+        print(f"  segments total:       {next_segment}")
+        print(f"  segments warm-started: {len(warm_started_segments)} (segment 0 is never warm-started)")
+        print("============================================================")
+
+    if settings.max_video_packet_kb > 0:
+        print()
+        print("============================================================")
+        print("VIDEO PACKET CAP RESULTS")
+        print("============================================================")
+        print(f"  cap:                  {settings.max_video_packet_kb} KB")
+        print(f"  chunk_frames:         {chunk_frames}  (retry unit is a whole chunk, not a single frame)")
+        print(f"  segments total:       {next_segment}")
+        print(f"  segments capped:      {len(cap_stats)}")
+        if cap_stats:
+            frames_affected = sum(s["frame_count"] for s in cap_stats)
+            avg_retries = sum(s["retries"] for s in cap_stats) / len(cap_stats)
+            worst_before = max(s["initial_max"] for s in cap_stats)
+            worst_after = max(s["final_max"] for s in cap_stats)
+            still_over = [s for s in cap_stats if s.get("still_over_cap")]
+            print(f"  frames affected:      {frames_affected}")
+            print(f"  avg retries/segment:  {avg_retries:.1f} (limit {PACKET_CAP_MAX_RETRIES})")
+            print(f"  worst packet before:  {worst_before} B ({worst_before / 1024:.1f} KB)")
+            print(f"  worst packet after:   {worst_after} B ({worst_after / 1024:.1f} KB)")
+            if still_over:
+                worst_remaining = max(s["final_max"] for s in still_over)
+                unmoved = [s for s in still_over if s["final_max"] >= s["initial_max"]]
+                print(
+                    f"  *** WARNING: {len(still_over)} segment(s) still exceed the cap after "
+                    f"{PACKET_CAP_MAX_RETRIES} retries at QP up to {PACKET_CAP_MAX_QP}. "
+                    f"Worst remaining packet: {worst_remaining} B ({worst_remaining / 1024:.1f} KB). "
+                    f"Further QP increases risk visible quality loss -- consider --keep 8/--profile 3ds-fast instead."
+                )
+                if unmoved:
+                    print(
+                        f"  *** NOTE: {len(unmoved)} of those segment(s) shrank by 0 bytes across all "
+                        f"{PACKET_CAP_MAX_RETRIES} QP retries -- their largest packet is QP-insensitive "
+                        f"(likely a forced keyframe or an extreme-motion frame hitting a size floor this "
+                        f"encoder's QP does not control). Raising QP further will not help; a real fix "
+                        f"needs a different lever (--keep, source pre-filtering, or a decoder-side change)."
+                    )
+        print("============================================================")
 
     for segment in ordered_segments:
         segment.unlink(missing_ok=True)
@@ -1184,6 +1576,8 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
             str(settings.c_delta),
             "--mv-range",
             str(settings.mv_range),
+            "--motion-search",
+            settings.motion_search,
             "--keep",
             str(settings.keep),
         ]
@@ -1520,7 +1914,7 @@ def encode_one(
             print("5. Packet Size Report")
             print("============================================================")
             try:
-                report_packet_size_stats(output_path)
+                report_packet_size_stats(output_path, chunk_frames=settings.chunk_frames)
             except Exception as exc:
                 print(f"WARNING: packet size report failed: {exc}")
 
@@ -1587,9 +1981,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--y-delta", type=int, default=DEFAULT_Y_DELTA)
     parser.add_argument("--c-delta", type=int, default=DEFAULT_C_DELTA)
     parser.add_argument("--mv-range", type=int, default=DEFAULT_MV_RANGE)
+    parser.add_argument(
+        "--motion-search",
+        choices=["full", "diamond", "fast"],
+        default="full",
+        help="per-block motion search algorithm: full = exhaustive, slowest, best quality "
+             "(default, unchanged behavior); diamond = experimental iterative search, faster, "
+             "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk",
+    )
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, choices=[4, 8, 16], help="transform coefficients kept per 4x4 quadrant: 16=HD detail (default), 4=small legacy files")
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel encoder workers, default {DEFAULT_JOBS}")
     parser.add_argument("--chunk-frames", type=int, default=DEFAULT_CHUNK_FRAMES, help=f"frames per streaming worker chunk, default {DEFAULT_CHUNK_FRAMES}")
+    parser.add_argument(
+        "--max-video-packet-kb",
+        type=int,
+        default=0,
+        help="if set, any encoded chunk whose largest video packet exceeds this size (KB) "
+             "is retried at a higher QP (bounded retries, keeps the smallest-packet attempt); "
+             "0 disables (default). Retry granularity is a whole --chunk-frames chunk, not a "
+             "single frame -- pair with a smaller --chunk-frames for finer-grained retries.",
+    )
+    parser.add_argument(
+        "--warm-start-chunks",
+        action="store_true",
+        help="experimental: feed each chunk after the first its predecessor's actual "
+             "reconstructed last frame as a throwaway warm-up, so the chunk's real first "
+             "frame can use ordinary QP/keep-responsive P-frame coding instead of being "
+             "forced into a SOLID/RAW-only keyframe at every chunk boundary. Serializes "
+             "chunk encoding (no parallelism across chunks) since each needs its "
+             "predecessor's finished reconstruction first. Off by default.",
+    )
     parser.add_argument("--no-deploy", action="store_true", help="skip SD card deployment")
     parser.add_argument("--m2y2", action="store_true", help="range-code video to the smaller M2Y2 codec (lossless, approximately 20 percent smaller)")
     parser.add_argument("--no-seek-index", action="store_true", help="do not generate .idx sidecar seek index")
@@ -1623,7 +2044,13 @@ def main() -> None:
         keep=args.keep,
         jobs=args.jobs,
         chunk_frames=args.chunk_frames,
+        max_video_packet_kb=args.max_video_packet_kb,
+        warm_start_chunks=args.warm_start_chunks,
+        motion_search=args.motion_search,
     )
+
+    if settings.max_video_packet_kb < 0:
+        raise SystemExit("--max-video-packet-kb must be >= 0")
 
     # ---- profile presets ----
     # Apply preset defaults, but let explicit CLI flags override by
@@ -1664,7 +2091,12 @@ def main() -> None:
     print(f"  y_delta:         {settings.y_delta}")
     print(f"  c_delta:         {settings.c_delta}")
     print(f"  mv_range:        {settings.mv_range}")
+    motion_search_desc = settings.motion_search if settings.motion_search == "full" else f"{settings.motion_search} (experimental)"
+    print(f"  motion_search:   {motion_search_desc}")
     print(f"  audio:           {settings.audio_codec.upper()} {settings.audio_rate}Hz ch={settings.audio_channels}")
+    cap_desc = f"{settings.max_video_packet_kb} KB" if settings.max_video_packet_kb > 0 else "disabled"
+    print(f"  max_video_pkt:   {cap_desc}")
+    print(f"  warm_start:      {'ENABLED (experimental)' if settings.warm_start_chunks else 'disabled'}")
     if args.profile == "3ds-fast":
         print()
         print("  Tip: use --report-packet-sizes to check packet size distribution.")
