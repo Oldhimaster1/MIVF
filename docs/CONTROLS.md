@@ -1,5 +1,7 @@
 # Controls Reference
 
+This page is also available in-app as a scrollable help screen — press **X** in the file browser, or open Settings during playback and select **CONTROLS**. The in-app screen is the same content shown here, so either source is accurate.
+
 ## File Browser
 
 | Button | Action |
@@ -7,6 +9,8 @@
 | D-Pad ↑/↓ | Move selection up/down |
 | A | Open selected file |
 | Y | Toggle favorite on selected file |
+| SELECT | Toggle showing all folders (including SD root) |
+| X | Open the in-app controls help screen |
 | B | Go back / exit browser |
 | START | Exit app |
 
@@ -62,6 +66,16 @@ Settings are saved when you close the menu, not on every value change. This prev
 - Dim timeout
 - Dim brightness level
 - Debug overlay (on/off)
+- Controls (opens the in-app help screen; press A on this row)
+
+## In-App Controls Help Screen
+
+Open with X in the file browser, or via the CONTROLS row in Settings during playback.
+
+| Button | Action |
+| :--- | :--- |
+| D-Pad ↑/↓ | Scroll |
+| B / START / X | Close |
 
 ## Touch Controls
 
