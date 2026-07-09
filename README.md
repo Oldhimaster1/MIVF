@@ -20,6 +20,7 @@ A homebrew video player for the Nintendo 3DS. MIVF uses a custom page-based vide
 - **Customization:** themes, adjustable brightness, auto-dim, font scale, persistent settings saved on close.
 - **Touch transport:** drag the timeline to scrub.
 - **Seek index:** sidecar `.idx` and embedded footer for fast seeking. Large uncached files skip expensive synchronous scanning at open time.
+- **In-app controls help screen:** a scrollable, always-up-to-date reference for every button binding. Press X in the browser, or open Settings and select CONTROLS during playback.
 
 ## Controls
 
@@ -32,6 +33,7 @@ See [docs/CONTROLS.md](docs/CONTROLS.md) for the full control map.
 | Browser | D-Pad ↑/↓ | Move selection |
 | Browser | A | Open file |
 | Browser | Y | Toggle favorite |
+| Browser | X | Open controls help screen |
 | Browser | B / START | Exit |
 | Playback | A | Play / pause |
 | Playback | ←/→ | Seek ±5 s |
@@ -44,6 +46,9 @@ See [docs/CONTROLS.md](docs/CONTROLS.md) for the full control map.
 | Playback | R + ←/→ | Previous / next chapter |
 | Playback | SELECT | Open settings |
 | Playback | START | Stop and return to browser |
+| Settings | CONTROLS row → A | Open controls help screen |
+| Controls help | D-Pad ↑/↓ | Scroll |
+| Controls help | B / START / X | Close |
 
 ### Settings (SELECT)
 D-Pad ↑/↓ to move, A/←/→ to change, B or SELECT to close and save.
