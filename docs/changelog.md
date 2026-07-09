@@ -6,6 +6,8 @@
 - Added experimental `--motion-search hybrid` encoder mode: seeds the diamond search from both the zero vector and the frame's global motion estimate, with a capped local refine for blocks that still look unreliable. `full`/`diamond`/`fast` are unaffected.
 - Added an aggregated `ENCODE SUMMARY` at the end of each encode run (settings, byte/frame counts, per-mode block histogram, approximate PSNR), sourced from the native helper's existing per-segment diagnostics.
 - Added an in-app controls/keybinds help screen (press X in the browser, or select CONTROLS in Settings during playback).
+- Overhauled the README with badges, screenshots, benchmark charts, recommended settings, and MoFlex-vs-MIVF comparison notes.
+- Documented encoder motion-search modes, packet-spike diagnostics, warm-start chunks, and release packaging requirements.
 - Documented the stable streaming chunk encoder pipeline.
 - Added full documentation site (docs/).
 

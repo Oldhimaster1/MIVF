@@ -50,6 +50,11 @@ MANIFEST_*
 # Generated banner blob (rebuilt by `make cia`)
 meta/banner.bnr
 
+# --- README screenshots (override the broad *.png rule above) ---
+!screenshots/*.png
+!screenshots/*.jpg
+!screenshots/*.jpeg
+
 # --- Source / tool backups and scratch (never ship these) ---
 *BACKUP
 *.bak
