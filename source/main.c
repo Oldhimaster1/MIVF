@@ -170,6 +170,8 @@ static u32 g_hfix59r2_video_fps_den = 1;
 static bool g_hfix56_force_stereo = true;
 static bool g_hfix59r3_settings_visible = false;
 static bool g_hfix59r3_resume_after_settings = false;
+static bool g_hfix62_help_visible = false;
+static int g_hfix62_help_scroll = 0;
 
 static MivfSettings g_mivf_settings;
 static bool g_mivf_settings_loaded = false;
@@ -2666,7 +2668,7 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
     }
 }
 
-#define HFIX59R3_SETTINGS_COUNT 20
+#define HFIX59R3_SETTINGS_COUNT 21
 #define HFIX59R3_SETTINGS_VISIBLE 13
 
 static const char *hfix59r3_settings_group(int idx) {
@@ -2674,7 +2676,8 @@ static const char *hfix59r3_settings_group(int idx) {
     if (idx <= 8) return "DISPLAY";
     if (idx == 9) return "AUDIO";
     if (idx <= 14) return "SUBS";
-    return "ADV";
+    if (idx <= 19) return "ADV";
+    return "HELP";
 }
 
 static const char *hfix59r3_settings_label(int idx) {
@@ -2698,7 +2701,8 @@ static const char *hfix59r3_settings_label(int idx) {
         "LID SLEEP",
         "DIM TIME",
         "DIM LEVEL",
-        "DEBUG"
+        "DEBUG",
+        "CONTROLS"
     };
 
     if (idx < 0 || idx >= HFIX59R3_SETTINGS_COUNT) {
@@ -2743,9 +2747,14 @@ static void hfix59r3_settings_value(int idx, char *out, size_t out_sz) {
         case 17: snprintf(out, out_sz, "%lus", (unsigned long)(g_mivf_settings.autodim_timeout_frames / 60u)); break;
         case 18: snprintf(out, out_sz, "%lu", (unsigned long)g_mivf_settings.autodim_brightness); break;
         case 19: snprintf(out, out_sz, "%s", g_mivf_settings.debug_overlay_enabled ? "ON" : "OFF"); break;
+        case 20: snprintf(out, out_sz, "A: VIEW"); break;
         default: break;
     }
 }
+
+/* HFIX62 forward decl: the Settings menu's CONTROLS row hands off to Help,
+   defined further down this file (see hfix62_set_help_open). */
+static void hfix62_set_help_open(bool open);
 
 static bool hfix59r3_handle_settings_menu(u32 down) {
     char value[32];
@@ -2934,6 +2943,14 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
             g_mivf_settings.debug_overlay_enabled = !g_mivf_settings.debug_overlay_enabled;
             snprintf(value, sizeof(value), "DEBUG %s", g_mivf_settings.debug_overlay_enabled ? "ON" : "OFF");
             break;
+        case 20:
+            /* Hand off from Settings to the Help overlay directly (no
+               resume-tracking side effects here -- playback is already
+               paused from opening Settings; hfix62_set_help_open(false)
+               performs the actual resume check when Help closes). */
+            g_hfix59r3_settings_visible = false;
+            hfix62_set_help_open(true);
+            break;
         default:
             break;
     }
@@ -3029,6 +3046,189 @@ static void hfix59r3_draw_settings_overlay(u8 *fb) {
     hfix58_draw_text_shadow(fb, 24, 226, "SELECT OR B CLOSES AND SAVES", 1, 208, 228, 246);
 }
 
+/* ------------------------------------------------------------------------- */
+/* HFIX62: in-app controls/keybinds help screen.                             */
+/*                                                                           */
+/* Reachable two ways: pressing X in the file browser (X is otherwise unused */
+/* there), or selecting the CONTROLS row at the end of the Settings menu     */
+/* during playback (X is already bound to playback speed there, so it isn't */
+/* reused as a direct hotkey in that context). Read-only, scrollable list;  */
+/* content here must stay in sync with the actual key handling below if      */
+/* those bindings ever change.                                              */
+/* ------------------------------------------------------------------------- */
+typedef struct {
+    const char *label;
+    const char *desc;
+    bool header;
+} Hfix62HelpRow;
+
+static const Hfix62HelpRow g_hfix62_help_rows[] = {
+    { "BROWSER", NULL, true },
+    { "D-PAD UP/DOWN", "Move selection", false },
+    { "A", "Open file", false },
+    { "Y", "Toggle favorite", false },
+    { "SELECT", "Toggle show-all folders", false },
+    { "X", "Open this help screen", false },
+    { "B / START", "Exit app", false },
+
+    { "PLAYBACK", NULL, true },
+    { "A", "Play / pause", false },
+    { "LEFT / RIGHT", "Seek -/+ 5 seconds", false },
+    { "TOUCH + DRAG", "Scrub timeline", false },
+    { "X", "Cycle playback speed", false },
+    { "Y", "Cycle subtitle track", false },
+    { "B", "A/B loop: set A, set B, clear", false },
+    { "SELECT", "Open settings", false },
+    { "START", "Stop, return to browser", false },
+
+    { "HOLD L +", NULL, true },
+    { "UP / DOWN", "Volume +/- 10%", false },
+    { "RIGHT", "Toggle forced stereo", false },
+    { "LEFT", "Toggle audio limiter", false },
+
+    { "HOLD R +", NULL, true },
+    { "UP / DOWN", "Screen brightness", false },
+    { "LEFT / RIGHT", "Previous / next chapter", false },
+
+    { "SETTINGS MENU", NULL, true },
+    { "D-PAD UP/DOWN", "Move selection", false },
+    { "A / LEFT / RIGHT", "Change value", false },
+    { "B / SELECT", "Close (saves)", false },
+
+    { "THIS SCREEN", NULL, true },
+    { "D-PAD UP/DOWN", "Scroll", false },
+    { "B / START / X", "Close", false },
+};
+
+#define HFIX62_HELP_ROW_COUNT ((int)(sizeof(g_hfix62_help_rows) / sizeof(g_hfix62_help_rows[0])))
+#define HFIX62_HELP_VISIBLE 13
+
+/* Mirrors hfix59r3_set_settings_open's pause/resume bookkeeping, sharing
+   g_hfix59r3_resume_after_settings so a Settings -> Help transition (see the
+   CONTROLS row handling in hfix59r3_handle_settings_menu) doesn't trigger a
+   second, incorrect pause/resume capture -- the guard below only fires when
+   neither menu was already open. */
+static void hfix62_set_help_open(bool open) {
+    if (open) {
+        if (!g_hfix62_help_visible && !g_hfix59r3_settings_visible &&
+            g_media_ctl.state == STATE_PLAYING) {
+            g_hfix59r3_resume_after_settings = true;
+            g_media_ctl.state = STATE_PAUSED;
+            if (audio_can_use_ndsp()) {
+                ndspChnSetPaused(0, true);
+            }
+        }
+
+        g_hfix62_help_visible = true;
+        g_hfix62_help_scroll = 0;
+        g_media_ctl.ui_visible = true;
+    } else {
+        g_hfix62_help_visible = false;
+
+        if (g_hfix59r3_resume_after_settings) {
+            g_media_ctl.state = STATE_PLAYING;
+            if (audio_can_use_ndsp()) {
+                ndspChnSetPaused(0, false);
+            }
+        }
+    }
+}
+
+static bool hfix62_handle_help_menu(u32 down) {
+    if (!g_hfix62_help_visible) {
+        return false;
+    }
+
+    if ((down & KEY_B) || (down & KEY_START) || (down & KEY_X)) {
+        hfix62_set_help_open(false);
+        return true;
+    }
+
+    if (down & KEY_DUP) {
+        if (g_hfix62_help_scroll > 0) {
+            g_hfix62_help_scroll--;
+        }
+        return true;
+    }
+
+    if (down & KEY_DDOWN) {
+        int max_scroll = HFIX62_HELP_ROW_COUNT - HFIX62_HELP_VISIBLE;
+        if (max_scroll < 0) {
+            max_scroll = 0;
+        }
+        if (g_hfix62_help_scroll < max_scroll) {
+            g_hfix62_help_scroll++;
+        }
+        return true;
+    }
+
+    return true;
+}
+
+static void hfix62_draw_help_overlay(u8 *fb) {
+    if (!g_hfix62_help_visible) {
+        return;
+    }
+
+    int max_first = HFIX62_HELP_ROW_COUNT - HFIX62_HELP_VISIBLE;
+    if (max_first < 0) {
+        max_first = 0;
+    }
+
+    int first = g_hfix62_help_scroll;
+    if (first > max_first) {
+        first = max_first;
+    }
+    if (first < 0) {
+        first = 0;
+    }
+
+    hfix58_rect565(fb, 14, 6, 292, 228, 8, 13, 22);
+    hfix58_rect565(fb, 16, 8, 288, 224, 18, 28, 44);
+    hfix58_rect565(fb, 16, 8, 288, 14, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+    hfix58_rect565(fb, 16, 23, 288, 1, 40, 95, 135);
+
+    hfix58_draw_text_shadow(fb, 24, 10, "CONTROLS", 1, 245, 255, 255);
+    hfix58_draw_text_shadow(fb, 150, 10, "UP/DOWN SCROLL  B CLOSE", 1, 235, 245, 255);
+
+    for (int row = 0; row < HFIX62_HELP_VISIBLE; row++) {
+        int i = first + row;
+        int y = 30 + row * 14;
+
+        if (i >= HFIX62_HELP_ROW_COUNT) {
+            break;
+        }
+
+        const Hfix62HelpRow *r = &g_hfix62_help_rows[i];
+
+        if (r->header) {
+            hfix58_rect565(fb, 22, y - 2, 266, 12, 26, 50, 78);
+            hfix58_draw_text_shadow(fb, 26, y, r->label, 1, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+        } else {
+            hfix58_draw_text_shadow(fb, 30, y, r->label, 1, 200, 216, 236);
+            hfix58_draw_text_shadow(fb, 150, y, r->desc, 1, 170, 190, 214);
+        }
+    }
+
+    if (HFIX62_HELP_ROW_COUNT > HFIX62_HELP_VISIBLE) {
+        int track_h = 178;
+        int knob_h = (track_h * HFIX62_HELP_VISIBLE) / HFIX62_HELP_ROW_COUNT;
+        int knob_y = 30;
+        if (knob_h < 18) {
+            knob_h = 18;
+        }
+        if (max_first > 0) {
+            knob_y += ((track_h - knob_h) * first) / max_first;
+        }
+        hfix58_rect565(fb, 292, 30, 4, track_h, 30, 36, 52);
+        hfix58_rect565(fb, 292, knob_y, 4, knob_h, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+    }
+
+    hfix58_rect565(fb, 22, 212, 266, 1, 44, 66, 96);
+    hfix58_draw_text_shadow(fb, 24, 216, "D-PAD UP/DOWN SCROLL", 1, 208, 228, 246);
+    hfix58_draw_text_shadow(fb, 24, 226, "B, START, OR X CLOSES", 1, 208, 228, 246);
+}
+
 static void hfix58d_draw_bottom_fluent_ui(u8 *fb);
 static void hfix58s_draw_subtitle_overlay_top(u8 *fb);
 
@@ -3091,6 +3291,8 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
     static bool last_visible = false;
     static bool last_settings_visible = false;
     static int last_settings_index = -1;
+    static bool last_help_visible = false;
+    static int last_help_scroll = -1;
     static int force_redraw_frames = 2;
     static bool last_dimmed = false;
 
@@ -3106,6 +3308,7 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
     if (!g_media_ctl.ui_visible) {
         last_visible = false;
         last_settings_visible = false;
+        last_help_visible = false;
         return;
     }
 
@@ -3118,6 +3321,17 @@ static void hfix51c_draw_bottom_ui_throttled(void) {
         force_redraw_frames = 2;
         last_settings_visible = g_hfix59r3_settings_visible;
         last_settings_index = g_hfix59r3_settings_index;
+    }
+
+    if (g_hfix62_help_visible) {
+        force_redraw_frames = 2;
+    }
+
+    if (g_hfix62_help_visible != last_help_visible ||
+        g_hfix62_help_scroll != last_help_scroll) {
+        force_redraw_frames = 2;
+        last_help_visible = g_hfix62_help_visible;
+        last_help_scroll = g_hfix62_help_scroll;
     }
 
     int hfix58b_cur_selected_index = hfix58b_get_selected_index();
@@ -6884,6 +7098,9 @@ static void hfix58_browser_redraw(void) {
     u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
 
     hfix58_draw_browser(fb);
+    if (g_hfix62_help_visible) {
+        hfix62_draw_help_overlay(fb);
+    }
     gfxFlushBuffers();
     gfxSwapBuffers();
 }
@@ -6911,12 +7128,31 @@ static bool hfix58_file_browser_select(char *out_path, size_t out_sz) {
 
         u32 down = hidKeysDown();
 
+        /* HFIX62: while the help overlay is open, it owns all input --
+           handle it here and skip straight to the frame's vblank wait so
+           B/START don't fall through to the exit checks below. */
+        if (g_hfix62_help_visible) {
+            hfix62_handle_help_menu(down);
+            hfix58_browser_redraw();
+            gspWaitForVBlank();
+            continue;
+        }
+
         if (down & KEY_START) {
             return false;
         }
 
         if (down & KEY_B) {
             return false;
+        }
+
+        /* HFIX62: X opens the in-app controls/keybinds help screen (X is
+           otherwise unused in the browser). */
+        if (down & KEY_X) {
+            hfix62_set_help_open(true);
+            hfix58_browser_redraw();
+            gspWaitForVBlank();
+            continue;
         }
 
         /* HFIX60: SELECT toggles show-all mode — rescans with the
@@ -7872,11 +8108,15 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         hfix59r3_draw_settings_overlay(fb);
     }
 
+    if (g_hfix62_help_visible) {
+        hfix62_draw_help_overlay(fb);
+    }
+
     /*
         Volume/status module stays above transport panel.
     */
 
-    if (!g_hfix59r3_settings_visible) {
+    if (!g_hfix59r3_settings_visible && !g_hfix62_help_visible) {
         int vol = g_hfix56_volume_percent;
         if (vol < 0) vol = 0;
         if (vol > 300) vol = 300;
@@ -7969,8 +8209,9 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         Sliding transport panel.
         HFIX60: hidden while the settings overlay is open so the
         play/back/forward controls don't sit behind/around the menu.
+        HFIX62: also hidden while the help overlay is open, same reason.
     */
-    if (!g_hfix59r3_settings_visible) {
+    if (!g_hfix59r3_settings_visible && !g_hfix62_help_visible) {
         hfix58d_draw_fluent_panel(fb, g_mivf_anim.panel_current_y);
     }
 
@@ -10232,6 +10473,9 @@ static int play(void) {
             }
 
             hfix59r3_handle_settings_menu(settings_keys);
+            hfix59r3_tick_idle(hfix59r3_activity);
+        } else if (g_hfix62_help_visible) {
+            hfix62_handle_help_menu(h_keys_down);
             hfix59r3_tick_idle(hfix59r3_activity);
         } else {
             /* HFIX60: R modifier — brightness (up/down) and chapter nav (left/right). */
