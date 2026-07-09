@@ -4307,6 +4307,71 @@ static int dec_m2y1_plane(
     return 0;
 }
 
+/* Overflow-safe sum of three u32 values into a size_t. On the real 3DS
+   target, size_t is 32 bits, so a naive "(size_t)a + (size_t)b + (size_t)c"
+   can silently wrap past a small value before any bounds check runs --
+   this checks each addition against the type's max before performing it,
+   so a corrupted/huge individual value can never hide behind a small
+   wrapped total. Returns false (leaving *out_sum untouched) if the true
+   sum would not fit in a size_t. */
+static bool mivf_u32_sum3(u32 a, u32 b, u32 c, size_t *out_sum) {
+    size_t sum = (size_t)a;
+
+    if ((size_t)b > (size_t)-1 - sum) {
+        return false;
+    }
+    sum += (size_t)b;
+
+    if ((size_t)c > (size_t)-1 - sum) {
+        return false;
+    }
+    sum += (size_t)c;
+
+    *out_sum = sum;
+    return true;
+}
+
+/* Validates the three M2Y1 plane payload sizes (y/cb/cr) before they are
+   used as buffer lengths, per the packet layout "[header_bytes header]
+   [y_payload bytes][cb_payload bytes][cr_payload bytes]":
+     1. each individually must fit within the packet body remaining after
+        the fixed header prefix -- catches a single corrupted huge field
+        even before any sum is formed;
+     2. their sum must not overflow (see mivf_u32_sum3);
+     3. header_bytes + the sum must not exceed n.
+   All three are explicit/independent checks (not merely implied by
+   evaluation order), so this stays correct even if reused or reordered.
+   For a valid, non-corrupted packet these checks are exactly as
+   permissive as the single "header_bytes + y + cb + cr <= n" check this
+   replaces -- decode behavior for valid files is unchanged. */
+static bool mivf_m2y1_plane_sizes_ok(size_t header_bytes, u32 y, u32 cb, u32 cr, size_t n) {
+    if (header_bytes > n) {
+        return false;
+    }
+
+    size_t remaining = n - header_bytes;
+
+    if ((size_t)y > remaining || (size_t)cb > remaining || (size_t)cr > remaining) {
+        return false;
+    }
+
+    size_t sum;
+
+    if (!mivf_u32_sum3(y, cb, cr, &sum)) {
+        return false;
+    }
+
+    if (sum > remaining) {
+        return false;
+    }
+
+    if (header_bytes + sum > n) {
+        return false;
+    }
+
+    return true;
+}
+
 static int dec_m2y1(
     const u8 *p,
     size_t n,
@@ -4332,9 +4397,7 @@ static int dec_m2y1(
     u32 cb_payload = le32(p + 20);
     u32 cr_payload = le32(p + 24);
 
-    size_t need = 28u + (size_t)y_payload + (size_t)cb_payload + (size_t)cr_payload;
-
-    if (n < need) {
+    if (!mivf_m2y1_plane_sizes_ok(28u, y_payload, cb_payload, cr_payload, n)) {
         return -3;
     }
 
@@ -4441,7 +4504,19 @@ static int dec_m2y2(
         return -3;
     }
 
-    size_t raw_total = (size_t)y_raw + (size_t)cb_raw + (size_t)cr_raw;
+    /* Unlike M2Y1's plane sizes, y_raw/cb_raw/cr_raw describe *decompressed*
+       sizes, which are legitimately allowed to exceed the compressed
+       packet's own size (comp) -- that's the point of compression -- so
+       there is no "remaining packet body" bound to check here, only that
+       the sum itself does not silently overflow before the implausible-
+       size cap below gets a chance to reject it (that overflow previously
+       let a corrupted/huge individual value hide behind a small wrapped
+       total and under-allocate g_m2y2_raw). */
+    size_t raw_total;
+
+    if (!mivf_u32_sum3(y_raw, cb_raw, cr_raw, &raw_total)) {
+        return -9;
+    }
 
     if (raw_total == 0) {
         return -4;

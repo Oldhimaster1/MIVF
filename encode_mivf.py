@@ -78,6 +78,91 @@ IMA_STEP_TABLE = [
     32767,
 ]
 
+# Native helper's per-segment STATS line field names, exactly as emitted by
+# tools/miv2y_moflex_tier.c's print_stats(). Used only to parse/aggregate the
+# helper's own stdout across chunks for the Patch 0 encode summary -- never
+# affects encoder decisions or the bitstream.
+HELPER_STATS_INT_FIELDS = [
+    "I", "P",
+    "Y_skip", "Y_delta", "Y_solid", "Y_mv", "Y_mvqres", "Y_qres", "Y_tr", "Y_mvtr",
+    "Y_qz", "Y_mvqz", "Y_trz", "Y_mvtrz", "Y_raw", "Y_run_tokens", "Y_run_blocks",
+    "C_skip", "C_delta", "C_solid", "C_mv", "C_mvqres", "C_qres", "C_tr", "C_mvtr",
+    "C_qz", "C_mvqz", "C_trz", "C_mvtrz", "C_raw", "C_run_tokens", "C_run_blocks",
+    "frames", "total_bytes",
+]
+
+
+def parse_helper_stats_line(stdout_text: str) -> dict[str, int] | None:
+    """Parse the native helper's `STATS ...` line (tools/miv2y_moflex_tier.c
+    print_stats(), already printed on every successful run) into a dict of
+    ints. Returns None if no STATS line is present. Measurement-only: just
+    reads back stdout the helper already produces."""
+    for line in stdout_text.splitlines():
+        if not line.startswith("STATS "):
+            continue
+        fields: dict[str, int] = {}
+        for tok in line[len("STATS "):].split():
+            key, sep, val = tok.partition("=")
+            if not sep or key not in HELPER_STATS_INT_FIELDS:
+                continue
+            try:
+                fields[key] = int(val)
+            except ValueError:
+                pass
+        return fields or None
+    return None
+
+
+def parse_helper_psnr_line(stdout_text: str) -> dict[str, float] | None:
+    """Parse the native helper's `PSNR Y=.. Cb=.. Cr=.. combined=.. dB` line.
+    This is already computed unconditionally per segment by the helper (see
+    the psnr_se_y/psnr_np_y accumulation in miv2y_moflex_tier.c) -- this just
+    reads it back."""
+    for line in stdout_text.splitlines():
+        if not line.startswith("PSNR "):
+            continue
+        fields: dict[str, float] = {}
+        for tok in line[len("PSNR "):].split():
+            key, sep, val = tok.partition("=")
+            if not sep:
+                continue
+            try:
+                fields[key] = float(val)
+            except ValueError:
+                pass
+        return fields or None
+    return None
+
+
+def accumulate_helper_stats(agg: dict[str, int], parsed: dict[str, int]) -> None:
+    """Sum one segment's parsed STATS into the running cross-segment total."""
+    for key, val in parsed.items():
+        agg[key] = agg.get(key, 0) + val
+
+
+def accumulate_helper_psnr(
+    agg: dict[str, dict[str, float]], parsed: dict[str, float], weight_frames: int
+) -> None:
+    """Frame-count-weighted running average of each segment's PSNR (dB).
+    Averaging dB directly (rather than inverting to MSE first) is exact only
+    when segments have equal frame counts -- true for every chunk except
+    possibly the last -- but is precise enough as an A/B signal between
+    motion-search modes, and keeps this measurement-only patch simple."""
+    if weight_frames <= 0:
+        return
+    for key, db in parsed.items():
+        bucket = agg.setdefault(key, {"weighted_sum": 0.0, "weight": 0})
+        bucket["weighted_sum"] += db * weight_frames
+        bucket["weight"] += weight_frames
+
+
+def finalize_helper_psnr(agg: dict[str, dict[str, float]]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, bucket in agg.items():
+        if bucket["weight"] > 0:
+            out[key] = bucket["weighted_sum"] / bucket["weight"]
+    return out
+
 
 @dataclass
 class EncodeSettings:
@@ -101,7 +186,7 @@ class EncodeSettings:
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
     max_video_packet_kb: int = 0  # 0 = disabled (default, unchanged behavior)
     warm_start_chunks: bool = False  # experimental, opt-in (see --warm-start-chunks)
-    motion_search: str = "full"  # full (default, unchanged) | diamond | fast (both experimental)
+    motion_search: str = "full"  # full (default, unchanged) | diamond | fast | hybrid (all experimental)
 
 
 @dataclass
@@ -1037,7 +1122,12 @@ def run_encoder_segment(
     raw_frames: bytes,
     workdir: Path,
     recon_dump_path: Path | None = None,
-) -> Path:
+) -> tuple[Path, str]:
+    """Returns (output_path, decoded stdout text). The stdout text carries the
+    helper's existing STATS/PSNR lines (see print_stats() / the PSNR printf in
+    tools/miv2y_moflex_tier.c) so callers can aggregate them; it was previously
+    discarded on success. Encoder invocation, error handling, and the produced
+    .mivf bytes are unchanged."""
     result = subprocess.run(
         encoder_segment_cmd(helper, output_path, settings, start_frame, recon_dump_path),
         input=raw_frames,
@@ -1054,7 +1144,8 @@ def run_encoder_segment(
         )
     if not output_path.exists():
         raise RuntimeError(f"encoder segment did not create {output_path}")
-    return output_path
+    stdout_text = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+    return output_path, stdout_text
 
 
 def scan_segment_video_packet_sizes(mivf_path: Path, skip_first_page: bool = False) -> list[int]:
@@ -1162,7 +1253,7 @@ def run_encoder_segment_capped(
     merging, so judging the cap against it would waste retries on a packet
     that never reaches the final output."""
     initial_dump = output_path.with_name(output_path.stem + "_cap0.recon") if recon_dump_path else None
-    run_encoder_segment(helper, output_path, settings, start_frame, frame_count, raw_frames, workdir, initial_dump)
+    _, best_stdout = run_encoder_segment(helper, output_path, settings, start_frame, frame_count, raw_frames, workdir, initial_dump)
 
     cap_bytes = settings.max_video_packet_kb * 1024 if settings.max_video_packet_kb > 0 else 0
 
@@ -1176,6 +1267,11 @@ def run_encoder_segment_capped(
     def finish(result: dict) -> dict:
         if recon_dump_path is not None and best_dump is not None and best_dump.exists():
             os.replace(best_dump, recon_dump_path)
+        # Measurement-only: attach whichever attempt's stdout actually became
+        # the kept segment output, so STATS/PSNR reflect the real result even
+        # when a --max-video-packet-kb retry replaced the initial attempt.
+        result["helper_stats"] = parse_helper_stats_line(best_stdout)
+        result["helper_psnr"] = parse_helper_psnr_line(best_stdout)
         return result
 
     if cap_bytes <= 0:
@@ -1193,7 +1289,7 @@ def run_encoder_segment_capped(
         retry_settings = replace(settings, qp=cur_qp)
         retry_path = output_path.with_name(output_path.stem + f"_cap{attempts}.mivf")
         retry_dump = output_path.with_name(output_path.stem + f"_cap{attempts}.recon") if recon_dump_path else None
-        run_encoder_segment(helper, retry_path, retry_settings, start_frame, frame_count, raw_frames, workdir, retry_dump)
+        _, retry_stdout = run_encoder_segment(helper, retry_path, retry_settings, start_frame, frame_count, raw_frames, workdir, retry_dump)
         retry_max = max(scan_segment_video_packet_sizes(retry_path, skip_first_page=has_warmup_frame), default=0)
 
         if retry_max < best_max:
@@ -1203,6 +1299,7 @@ def run_encoder_segment_capped(
                 best_dump.unlink(missing_ok=True)
             best_path, best_max, best_qp = retry_path, retry_max, cur_qp
             best_dump = retry_dump
+            best_stdout = retry_stdout
         else:
             retry_path.unlink(missing_ok=True)
             if retry_dump is not None:
@@ -1336,7 +1433,7 @@ def merge_video_segments(
     return total_frames
 
 
-def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, settings: EncodeSettings, workdir: Path) -> None:
+def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, settings: EncodeSettings, workdir: Path) -> dict:
     helper = copy_helper_binary(workdir)
     frame_size = settings.width * settings.height + (settings.width // 2) * (settings.height // 2) * 2
     jobs = max(1, settings.jobs)
@@ -1358,6 +1455,10 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
     completed_frames = 0
     start_time = time.time()
     cap_stats: list[dict] = []
+    # Measurement-only: cross-segment aggregation of the helper's existing
+    # STATS/PSNR stdout (see parse_helper_stats_line / parse_helper_psnr_line).
+    agg_helper_stats: dict[str, int] = {}
+    agg_helper_psnr: dict[str, dict[str, float]] = {}
 
     # --warm-start-chunks: chunk N>0 is fed the previous chunk's own closed-loop
     # reconstructed last frame as a throwaway prepended frame, so its real first
@@ -1379,6 +1480,12 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
             completed_frames += frame_count
             if stats.get("capped"):
                 cap_stats.append({**stats, "seg_idx": seg_idx, "frame_count": frame_count})
+            helper_stats = stats.get("helper_stats")
+            if helper_stats:
+                accumulate_helper_stats(agg_helper_stats, helper_stats)
+            helper_psnr = stats.get("helper_psnr")
+            if helper_psnr:
+                accumulate_helper_psnr(agg_helper_psnr, helper_psnr, frame_count)
             if recon_dump_path is not None:
                 if not recon_dump_path.exists():
                     raise RuntimeError(f"segment {seg_idx}: expected --dump-last-recon output at {recon_dump_path}")
@@ -1506,6 +1613,14 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
 
     for segment in ordered_segments:
         segment.unlink(missing_ok=True)
+
+    return {
+        "frames": merged_frames,
+        "segments": next_segment,
+        "elapsed_sec": time.time() - start_time,
+        "helper_stats": agg_helper_stats,
+        "helper_psnr": finalize_helper_psnr(agg_helper_psnr),
+    }
 
 
 def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: Path, settings: EncodeSettings) -> None:
@@ -1838,6 +1953,90 @@ def transcode_to_m2y2(src: Path, dst: Path) -> None:
         raise SystemExit(f"M2Y2 transcode failed (exit code {result.returncode}).")
 
 
+def print_encode_summary(
+    input_path: Path,
+    output_path: Path,
+    settings: EncodeSettings,
+    make_m2y2: bool,
+    video_only_bytes: int,
+    total_frames: int,
+    elapsed_sec: float,
+    helper_stats: dict,
+    helper_psnr: dict,
+    packet_stats: dict | None,
+) -> None:
+    """Measurement-only final summary. Aggregates the native helper's existing
+    STATS/PSNR stdout (tools/miv2y_moflex_tier.c) plus already-computed file
+    sizes, so full/diamond/fast (and any future --motion-search mode) can be
+    compared run-to-run. Prints only -- never changes encoder decisions or the
+    bitstream."""
+    final_size = output_path.stat().st_size if output_path.exists() else 0
+
+    print()
+    print("============================================================")
+    print("ENCODE SUMMARY")
+    print("============================================================")
+    print(f"  input:                {input_path}")
+    print(f"  output:               {output_path}")
+    print(f"  motion-search:        {settings.motion_search}")
+    print(f"  resolution:           {settings.width}x{settings.height} @ {settings.fps} fps")
+    print(f"  qp:                   {settings.qp} (c-qp-offset {settings.c_qp_offset})")
+    print(f"  lambda:               {settings.lambda_value}")
+    print(f"  keep:                 {settings.keep}")
+    print(f"  mv-range:             {settings.mv_range}")
+    print(f"  chunk-frames:         {settings.chunk_frames}")
+    print(f"  jobs:                 {settings.jobs}")
+    print(f"  warm-start-chunks:    {'on' if settings.warm_start_chunks else 'off'}")
+    print(f"  m2y2:                 {'on' if make_m2y2 else 'off'}")
+    print(f"  total frames:         {total_frames}")
+    fps_note = f"  ({total_frames / elapsed_sec:.1f} fps)" if elapsed_sec > 0 and total_frames > 0 else ""
+    print(f"  encode wall time:     {elapsed_sec:.1f} s{fps_note}")
+    print(f"  video-only bytes:     {video_only_bytes} ({video_only_bytes / 1048576.0:.2f} MiB)")
+    print(f"  final output bytes:   {final_size} ({final_size / 1048576.0:.2f} MiB)")
+
+    if helper_stats:
+        frames_seen = helper_stats.get("frames", 0)
+        print(f"  helper-reported frames: {frames_seen} (I={helper_stats.get('I', 0)} P={helper_stats.get('P', 0)})")
+        if frames_seen != total_frames:
+            print(
+                f"    note: differs from total frames above by {frames_seen - total_frames} -- "
+                f"expected when --warm-start-chunks is on (each warm-started segment encodes "
+                f"one extra throwaway frame that never reaches the final output)."
+            )
+
+        def mode_line(prefix: str) -> str:
+            keys = [
+                "skip", "delta", "solid", "mv", "mvqres", "qres", "tr", "mvtr",
+                "qz", "mvqz", "trz", "mvtrz", "raw", "run_tokens", "run_blocks",
+            ]
+            return " ".join(f"{k}={helper_stats.get(f'{prefix}_{k}', 0)}" for k in keys)
+
+        print(f"  Y modes:              {mode_line('Y')}")
+        print(f"  C modes:              {mode_line('C')}")
+        print(
+            f"  sum of segment total_bytes: {helper_stats.get('total_bytes', 0)} "
+            f"(includes per-segment header overhead and any warm-start filler frames; "
+            f"not directly comparable to final output bytes above)"
+        )
+    else:
+        print("  helper STATS:         not available (no STATS line found in encoder stdout)")
+
+    if helper_psnr:
+        parts = [f"{k}={v:.2f}dB" for k, v in helper_psnr.items()]
+        print(f"  PSNR (frame-weighted avg, approximate): {' '.join(parts)}")
+
+    if packet_stats and packet_stats.get("count"):
+        print(
+            f"  video packet sizes:   min={packet_stats['min']}B avg={packet_stats['avg']:.0f}B "
+            f"p50={packet_stats['p50']}B p95={packet_stats['p95']}B p99={packet_stats['p99']}B "
+            f"max={packet_stats['max']}B"
+        )
+    else:
+        print("  video packet sizes:   not computed (pass --report-packet-sizes for full histogram)")
+
+    print("============================================================")
+
+
 def encode_one(
     input_path: Path,
     output_path: Path,
@@ -1856,7 +2055,8 @@ def encode_one(
         print("============================================================")
         print("1. Streaming and Compressing Video")
         print("============================================================")
-        build_streaming_parallel_mivf(input_path, temp_video_only, settings, workdir)
+        encode_stats = build_streaming_parallel_mivf(input_path, temp_video_only, settings, workdir)
+        video_only_bytes = temp_video_only.stat().st_size
 
         print()
         print("============================================================")
@@ -1908,18 +2108,32 @@ def encode_one(
             except Exception as exc:
                 print(f"WARNING: seek index generation failed: {exc}")
 
+        packet_stats: dict | None = None
         if report_packet_sizes:
             print()
             print("============================================================")
             print("5. Packet Size Report")
             print("============================================================")
             try:
-                report_packet_size_stats(output_path, chunk_frames=settings.chunk_frames)
+                packet_stats = report_packet_size_stats(output_path, chunk_frames=settings.chunk_frames)
             except Exception as exc:
                 print(f"WARNING: packet size report failed: {exc}")
 
         if deploy_sd:
             deploy_output(output_path)
+
+        print_encode_summary(
+            input_path=input_path,
+            output_path=output_path,
+            settings=settings,
+            make_m2y2=make_m2y2,
+            video_only_bytes=video_only_bytes,
+            total_frames=encode_stats.get("frames", 0),
+            elapsed_sec=encode_stats.get("elapsed_sec", 0.0),
+            helper_stats=encode_stats.get("helper_stats") or {},
+            helper_psnr=encode_stats.get("helper_psnr") or {},
+            packet_stats=packet_stats,
+        )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -1983,11 +2197,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mv-range", type=int, default=DEFAULT_MV_RANGE)
     parser.add_argument(
         "--motion-search",
-        choices=["full", "diamond", "fast"],
+        choices=["full", "diamond", "fast", "hybrid"],
         default="full",
         help="per-block motion search algorithm: full = exhaustive, slowest, best quality "
              "(default, unchanged behavior); diamond = experimental iterative search, faster, "
-             "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk",
+             "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk; "
+             "hybrid = experimental, two-seed diamond plus capped local refine, aims for diamond-ish "
+             "speed with less of its quality/size cost",
     )
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, choices=[4, 8, 16], help="transform coefficients kept per 4x4 quadrant: 16=HD detail (default), 4=small legacy files")
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel encoder workers, default {DEFAULT_JOBS}")
