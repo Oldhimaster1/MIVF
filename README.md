@@ -83,6 +83,9 @@ python encode_mivf.py ./videos/ ./output/
 | `--m2y2` | Use M2Y2 codec (smaller files, ~20% savings) |
 | `--profile 3ds-fast` | Tune for Old 3DS playback smoothness |
 | `--report-packet-sizes` | Print per-video-packet size histogram after encoding |
+| `--motion-search {full,diamond,fast,hybrid}` | Motion search algorithm (default `full`). `diamond`/`fast`/`hybrid` are experimental — see [Performance Tuning](docs/PERFORMANCE_TUNING.md) |
+| `--warm-start-chunks` | Feed each parallel chunk the prior chunk's reconstructed last frame, avoiding a hard keyframe reset at chunk boundaries |
+| `--max-video-packet-kb` | Reject and retry a chunk at a higher QP if any video packet exceeds this size |
 | `--no-seek-index` | Skip `.idx` sidecar generation |
 | `--no-embedded-index` | Skip embedded seek footer in `.mivf` |
 | `--qp` | Quality parameter (higher QP = smaller file, lower quality) |

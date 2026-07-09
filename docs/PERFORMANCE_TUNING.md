@@ -37,6 +37,18 @@ If playback is still choppy on Old 3DS, try progressively more aggressive settin
 --fps 24
 ```
 
+## Motion Search Modes
+
+`--motion-search` trades encode time against output size/quality. `full` (the default) is an exhaustive search and is the only mode with a long production track record — it's the safe choice.
+
+`diamond`, `fast`, and `hybrid` are experimental. In local validation on a handful of test clips:
+
+- `full`, `diamond`, and `fast` each produce **byte-identical output** to their own prior baselines across repeated runs — `hybrid` is purely additive and doesn't change their behavior at all.
+- `diamond` encoded noticeably faster than `full`, at a cost of roughly a few percent larger files (varied by content, up to ~5-6% on some clips) and a small PSNR loss.
+- `hybrid` tracked `diamond`'s speed closely (single-digit percent slower in local timing) while generally landing closer to `full`'s file size than `diamond` did — the improvement over `diamond` was clip-dependent and not uniform across all content tested.
+
+These are small-sample local results, not a guarantee for every source — if size/quality matters more than encode time for a given project, `full` remains the safest choice. If you try `diamond`/`fast`/`hybrid`, use `--report-packet-sizes` and compare the `ENCODE SUMMARY` output (frame-weighted PSNR, mode histogram, byte counts) against a `full` encode of the same source before committing to it for a release.
+
 ## Diagnosing with Packet Size Report
 
 Use `--report-packet-sizes` to see the distribution of video packet sizes:
