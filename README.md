@@ -29,6 +29,8 @@ A homebrew video player for the Nintendo 3DS. MIVF uses a custom page-based vide
 
 *Coming soon — captures from real hardware / Azahar. See [screenshots/README.md](screenshots/README.md) for the expected filenames if you'd like to contribute some.*
 
+⚠️ Screenshots captured via the Azahar emulator don't represent real hardware quality — the video is shown here at emulator display scaling, whereas on an actual 3DS's small physical screen the same encode looks noticeably sharper and higher-quality than these captures suggest.
+
 **File browser** \
 <img src="screenshots/browser.png" width="400">
 
