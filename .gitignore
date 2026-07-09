@@ -43,6 +43,20 @@ MANIFEST_*
 *.avi
 *.wav
 *.mivf
+*.idx
+
+# --- PyInstaller packaged-encoder build output (Windows/Linux/macOS) ---
+dist/
+build_linux_helpers/
+.venv-linux-build/
+*.spec
+
+# --- Packaged release archives (built locally, uploaded via `gh release`, not committed) ---
+*.zip
+*.tar.gz
+
+# --- Local release-notes drafts (the real notes live on the GitHub release) ---
+RELEASE_NOTES_*.md
 
 # --- Release packaging assets (override the broad *.png / *.wav rules above) ---
 !meta/*.png
