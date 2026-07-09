@@ -195,6 +195,71 @@ typedef struct {
 static MivfChapter g_mivf_chapters[MIVF_CHAP_MAX];
 static int g_mivf_chapters_count = 0;
 
+/* HFIX66: DVD-style MIVF Menu Packs.
+   A ".menu.ini" sidecar next to a movie switches its browser-selection entry
+   point from immediate playback to a simple DVD-menu-style screen (Play /
+   Resume / Chapters / Back). This is intentionally NOT a DVD VM: no ISO/
+   VIDEO_TS/IFO parsing happens on the 3DS, no button-VM commands, no
+   subpicture overlays -- just a small hand-rolled INI describing button
+   rects/labels/actions, rendered with the existing RGB565 draw helpers.
+   Chapters reuses the existing ".chapters" sidecar and hfix60_chapters_load
+   verbatim (called once here for labels only, and again later inside play()
+   with the real per-file fps for the actual seek target). */
+#define MIVF_MENU_MAX_BUTTONS 8
+#define MIVF_MENU_LABEL_MAX 32
+#define MIVF_MENU_ID_MAX 16
+#define MIVF_MENU_TITLE_MAX 64
+
+typedef enum {
+    MIVF_MENU_ACTION_NONE = 0,
+    MIVF_MENU_ACTION_PLAY,
+    MIVF_MENU_ACTION_RESUME,
+    MIVF_MENU_ACTION_CHAPTERS,
+    MIVF_MENU_ACTION_BACK
+} MivfMenuAction;
+
+typedef struct {
+    char id[MIVF_MENU_ID_MAX];
+    char label[MIVF_MENU_LABEL_MAX];
+    int x, y, w, h;
+    MivfMenuAction action;
+    bool enabled;
+} MivfMenuButton;
+
+typedef struct {
+    bool valid;
+    char title[MIVF_MENU_TITLE_MAX];
+    bool has_background;
+    int button_count;
+    int selected;
+    MivfMenuButton buttons[MIVF_MENU_MAX_BUTTONS];
+} MivfMenu;
+
+typedef enum {
+    MIVF_MENU_RESULT_PLAY = 0,
+    MIVF_MENU_RESULT_BACK
+} MivfMenuResult;
+
+/* One-shot launch directive consumed by play() and reset to DEFAULT right
+   after use, so auto-advance/normal browser selection is never affected by
+   a previous menu-driven launch. */
+typedef enum {
+    MIVF_LAUNCH_DEFAULT = 0,
+    MIVF_LAUNCH_START_OVER,
+    MIVF_LAUNCH_RESUME,
+    MIVF_LAUNCH_CHAPTER
+} MivfLaunchMode;
+
+static MivfLaunchMode g_mivf_launch_mode = MIVF_LAUNCH_DEFAULT;
+static int g_mivf_launch_chapter_index = -1;
+
+/* Raw RGB565 top-screen-sized (400x240) still background, distinct from the
+   browser's small preview ".cover" thumbnail (88x50) -- different extension,
+   so the two never collide on the same base filename. */
+#define MIVF_MENU_BG_W TOP_W
+#define MIVF_MENU_BG_H TOP_H
+static u16 g_mivf_menu_bg[MIVF_MENU_BG_W * MIVF_MENU_BG_H];
+
 /* Playback-speed table (percent of normal). Index 2 == 100% (1.0x). */
 static const u32 g_mivf_speed_table[] = { 50u, 75u, 100u, 125u, 150u, 200u };
 #define MIVF_SPEED_COUNT ((int)(sizeof(g_mivf_speed_table) / sizeof(g_mivf_speed_table[0])))
@@ -8938,6 +9003,487 @@ static void hfix60_chapter_jump(int dir, u32 cur_frame) {
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* HFIX66: DVD-style MIVF Menu Packs -- static MVP runtime.                   */
+/*                                                                           */
+/* Scope, deliberately: a ".menu.ini" sidecar switches browser selection      */
+/* from immediate playback to a small Play/Resume/Chapters/Back screen.      */
+/* There is no ISO/VIDEO_TS/IFO parsing here, no DVD VM, no subpicture       */
+/* overlays -- just a hand-rolled INI and the existing RGB565 draw helpers.  */
+/* An invalid or missing sidecar always falls back to normal playback.       */
+/* ------------------------------------------------------------------------- */
+
+static bool mivf_menu_chapters_sidecar_exists(const char *movie_path) {
+    char path[HFIX58_MAX_PATH];
+    FILE *f;
+
+    hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".chapters");
+    if (!path[0]) {
+        return false;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static bool mivf_menu_exists_for_movie(const char *movie_path) {
+    char path[HFIX58_MAX_PATH];
+    FILE *f;
+
+    hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".menu.ini");
+    if (!path[0]) {
+        return false;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static bool mivf_menu_load_background(const char *movie_path) {
+    char path[HFIX58_MAX_PATH];
+    FILE *f;
+    size_t need = (size_t)MIVF_MENU_BG_W * (size_t)MIVF_MENU_BG_H * 2u;
+    size_t got;
+
+    hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".menu_bg.cover");
+    if (!path[0]) {
+        return false;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+
+    got = fread(g_mivf_menu_bg, 1, need, f);
+    fclose(f);
+
+    return got == need;
+}
+
+static MivfMenuAction mivf_menu_parse_action(const char *s) {
+    if (!strcmp(s, "play")) return MIVF_MENU_ACTION_PLAY;
+    if (!strcmp(s, "resume")) return MIVF_MENU_ACTION_RESUME;
+    if (!strcmp(s, "chapters")) return MIVF_MENU_ACTION_CHAPTERS;
+    if (!strcmp(s, "back")) return MIVF_MENU_ACTION_BACK;
+    return MIVF_MENU_ACTION_NONE;
+}
+
+/* Trims trailing whitespace/CR/LF in place and returns a pointer past any
+   leading whitespace -- same idiom as hfix60_chapters_load's line handling. */
+static char *mivf_menu_ini_trim(char *s) {
+    size_t ln = strlen(s);
+
+    while (ln > 0 && (s[ln - 1] == '\n' || s[ln - 1] == '\r' ||
+                       s[ln - 1] == ' '  || s[ln - 1] == '\t')) {
+        s[--ln] = 0;
+    }
+
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+
+    return s;
+}
+
+/* Only a safe subset is parsed: [MIVF_MENU]'s title=, and [BUTTON id]
+   sections' label=/x=/y=/w=/h=/action=. Unrecognized keys (background=,
+   style=, up=/down=/etc. from the wider spec) are intentionally ignored for
+   this MVP -- background is always the fixed ".menu_bg.cover" sidecar, never
+   an arbitrary path from the ini, so there is no path-traversal surface. */
+static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
+    char path[HFIX58_MAX_PATH];
+    FILE *f;
+    char line[192];
+    MivfMenuButton *cur_button = NULL;
+
+    memset(menu, 0, sizeof(*menu));
+    menu->selected = -1;
+
+    hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".menu.ini");
+    if (!path[0]) {
+        return false;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        char *p = mivf_menu_ini_trim(line);
+        char *eq;
+        char *key;
+        char *val;
+
+        if (*p == 0 || *p == '#' || *p == ';') {
+            continue;
+        }
+
+        if (*p == '[') {
+            char *end = strchr(p, ']');
+            char *id;
+
+            if (!end) {
+                continue;
+            }
+            *end = 0;
+            p++;
+
+            if (!strncmp(p, "BUTTON", 6)) {
+                id = p + 6;
+                while (*id == ' ') {
+                    id++;
+                }
+
+                if (menu->button_count < MIVF_MENU_MAX_BUTTONS) {
+                    cur_button = &menu->buttons[menu->button_count++];
+                    memset(cur_button, 0, sizeof(*cur_button));
+                    snprintf(cur_button->id, sizeof(cur_button->id), "%s", id);
+                    cur_button->enabled = true;
+                } else {
+                    cur_button = NULL;
+                }
+            } else {
+                cur_button = NULL;
+            }
+            continue;
+        }
+
+        eq = strchr(p, '=');
+        if (!eq) {
+            continue;
+        }
+        *eq = 0;
+        key = p;
+        val = eq + 1;
+
+        if (cur_button) {
+            if (!strcmp(key, "label")) {
+                snprintf(cur_button->label, sizeof(cur_button->label), "%s", val);
+            } else if (!strcmp(key, "x")) {
+                cur_button->x = atoi(val);
+            } else if (!strcmp(key, "y")) {
+                cur_button->y = atoi(val);
+            } else if (!strcmp(key, "w")) {
+                cur_button->w = atoi(val);
+            } else if (!strcmp(key, "h")) {
+                cur_button->h = atoi(val);
+            } else if (!strcmp(key, "action")) {
+                cur_button->action = mivf_menu_parse_action(val);
+            }
+        } else {
+            if (!strcmp(key, "title")) {
+                snprintf(menu->title, sizeof(menu->title), "%s", val);
+            }
+        }
+    }
+
+    fclose(f);
+
+    if (menu->button_count == 0) {
+        return false;
+    }
+
+    if (menu->title[0] == 0) {
+        const char *base = strrchr(movie_path, '/');
+        char *dot;
+
+        base = base ? base + 1 : movie_path;
+        snprintf(menu->title, sizeof(menu->title), "%.60s", base);
+        dot = strrchr(menu->title, '.');
+        if (dot) {
+            *dot = 0;
+        }
+    }
+
+    for (int i = 0; i < menu->button_count; i++) {
+        MivfMenuButton *b = &menu->buttons[i];
+
+        if (b->action == MIVF_MENU_ACTION_NONE) {
+            b->enabled = false;
+        }
+        if (b->label[0] == 0) {
+            snprintf(b->label, sizeof(b->label), "%s", b->id[0] ? b->id : "BUTTON");
+        }
+        if (b->w <= 0) b->w = 120;
+        if (b->h <= 0) b->h = 22;
+        if (b->w > 320) b->w = 320;
+        if (b->h > 240) b->h = 240;
+        if (b->x < 0) b->x = 0;
+        if (b->y < 0) b->y = 0;
+        if (b->x + b->w > 320) b->x = 320 - b->w;
+        if (b->y + b->h > 240) b->y = 240 - b->h;
+    }
+
+    /* Resume needs an actual bookmark; Chapters needs the sidecar to exist
+       and to actually contain at least one entry. Load chapter labels now
+       (dummy 30/1 fps -- only .label is used here; play() reloads this same
+       sidecar with the real fps before actually seeking to a chapter). */
+    {
+        MivfBookmark bookmark;
+        bool have_bookmark = MIVF_BookmarkLoad(movie_path, &bookmark) &&
+            bookmark.video_path[0] &&
+            !strcmp(bookmark.video_path, movie_path) &&
+            bookmark.frame > 0;
+        bool have_chapters_sidecar = mivf_menu_chapters_sidecar_exists(movie_path);
+
+        if (have_chapters_sidecar) {
+            hfix60_chapters_load(movie_path, 30, 1);
+        } else {
+            g_mivf_chapters_count = 0;
+        }
+
+        for (int i = 0; i < menu->button_count; i++) {
+            MivfMenuButton *b = &menu->buttons[i];
+
+            if (b->action == MIVF_MENU_ACTION_RESUME && !have_bookmark) {
+                b->enabled = false;
+            }
+            if (b->action == MIVF_MENU_ACTION_CHAPTERS && g_mivf_chapters_count <= 0) {
+                b->enabled = false;
+            }
+        }
+    }
+
+    menu->has_background = mivf_menu_load_background(movie_path);
+    menu->valid = true;
+    return true;
+}
+
+static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
+    int title_w;
+
+    if (menu->has_background) {
+        for (int yy = 0; yy < MIVF_MENU_BG_H; yy++) {
+            for (int xx = 0; xx < MIVF_MENU_BG_W; xx++) {
+                hfix58s_top_px565(fb, xx, yy, g_mivf_menu_bg[(size_t)yy * MIVF_MENU_BG_W + xx]);
+            }
+        }
+        hfix58s_top_rect565(fb, 0, 0, TOP_W, 30, 4, 8, 16);
+        hfix58s_top_rect565(fb, 0, 28, TOP_W, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+        hfix58s_top_draw_text_shadow(fb, 12, 9, menu->title, 1, 235, 245, 255);
+        return;
+    }
+
+    /* Generated "classic_dvd" fallback: dark blue/black vertical gradient,
+       centered title, thin gold/theme divider, small disc-menu caption. */
+    for (int yy = 0; yy < TOP_H; yy++) {
+        int shade = 4 + (yy * 22) / TOP_H;
+        hfix58s_top_rect565(fb, 0, yy, TOP_W, 1, shade / 3, shade / 2, shade + 8);
+    }
+
+    hfix58s_top_rect565(fb, 0, TOP_H / 2 - 1, TOP_W, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+
+    title_w = (int)strlen(menu->title) * 6 * 2;
+    hfix58s_top_draw_text_shadow(fb, (TOP_W - title_w) / 2, TOP_H / 2 - 24, menu->title, 2, 235, 245, 255);
+    hfix58s_top_draw_text_shadow(fb, (TOP_W - (int)strlen("MIVF DISC MENU") * 6) / 2, TOP_H - 20,
+        "MIVF DISC MENU", 1, 130, 150, 175);
+}
+
+static void mivf_menu_draw_button(u8 *fb, const MivfMenuButton *b, bool is_selected, u32 pulse) {
+    int br, bg, bb, alpha;
+    int text_r, text_g, text_b;
+    int label_x = b->x + 10;
+
+    if (!b->enabled) {
+        br = 20; bg = 22; bb = 28; alpha = 130;
+        text_r = 110; text_g = 118; text_b = 128;
+    } else if (is_selected) {
+        br = g_mivf_theme_r; bg = g_mivf_theme_g; bb = g_mivf_theme_b;
+        alpha = 150 + (int)(pulse % 60u);
+        text_r = 255; text_g = 250; text_b = 235;
+        label_x += 12;
+    } else {
+        br = 26; bg = 32; bb = 46; alpha = 165;
+        text_r = 205; text_g = 215; text_b = 228;
+    }
+
+    hfix58_blend_rect565(fb, b->x, b->y, b->w, b->h, br, bg, bb, alpha);
+    hfix58_rect565(fb, b->x, b->y, b->w, 1, br, bg, bb);
+
+    if (is_selected) {
+        hfix58_rect565(fb, b->x, b->y, 2, b->h, 255, 222, 120);
+
+        for (int i = 0; i < 4; i++) {
+            int arm = 4 - i;
+            hfix58_rect565(fb, b->x + 5 + i, b->y + b->h / 2 - arm, 1, arm * 2 + 1, 255, 222, 120);
+        }
+    }
+
+    hfix58_draw_text_shadow(fb, label_x, b->y + b->h / 2 - 3, b->label, 1, text_r, text_g, text_b);
+}
+
+static void mivf_menu_draw_bottom(u8 *fb, const MivfMenu *menu, u32 pulse) {
+    hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
+    hfix58_blend_rect565(fb, 10, 8, 300, 210, 14, 22, 38, 225);
+    hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+    hfix58_rect565(fb, 10, 216, 300, 2, 2, 4, 8);
+
+    hfix58_draw_text_shadow(fb, 18, 16, "DISC MENU", 1, 170, 195, 220);
+
+    for (int i = 0; i < menu->button_count; i++) {
+        mivf_menu_draw_button(fb, &menu->buttons[i], i == menu->selected, pulse);
+    }
+
+    hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
+}
+
+static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
+    enum { VISIBLE_ROWS = 8, ROW_H = 22 };
+    int start = 0;
+
+    if (selected >= VISIBLE_ROWS) {
+        start = selected - VISIBLE_ROWS + 1;
+    }
+
+    hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
+    hfix58_blend_rect565(fb, 10, 8, 300, 210, 14, 22, 38, 225);
+    hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+    hfix58_draw_text_shadow(fb, 18, 16, "SCENE SELECTION", 1, 235, 245, 255);
+
+    for (int row = 0; row < VISIBLE_ROWS && (start + row) < g_mivf_chapters_count; row++) {
+        int idx = start + row;
+        int y = 38 + row * ROW_H;
+        bool sel = (idx == selected);
+        char line[64];
+
+        if (sel) {
+            hfix58_blend_rect565(fb, 18, y - 2, 284, 20, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 170);
+        }
+
+        snprintf(line, sizeof(line), "%d. %.36s", idx + 1, g_mivf_chapters[idx].label);
+        hfix58_draw_text_shadow(fb, 26, y, line, 1,
+            sel ? 255 : 200, sel ? 250 : 210, sel ? 235 : 220);
+    }
+
+    hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
+}
+
+/* Runs the interactive menu loop. Returns PLAY once a launch-worthy action
+   fires (having set g_mivf_launch_mode/g_mivf_launch_chapter_index as a
+   side effect), or BACK to return to the browser without playing anything. */
+static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
+    bool in_chapters = false;
+    int chapter_selected = 0;
+    u32 pulse = 0;
+
+    menu->selected = -1;
+    for (int i = 0; i < menu->button_count; i++) {
+        if (menu->buttons[i].enabled) {
+            menu->selected = i;
+            break;
+        }
+    }
+    if (menu->selected < 0) {
+        menu->selected = 0;
+    }
+
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 down = hidKeysDown();
+        pulse++;
+
+        if (in_chapters) {
+            if ((down & KEY_DUP) && chapter_selected > 0) {
+                chapter_selected--;
+            }
+            if ((down & KEY_DDOWN) && chapter_selected < g_mivf_chapters_count - 1) {
+                chapter_selected++;
+            }
+            if ((down & KEY_A) && g_mivf_chapters_count > 0) {
+                g_mivf_launch_mode = MIVF_LAUNCH_CHAPTER;
+                g_mivf_launch_chapter_index = chapter_selected;
+                return MIVF_MENU_RESULT_PLAY;
+            }
+            if (down & (KEY_B | KEY_START)) {
+                in_chapters = false;
+            }
+        } else {
+            if (down & (KEY_DUP | KEY_DDOWN) && menu->button_count > 0) {
+                int dir = (down & KEY_DUP) ? -1 : 1;
+                for (int i = 1; i <= menu->button_count; i++) {
+                    int idx = ((menu->selected + dir * i) % menu->button_count + menu->button_count) % menu->button_count;
+                    if (menu->buttons[idx].enabled) {
+                        menu->selected = idx;
+                        break;
+                    }
+                }
+            }
+
+            if (down & KEY_TOUCH) {
+                touchPosition tp;
+                hidTouchRead(&tp);
+                for (int i = 0; i < menu->button_count; i++) {
+                    MivfMenuButton *b = &menu->buttons[i];
+                    if (b->enabled &&
+                        tp.px >= b->x && tp.px < b->x + b->w &&
+                        tp.py >= b->y && tp.py < b->y + b->h) {
+                        menu->selected = i;
+                        break;
+                    }
+                }
+            }
+
+            if ((down & KEY_A) && menu->selected >= 0 && menu->selected < menu->button_count) {
+                MivfMenuButton *b = &menu->buttons[menu->selected];
+
+                if (b->enabled) {
+                    switch (b->action) {
+                        case MIVF_MENU_ACTION_PLAY:
+                            g_mivf_launch_mode = MIVF_LAUNCH_START_OVER;
+                            return MIVF_MENU_RESULT_PLAY;
+                        case MIVF_MENU_ACTION_RESUME:
+                            g_mivf_launch_mode = MIVF_LAUNCH_RESUME;
+                            return MIVF_MENU_RESULT_PLAY;
+                        case MIVF_MENU_ACTION_CHAPTERS:
+                            in_chapters = true;
+                            chapter_selected = 0;
+                            break;
+                        case MIVF_MENU_ACTION_BACK:
+                            return MIVF_MENU_RESULT_BACK;
+                        default:
+                            break;
+                    }
+                }
+            }
+
+            if (down & (KEY_B | KEY_START)) {
+                return MIVF_MENU_RESULT_BACK;
+            }
+        }
+
+        u16 fw = 0, fh = 0;
+        u8 *fb_top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
+        u8 *fb_bot = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+
+        if (fb_top) {
+            mivf_menu_draw_top(fb_top, menu);
+        }
+        if (fb_bot) {
+            if (in_chapters) {
+                mivf_menu_draw_chapters_bottom(fb_bot, chapter_selected);
+            } else {
+                mivf_menu_draw_bottom(fb_bot, menu, pulse);
+            }
+        }
+
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+    }
+
+    return MIVF_MENU_RESULT_BACK;
+}
+
 static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up) {
     touchPosition touch;
     static u32 last_live_seek_frame = 0xFFFFFFFFu;
@@ -10429,7 +10975,35 @@ static int play(void) {
        a previous file don't mislead the debug overlay. */
     hfix58_perf_diag_reset();
 
-    if (g_mivf_settings.resume_enabled) {
+    /* HFIX66: a DVD-style menu (if one ran before this play()) sets a one-shot
+       launch directive that takes priority over the normal resume prompt --
+       the menu already asked/decided, so re-prompting here would be
+       redundant. MIVF_LAUNCH_DEFAULT (normal browser selection, or no menu
+       sidecar) falls through to the existing unmodified prompt behavior. */
+    if (g_mivf_launch_mode == MIVF_LAUNCH_CHAPTER) {
+        if (g_mivf_launch_chapter_index >= 0 && g_mivf_launch_chapter_index < g_mivf_chapters_count) {
+            hfix58j_request_absolute_seek(g_mivf_chapters[g_mivf_launch_chapter_index].frame);
+            (void)hfix58f_execute_pending_seek(
+                &stream, f, &v, &m2y0, &m2y0_prev, &m2y0_have_prev,
+                frame, prev, fsz, &have_prev, &hfix51c_last_direct_yuv,
+                &shown, &next_frame_tick, frame_ticks_abs);
+        }
+    } else if (g_mivf_launch_mode == MIVF_LAUNCH_RESUME) {
+        MivfBookmark bookmark;
+        if (MIVF_BookmarkLoad(MIVF_PATH, &bookmark) &&
+            bookmark.video_path[0] &&
+            !strcmp(bookmark.video_path, MIVF_PATH) &&
+            bookmark.frame > 0) {
+            hfix58j_request_absolute_seek(bookmark.frame);
+            (void)hfix58f_execute_pending_seek(
+                &stream, f, &v, &m2y0, &m2y0_prev, &m2y0_have_prev,
+                frame, prev, fsz, &have_prev, &hfix51c_last_direct_yuv,
+                &shown, &next_frame_tick, frame_ticks_abs);
+        }
+    } else if (g_mivf_launch_mode == MIVF_LAUNCH_START_OVER) {
+        /* Play from the beginning; the menu already chose this, so the
+           bookmark (if any) is left untouched and the prompt is skipped. */
+    } else if (g_mivf_settings.resume_enabled) {
         MivfBookmark bookmark;
         if (MIVF_BookmarkLoad(MIVF_PATH, &bookmark) &&
             bookmark.video_path[0] &&
@@ -10461,6 +11035,11 @@ static int play(void) {
             }
         }
     }
+
+    /* One-shot: never let a menu-driven launch mode leak into the next file
+       (auto-advance, or a later normal browser selection). */
+    g_mivf_launch_mode = MIVF_LAUNCH_DEFAULT;
+    g_mivf_launch_chapter_index = -1;
 
     wait_stream_prebuffer(&stream);
 
@@ -11207,6 +11786,28 @@ int main(void) {
 
             g_hfix58_has_selected_media = false;
             continue;
+        }
+
+        /* HFIX66: a ".menu.ini" sidecar routes through the DVD-style menu
+           instead of straight into play(). Invalid/missing sidecar always
+           falls back to normal playback below, unchanged. */
+        if (mivf_menu_exists_for_movie(MIVF_PATH)) {
+            MivfMenu menu;
+
+            if (mivf_menu_load_for_movie(MIVF_PATH, &menu)) {
+                printf("lifecycle: entering dvd-style menu: %s\n", MIVF_PATH);
+                MivfMenuResult mr = mivf_menu_run(&menu);
+                printf("lifecycle: dvd-style menu returned (%d)\n", (int)mr);
+
+                if (mr == MIVF_MENU_RESULT_BACK) {
+                    g_hfix58_has_selected_media = false;
+                    continue;
+                }
+                /* MIVF_MENU_RESULT_PLAY: g_mivf_launch_mode is already set
+                   (START_OVER / RESUME / CHAPTER); fall through to play(). */
+            } else {
+                printf("lifecycle: invalid/unreadable menu.ini, falling back to normal playback: %s\n", MIVF_PATH);
+            }
         }
 
         printf("lifecycle: entering play(): %s\n", MIVF_PATH);
