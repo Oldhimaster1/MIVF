@@ -10185,6 +10185,77 @@ static void print_ring_telemetry(MivfStream *stream, u32 shown) {
     /* HFIX58D: scrubbed full bottom-console printf statement. */
 }
 
+
+/* HFIX64_RESUME_PROMPT: ask before applying a saved bookmark.
+   This reuses the existing bookmark/seek pipeline. A resumes from the saved
+   frame; B/START starts from the beginning and clears the bookmark. */
+static bool hfix64_resume_prompt(u32 saved_frame, u32 fpsn, u32 fpsd) {
+    char time_line[48];
+    char frame_line[48];
+    u32 fps_num = fpsn ? fpsn : 30u;
+    u32 fps_den = fpsd ? fpsd : 1u;
+    u64 seconds = ((u64)saved_frame * (u64)fps_den) / (u64)fps_num;
+    u32 hh = (u32)(seconds / 3600u);
+    u32 mm = (u32)((seconds / 60u) % 60u);
+    u32 ss = (u32)(seconds % 60u);
+
+    if (hh > 0) {
+        snprintf(time_line, sizeof(time_line), "CONTINUE FROM %lu:%02lu:%02lu?",
+            (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
+    } else {
+        snprintf(time_line, sizeof(time_line), "CONTINUE FROM %lu:%02lu?",
+            (unsigned long)mm, (unsigned long)ss);
+    }
+
+    snprintf(frame_line, sizeof(frame_line), "SAVED FRAME %lu", (unsigned long)saved_frame);
+
+    while (aptMainLoop()) {
+        hidScanInput();
+        u32 down = hidKeysDown();
+
+        if (down & KEY_A) {
+            return true;
+        }
+
+        if (down & (KEY_B | KEY_START)) {
+            return false;
+        }
+
+        u16 fw = 0;
+        u16 fh = 0;
+        u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+
+        if (fb) {
+            hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
+            hfix58_blend_rect565(fb, 18, 28, 284, 184, 14, 22, 38, 238);
+            hfix58_rect565(fb, 18, 28, 284, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+            hfix58_rect565(fb, 18, 210, 284, 2, 2, 4, 8);
+
+            hfix58_draw_text_shadow(fb, 54, 48, "RESUME VIDEO", 2, 235, 245, 255);
+            hfix58_rect565(fb, 42, 76, 236, 1, 40, 62, 94);
+
+            hfix58_draw_text_shadow(fb, 40, 96, time_line, 1, 220, 238, 255);
+            hfix58_draw_text_shadow(fb, 40, 116, frame_line, 1, 170, 195, 220);
+
+            hfix58_blend_rect565(fb, 40, 148, 104, 28, 8, 70, 42, 235);
+            hfix58_rect565(fb, 40, 148, 104, 2, 80, 230, 130);
+            hfix58_draw_text_shadow(fb, 58, 158, "A RESUME", 1, 230, 255, 230);
+
+            hfix58_blend_rect565(fb, 176, 148, 104, 28, 72, 38, 18, 235);
+            hfix58_rect565(fb, 176, 148, 104, 2, 245, 170, 90);
+            hfix58_draw_text_shadow(fb, 192, 158, "B START", 1, 255, 230, 205);
+
+            hfix58_draw_text_shadow(fb, 44, 190, "START ALSO STARTS OVER", 1, 150, 170, 195);
+        }
+
+        gfxFlushBuffers();
+        gfxSwapBuffers();
+        gspWaitForVBlank();
+    }
+
+    return false;
+}
+
 static int play(void) {
     FILE *f = fopen(MIVF_PATH, "rb");
 
@@ -10364,22 +10435,30 @@ static int play(void) {
             bookmark.video_path[0] &&
             !strcmp(bookmark.video_path, MIVF_PATH) &&
             bookmark.frame > 0) {
-            hfix58j_request_absolute_seek(bookmark.frame);
-            (void)hfix58f_execute_pending_seek(
-                &stream,
-                f,
-                &v,
-                &m2y0,
-                &m2y0_prev,
-                &m2y0_have_prev,
-                frame,
-                prev,
-                fsz,
-                &have_prev,
-                &hfix51c_last_direct_yuv,
-                &shown,
-                &next_frame_tick,
-                frame_ticks_abs);
+            printf("resume prompt: found bookmark frame=%lu\n", (unsigned long)bookmark.frame);
+
+            if (hfix64_resume_prompt(bookmark.frame, v.fpsn, v.fpsd)) {
+                printf("resume prompt: resume accepted frame=%lu\n", (unsigned long)bookmark.frame);
+                hfix58j_request_absolute_seek(bookmark.frame);
+                (void)hfix58f_execute_pending_seek(
+                    &stream,
+                    f,
+                    &v,
+                    &m2y0,
+                    &m2y0_prev,
+                    &m2y0_have_prev,
+                    frame,
+                    prev,
+                    fsz,
+                    &have_prev,
+                    &hfix51c_last_direct_yuv,
+                    &shown,
+                    &next_frame_tick,
+                    frame_ticks_abs);
+            } else {
+                printf("resume prompt: start over selected; clearing bookmark\n");
+                MIVF_BookmarkClear(MIVF_PATH);
+            }
         }
     }
 
