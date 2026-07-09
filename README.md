@@ -125,6 +125,7 @@ Release packages may also include a prebuilt Windows encoder:
 encode_mivf.exe input.mp4 output.mivf --m2y2
 encode_mivf.exe input.mp4 output.mivf --m2y2 --motion-search hybrid
 encode_mivf.exe input.mp4 output.mivf --m2y2 --profile 3ds-fast
+```
 ### Key Encoder Flags
 
 | Flag | Purpose |
