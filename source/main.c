@@ -8170,19 +8170,9 @@ static void hfix58d_draw_bottom_fluent_ui(u8 *fb) {
         hfix58_rect565(fb, 166, 76, 36, 10, 20, 30, 48);
         hfix58_draw_text_shadow(fb, 171, 78, g_mivf_settings.resume_enabled ? "RES" : "OFF", 1, 206, 228, 255);
 
-        /* HFIX60: performance debug overlay line — only when enabled. */
-        if (g_mivf_settings.debug_overlay_enabled) {
-            char dbg[80];
-            snprintf(dbg, sizeof(dbg),
-                "D%5llu B%4llu P%4llu Ag%4llu Dr%-3u L%-3u",
-                (unsigned long long)g_perf_decode_us_max,
-                (unsigned long long)g_perf_blit_us_max,
-                (unsigned long long)g_perf_page_us_max,
-                (unsigned long long)g_perf_audio_gap_ms_max,
-                (unsigned int)g_audio_drop,
-                (unsigned int)g_perf_late_count);
-            hfix58_draw_text_shadow(fb, 222, 90, dbg, 1, 200, 220, 255);
-        }
+        /* HFIX64: user-facing playback stats/debug overlay disabled.
+           Keep the internal counters and CSV diagnostics alive, but do not draw
+           the D/B/P/Ag/Dr/L stats line on the bottom screen during playback. */
 
         int meter_x = 222;
         int meter_y = 74;
@@ -8432,7 +8422,6 @@ static void audio_queue(const u8 *data, u32 size);
 
 static bool hfix58_queue_audio_packet(const Stream *a, const u8 *body, u32 psize, u32 frame_no) {
     (void)frame_no;
-
     if (!a || !audio.ready || !body || psize == 0) {
         return false;
     }
@@ -11094,6 +11083,9 @@ int main(void) {
     MIVF_SettingsInit(&g_mivf_settings);
     MIVF_SettingsLoad(&g_mivf_settings);
     MIVF_SettingsClamp(&g_mivf_settings);
+    /* HFIX64: the playback stats overlay is no longer user-facing.  Force the
+       setting off at runtime so older settings.ini files cannot keep drawing it. */
+    g_mivf_settings.debug_overlay_enabled = false;
     g_mivf_settings_loaded = true;
     g_mivf_brightness_active = 5u;
     aptHook(&g_mivf_apt_hook, hfix59r3_apt_hook, NULL);
