@@ -27,9 +27,7 @@ A homebrew video player for the Nintendo 3DS. MIVF uses a custom page-based vide
 
 ## Screenshots
 
-*Coming soon — captures from real hardware / Azahar. See [screenshots/README.md](screenshots/README.md) for the expected filenames if you'd like to contribute some.*
-
-⚠️ Screenshots captured via the Azahar emulator don't represent real hardware quality — the video is shown here at emulator display scaling, whereas on an actual 3DS's small physical screen the same encode looks noticeably sharper and higher-quality than these captures suggest.
+Captured via the Azahar emulator. ⚠️ Azahar's display scaling doesn't represent real hardware quality — on an actual 3DS's small physical screen, the same encode looks noticeably sharper and higher-quality than these captures suggest.
 
 **File browser** \
 <img src="screenshots/browser.png" width="400">
@@ -39,9 +37,6 @@ A homebrew video player for the Nintendo 3DS. MIVF uses a custom page-based vide
 
 **Settings menu** \
 <img src="screenshots/settings.png" width="400">
-
-**In-app controls help screen** \
-<img src="screenshots/controls_help.png" width="400">
 
 ## Features
 
@@ -157,7 +152,32 @@ See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for the full step-b
 
 ⚠️ Encode time, output size, and quality all depend on source content, resolution, and encoder settings — these are real measurements from one test pass, not a guarantee for every video.
 
-**`--motion-search` mode comparison** — 5 short test clips (a mix of simple/synthetic and real-world video, varying resolution and motion complexity; clip names aren't shown since they're arbitrary local test files, not something a reader could look up anyway). `full` is the default, exhaustive search; `diamond` and `hybrid` are experimental faster modes — see [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md#motion-search-modes).
+### File Size: MIVF vs MoFlex
+
+File size efficiency versus the 3DS's built-in MoFlex (MobiClip) format was the original motivation for this project. Here's an honest test: one 62-second source clip (`anime.mp4`, 400×240, 30 fps), encoded once with a real 2-pass MobiClip encode, and four times through `encode_mivf.py` at different quality settings. MIVF only ever implemented a MoFlex *decoder* (for playback compatibility) — never an encoder — so the MoFlex file here was produced with separate external tooling, not anything in this repo.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/chart_moflex_dark.svg">
+  <img src="docs/assets/benchmarks/chart_moflex_light.svg" alt="Total encoded file size: MoFlex 2-pass vs MIVF at four quality tiers, same source clip">
+</picture>
+
+| Encode | Total file size | vs MoFlex | Video stream only | vs MoFlex video | PSNR (combined) | Encode time* |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MoFlex (2-pass, ~1800 kbps) | 16.24 MiB | — | 13.08 MiB | — | not measured** | ~154 s |
+| MIVF `--qp 24` (high quality) | 16.57 MiB | +2.0% | 15.11 MiB | +15.5% | 37.67 dB | 23–61 s |
+| MIVF default | 16.12 MiB | −0.7% | 14.66 MiB | +12.1% | 37.87 dB | 23–61 s |
+| MIVF `--profile 3ds-fast` | 11.68 MiB | −28.1% | 10.22 MiB | −21.9% | 35.26 dB | 23–61 s |
+| MIVF smallest settings*** | 9.60 MiB | −40.9% | 8.14 MiB | −37.8% | 33.59 dB | 23–61 s |
+
+\* Wall-clock, single dev machine, `--jobs 8`; varied 23–61 s run-to-run for every MIVF tier depending on system load, so treat it as "same rough order of magnitude," not a controlled benchmark. MoFlex's ~154 s used a separate 2-pass external tool on the same machine, so it isn't a fair apples-to-apples speed comparison either — included only for scale. \
+\*\* MIVF has no MoFlex encoder, only a decoder, so there's no in-repo way to compute reference PSNR for the MoFlex file — only its size is compared here. \
+\*\*\* `--m2y2 --profile 3ds-fast --qp 45 --lambda 45 --keep 4 --c-qp-offset 10`
+
+**Takeaway:** total file size is close between the formats — MIVF's default settings land within a percent of MoFlex, and the high-quality preset is actually a couple percent *larger*. That's despite MIVF's audio track being smaller here (mono 44.1kHz ADPCM vs. the MoFlex sample's stereo 48kHz ADPCM — a constant ~1.4 MiB difference that has nothing to do with video compression). Looking at video-only bytes with audio factored out, MobiClip's codec is actually more bit-efficient than MIVF at comparable quality on this clip. MIVF only pulls meaningfully ahead once you're willing to spend quality to get there: `--profile 3ds-fast` trades about 2.4 dB of PSNR for ~28% smaller files, and the smallest-settings preset trades ~4 dB for ~41% smaller. So the honest framing isn't "MIVF beats MoFlex at the same quality" — it's that MIVF is a fully open format this project can both encode and decode, with the quality/size tradeoff fully exposed and tunable, and its low-size tiers get substantially smaller than MoFlex when a smaller file matters more than matching MoFlex's quality.
+
+### Motion Search Mode Comparison
+
+5 short test clips (a mix of simple/synthetic and real-world video, varying resolution and motion complexity; clip names aren't shown since they're arbitrary local test files, not something a reader could look up anyway). `full` is the default, exhaustive search; `diamond` and `hybrid` are experimental faster modes — see [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md#motion-search-modes).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/chart_size_dark.svg">
