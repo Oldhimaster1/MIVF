@@ -117,6 +117,14 @@ python encode_mivf.py ./videos/ ./output/
 
 **Requirements:** Python 3 and `ffmpeg` on your system PATH.
 
+### Encoder EXE Builds
+
+Release packages may also include a prebuilt Windows encoder:
+
+```bash
+encode_mivf.exe input.mp4 output.mivf --m2y2
+encode_mivf.exe input.mp4 output.mivf --m2y2 --motion-search hybrid
+encode_mivf.exe input.mp4 output.mivf --m2y2 --profile 3ds-fast
 ### Key Encoder Flags
 
 | Flag | Purpose |
