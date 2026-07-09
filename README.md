@@ -155,7 +155,7 @@ See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for the full step-b
 
 ⚠️ Encode time, output size, and quality all depend on source content, resolution, and encoder settings — these are real measurements from one test pass, not a guarantee for every video.
 
-**`--motion-search` mode comparison** (5 short test clips of varied content; `full` is the default, exhaustive search; `diamond` and `hybrid` are experimental faster modes — see [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md#motion-search-modes)):
+**`--motion-search` mode comparison** — 5 short test clips (a mix of simple/synthetic and real-world video, varying resolution and motion complexity; clip names aren't shown since they're arbitrary local test files, not something a reader could look up anyway). `full` is the default, exhaustive search; `diamond` and `hybrid` are experimental faster modes — see [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md#motion-search-modes).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/benchmarks/chart_size_dark.svg">
@@ -171,11 +171,11 @@ See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for the full step-b
 
 | Clip | full | diamond | hybrid |
 | :--- | ---: | ---: | ---: |
-| smalltest | 51.21 | 51.15 | 51.17 |
-| red | 38.24 | 38.14 | 38.12 |
-| anime | 38.35 | 38.26 | 38.29 |
-| car | 36.95 | 36.77 | 36.81 |
-| anaconda | 37.04 | 37.00 | 36.99 |
+| Clip 1 | 51.21 | 51.15 | 51.17 |
+| Clip 2 | 38.24 | 38.14 | 38.12 |
+| Clip 3 | 38.35 | 38.26 | 38.29 |
+| Clip 4 | 36.95 | 36.77 | 36.81 |
+| Clip 5 | 37.04 | 37.00 | 36.99 |
 
 **Takeaway:** `diamond` encodes noticeably faster than `full` at the cost of a few percent larger files and a small PSNR loss. `hybrid` tracks `diamond`'s speed closely while generally landing closer to `full`'s file size — the improvement over `diamond` was clip-dependent, not uniform. `full` remains the safest choice when size/quality matters more than encode time; use `--report-packet-sizes` and compare the `ENCODE SUMMARY` output before committing to an experimental mode for a release.
 
