@@ -9108,6 +9108,206 @@ static bool mivf_menu_chapters_sidecar_exists(const char *movie_path) {
     return true;
 }
 
+/* ------------------------------------------------------------------------- */
+/* HFIX74: MIVF Asset Bundle (MASB) -- read-only, Phase A.                   */
+/*                                                                           */
+/* An append-only footer + directory + payloads written after all real      */
+/* movie/index data, so a player (or any other tool) that doesn't know       */
+/* about MASB can simply ignore the trailing bytes and still play the       */
+/* file normally. This lets a single .mivf eventually carry every sidecar   */
+/* (menu.ini, chapters, nfo, menu_bg.cover, idx, ...) internally, without    */
+/* ever touching the existing page-based movie data format.                 */
+/*                                                                           */
+/* Phase A implements the reader plus exactly one consumer: menu_bg.cover.   */
+/* Sidecar files still take priority over the embedded copy (see            */
+/* mivf_menu_load_background below) -- this keeps the existing dev workflow */
+/* of editing a sidecar without repacking the whole .mivf. Other keys       */
+/* (menu.ini, chapters, nfo, idx) are intentionally NOT wired to a loader    */
+/* yet; that's later phases, once the text-sidecar parsers are adapted to   */
+/* read from an in-memory buffer as well as a FILE*.                        */
+/*                                                                           */
+/* Deliberately NOT implemented in Phase A: CRC32 verification at load time */
+/* (the packer tool still writes it, so a later phase can start enforcing   */
+/* it without a format version bump) and any compression -- matching how    */
+/* small unqualified profile these assets have expects. */
+#define MIVF_ASSET_FOOTER_MAGIC   0x4253414Du /* "MASB" little-endian */
+#define MIVF_ASSET_FOOTER_VERSION 1u
+#define MIVF_ASSET_FOOTER_SIZE    64u
+#define MIVF_ASSET_DIR_MAGIC      0x44424D41u /* "MABD" little-endian */
+#define MIVF_ASSET_DIR_VERSION    1u
+#define MIVF_ASSET_DIR_HEADER_SIZE 16u
+#define MIVF_ASSET_ENTRY_SIZE     64u
+#define MIVF_ASSET_KEY_MAX        32u
+#define MIVF_ASSET_MAX_ENTRIES    64u
+
+typedef struct {
+    bool valid;
+    u64 bundle_offset;
+    u64 bundle_size;
+    u32 entry_count;
+} MivfAssetBundle;
+
+/* Reads and validates the trailing MASB footer. Does not keep the file
+   open -- called at most a couple of times per menu load, never in a
+   per-frame path, so the extra open/close is not a concern. */
+static bool mivf_assets_probe(const char *movie_path, MivfAssetBundle *bundle) {
+    FILE *f;
+    long end_pos;
+    u8 footer[MIVF_ASSET_FOOTER_SIZE];
+    u32 magic, version, entry_count;
+    u64 bundle_offset, bundle_size;
+
+    memset(bundle, 0, sizeof(*bundle));
+
+    f = fopen(movie_path, "rb");
+    if (!f) {
+        return false;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    end_pos = ftell(f);
+    if (end_pos < (long)MIVF_ASSET_FOOTER_SIZE) {
+        fclose(f);
+        return false;
+    }
+
+    if (fseek(f, end_pos - (long)MIVF_ASSET_FOOTER_SIZE, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    if (fread(footer, 1, sizeof(footer), f) != sizeof(footer)) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    magic = le32(footer + 0);
+    version = le32(footer + 4);
+    bundle_offset = le64(footer + 8);
+    bundle_size = le64(footer + 16);
+    entry_count = le32(footer + 24);
+
+    if (magic != MIVF_ASSET_FOOTER_MAGIC || version != MIVF_ASSET_FOOTER_VERSION) {
+        return false;
+    }
+    if (entry_count == 0 || entry_count > MIVF_ASSET_MAX_ENTRIES) {
+        return false;
+    }
+    if (bundle_offset >= (u64)end_pos ||
+        bundle_offset + bundle_size + (u64)MIVF_ASSET_FOOTER_SIZE != (u64)end_pos) {
+        return false;
+    }
+
+    bundle->valid = true;
+    bundle->bundle_offset = bundle_offset;
+    bundle->bundle_size = bundle_size;
+    bundle->entry_count = entry_count;
+    return true;
+}
+
+/* Looks up a single entry by key in the asset directory. *out_offset is
+   absolute (already added to bundle_offset), ready to fseek() to directly. */
+static bool mivf_assets_find(const char *movie_path, const MivfAssetBundle *bundle,
+                              const char *key, u64 *out_offset, u64 *out_size) {
+    FILE *f;
+    u8 dir_hdr[MIVF_ASSET_DIR_HEADER_SIZE];
+    u32 dmagic, dversion, dcount;
+    u32 i;
+
+    if (!bundle->valid) {
+        return false;
+    }
+
+    f = fopen(movie_path, "rb");
+    if (!f) {
+        return false;
+    }
+
+    if (fseek(f, (long)bundle->bundle_offset, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    if (fread(dir_hdr, 1, sizeof(dir_hdr), f) != sizeof(dir_hdr)) {
+        fclose(f);
+        return false;
+    }
+
+    dmagic = le32(dir_hdr + 0);
+    dversion = le32(dir_hdr + 4);
+    dcount = le32(dir_hdr + 8);
+
+    if (dmagic != MIVF_ASSET_DIR_MAGIC || dversion != MIVF_ASSET_DIR_VERSION || dcount != bundle->entry_count) {
+        fclose(f);
+        return false;
+    }
+
+    for (i = 0; i < dcount; i++) {
+        u8 entry[MIVF_ASSET_ENTRY_SIZE];
+        char entry_key[MIVF_ASSET_KEY_MAX + 1];
+        u64 rel_offset, size;
+
+        if (fread(entry, 1, sizeof(entry), f) != sizeof(entry)) {
+            fclose(f);
+            return false;
+        }
+
+        memcpy(entry_key, entry, MIVF_ASSET_KEY_MAX);
+        entry_key[MIVF_ASSET_KEY_MAX] = 0;
+
+        if (strcmp(entry_key, key) != 0) {
+            continue;
+        }
+
+        rel_offset = le64(entry + 40);
+        size = le64(entry + 48);
+        fclose(f);
+
+        *out_offset = bundle->bundle_offset + rel_offset;
+        *out_size = size;
+        return true;
+    }
+
+    fclose(f);
+    return false;
+}
+
+/* Convenience wrapper for a fixed-size binary asset (currently only
+   menu_bg.cover): probe, find, and read directly into dst if the stored
+   size matches expected_size exactly. */
+static bool mivf_assets_load_exact(const char *movie_path, const char *asset_key,
+                                    void *dst, size_t expected_size) {
+    MivfAssetBundle bundle;
+    u64 offset, size;
+    FILE *f;
+    size_t got;
+
+    if (!mivf_assets_probe(movie_path, &bundle)) {
+        return false;
+    }
+    if (!mivf_assets_find(movie_path, &bundle, asset_key, &offset, &size)) {
+        return false;
+    }
+    if (size != (u64)expected_size) {
+        return false;
+    }
+
+    f = fopen(movie_path, "rb");
+    if (!f) {
+        return false;
+    }
+    if (fseek(f, (long)offset, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+
+    got = fread(dst, 1, expected_size, f);
+    fclose(f);
+    return got == expected_size;
+}
+
 static bool mivf_menu_exists_for_movie(const char *movie_path) {
     char path[HFIX58_MAX_PATH];
     FILE *f;
@@ -9125,6 +9325,11 @@ static bool mivf_menu_exists_for_movie(const char *movie_path) {
     return true;
 }
 
+/* HFIX74: sidecar wins over the embedded MASB asset -- lets a background
+   still be replaced during development without repacking the whole .mivf.
+   Falls back to the embedded "menu_bg.cover" asset if no valid sidecar is
+   present; mivf_menu_draw_top's own has_background==false path handles the
+   case where neither exists. */
 static bool mivf_menu_load_background(const char *movie_path) {
     char path[HFIX58_MAX_PATH];
     FILE *f;
@@ -9132,19 +9337,18 @@ static bool mivf_menu_load_background(const char *movie_path) {
     size_t got;
 
     hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".menu_bg.cover");
-    if (!path[0]) {
-        return false;
+    if (path[0]) {
+        f = fopen(path, "rb");
+        if (f) {
+            got = fread(g_mivf_menu_bg, 1, need, f);
+            fclose(f);
+            if (got == need) {
+                return true;
+            }
+        }
     }
 
-    f = fopen(path, "rb");
-    if (!f) {
-        return false;
-    }
-
-    got = fread(g_mivf_menu_bg, 1, need, f);
-    fclose(f);
-
-    return got == need;
+    return mivf_assets_load_exact(movie_path, "menu_bg.cover", g_mivf_menu_bg, need);
 }
 
 static MivfMenuAction mivf_menu_parse_action(const char *s) {
