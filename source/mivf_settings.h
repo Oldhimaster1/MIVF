@@ -40,6 +40,10 @@ typedef struct {
     u32 subtitle_track_index;
     int subtitle_delay_ms;     /* negative = earlier, positive = later */
     u32 subtitle_position;     /* 0 = low, 1 = middle, 2 = high */
+    u32 audio_offset_ms;       /* 0..3000: hold decoded audio this many ms
+                                   before it reaches NDSP, so it lines up with
+                                   video that plays "ahead" of it. Debug/manual
+                                   calibration only -- see hfix71 audio offset. */
     u32 theme_index;
     u32 font_scale;
     u32 aspect_mode;          /* 0 = FIT, 1 = STRETCH, 2 = NATIVE */

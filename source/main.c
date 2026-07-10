@@ -2737,7 +2737,7 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
     }
 }
 
-#define HFIX59R3_SETTINGS_COUNT 22
+#define HFIX59R3_SETTINGS_COUNT 23
 #define HFIX59R3_SETTINGS_VISIBLE 13
 
 static const char *hfix59r3_settings_group(int idx) {
@@ -2773,7 +2773,8 @@ static const char *hfix59r3_settings_label(int idx) {
         "DIM LEVEL",
         "DEBUG",
         "CONTROLS",
-        "CHAPTER MARKERS"
+        "CHAPTER MARKERS",
+        "AUDIO SYNC"
     };
 
     if (idx < 0 || idx >= HFIX59R3_SETTINGS_COUNT) {
@@ -2820,6 +2821,7 @@ static void hfix59r3_settings_value(int idx, char *out, size_t out_sz) {
         case 19: snprintf(out, out_sz, "%s", g_mivf_settings.debug_overlay_enabled ? "ON" : "OFF"); break;
         case 20: snprintf(out, out_sz, "A: VIEW"); break;
         case 21: snprintf(out, out_sz, "%s", g_mivf_settings.chapter_markers_enabled ? "ON" : "OFF"); break;
+        case 22: snprintf(out, out_sz, "+%lums", (unsigned long)g_mivf_settings.audio_offset_ms); break;
         default: break;
     }
 }
@@ -2827,6 +2829,10 @@ static void hfix59r3_settings_value(int idx, char *out, size_t out_sz) {
 /* HFIX62 forward decl: the Settings menu's CONTROLS row hands off to Help,
    defined further down this file (see hfix62_set_help_open). */
 static void hfix62_set_help_open(bool open);
+
+/* hfix71 forward decl: the Settings menu's AUDIO SYNC row reconfigures the
+   manual sync delay ring, defined further down this file. */
+static void audio_delay_ring_reconfigure(u32 offset_ms);
 
 static bool hfix59r3_handle_settings_menu(u32 down) {
     char value[32];
@@ -3027,6 +3033,21 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
             g_mivf_settings.chapter_markers_enabled = !g_mivf_settings.chapter_markers_enabled;
             snprintf(value, sizeof(value), "CHAPTER MARKERS %s", g_mivf_settings.chapter_markers_enabled ? "ON" : "OFF");
             break;
+        case 22: {
+            /* Debug/manual A/V sync calibration: holds decoded audio this many
+               ms before NDSP submission (see audio_delay_ring_*). One-direction
+               only (audio can only be delayed further, not advanced) -- see
+               avsync diagnostics + encoder --audio-offset-ms for the other
+               direction and for a permanent, baked-in fix. */
+            int step = (down & KEY_DLEFT) ? -100 : 100;
+            int next = (int)g_mivf_settings.audio_offset_ms + step;
+            if (next < 0) next = 0;
+            if (next > 3000) next = 3000;
+            g_mivf_settings.audio_offset_ms = (u32)next;
+            audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
+            snprintf(value, sizeof(value), "AUDIO SYNC +%lums", (unsigned long)g_mivf_settings.audio_offset_ms);
+            break;
+        }
         default:
             break;
     }
@@ -8545,8 +8566,206 @@ static int decode_ia4m_packet(const u8 *p, size_t n, s16 *out, int out_cap) {
 
 static void audio_queue(const u8 *data, u32 size);
 
+/*
+    AVSYNC diagnostics (see task: "Finally fix the remaining MIVF audio/video
+    sync issue properly"). Bounded, always-on logging of first-N video shows
+    and first-N audio submits, plus a one-shot "which came first and by how
+    much" summary at startup and after every real (non-preview) seek. This is
+    read-only instrumentation -- it does not change playback behavior. It
+    exists so real hardware testing can tell us whether the residual offset
+    is a fixed startup/seek latency (constant delta_ms every run) or
+    something else, instead of guessing.
+*/
+#define AVSYNC_LOG_LIMIT 20
+
+static u32  g_avsync_video_log_count = 0;
+static u32  g_avsync_audio_log_count = 0;
+static bool g_avsync_first_video_seen = false;
+static bool g_avsync_first_audio_seen = false;
+static u64  g_avsync_first_video_tick = 0;
+static u64  g_avsync_first_audio_tick = 0;
+static u32  g_avsync_first_video_frame = 0;
+static u32  g_avsync_first_audio_frame = 0;
+
+/* Reset at the start of every play() session so a previous file's one-shot
+   startup report doesn't leak into the next file's log. */
+static void avsync_reset_startup(void) {
+    g_avsync_video_log_count = 0;
+    g_avsync_audio_log_count = 0;
+    g_avsync_first_video_seen = false;
+    g_avsync_first_audio_seen = false;
+    g_avsync_first_video_tick = 0;
+    g_avsync_first_audio_tick = 0;
+    g_avsync_first_video_frame = 0;
+    g_avsync_first_audio_frame = 0;
+}
+
+static void avsync_report_start_if_ready(void) {
+    if (!g_avsync_first_video_seen || !g_avsync_first_audio_seen) {
+        return;
+    }
+
+    u64 lo = g_avsync_first_video_tick < g_avsync_first_audio_tick
+        ? g_avsync_first_video_tick : g_avsync_first_audio_tick;
+    u64 hi = g_avsync_first_video_tick < g_avsync_first_audio_tick
+        ? g_avsync_first_audio_tick : g_avsync_first_video_tick;
+    long long delta_ms = (long long)(ticks_to_us(hi - lo) / 1000u);
+    if (g_avsync_first_audio_tick < g_avsync_first_video_tick) {
+        delta_ms = -delta_ms; /* negative: audio was submitted before video first showed */
+    }
+
+    printf(
+        "avsync: start first_audio_submit_frame=%lu tick=%llu first_video_show_frame=%lu tick=%llu delta_ms=%lld\n",
+        (unsigned long)g_avsync_first_audio_frame,
+        (unsigned long long)g_avsync_first_audio_tick,
+        (unsigned long)g_avsync_first_video_frame,
+        (unsigned long long)g_avsync_first_video_tick,
+        delta_ms);
+}
+
+/* Seek-side counterpart: armed by hfix58f_execute_pending_seek (real seeks
+   only, not preview/scrub), reported once both sides have fired. */
+static bool g_avsync_seek_active = false;
+static u32  g_avsync_seek_target = 0;
+static u32  g_avsync_seek_seekpoint = 0;
+static bool g_avsync_seek_first_video_seen = false;
+static bool g_avsync_seek_first_audio_seen = false;
+static u32  g_avsync_seek_first_video_frame = 0;
+static u32  g_avsync_seek_first_audio_frame = 0;
+
+static void avsync_arm_seek(u32 target, u32 seekpoint_frame) {
+    g_avsync_seek_active = true;
+    g_avsync_seek_target = target;
+    g_avsync_seek_seekpoint = seekpoint_frame;
+    g_avsync_seek_first_video_seen = false;
+    g_avsync_seek_first_audio_seen = false;
+    g_avsync_seek_first_video_frame = 0;
+    g_avsync_seek_first_audio_frame = 0;
+}
+
+static void avsync_report_seek_if_ready(void) {
+    if (!g_avsync_seek_active ||
+        !g_avsync_seek_first_video_seen ||
+        !g_avsync_seek_first_audio_seen) {
+        return;
+    }
+
+    long delta_frames = (long)g_avsync_seek_first_audio_frame - (long)g_avsync_seek_first_video_frame;
+
+    printf(
+        "avsync: seek target=%lu seekpoint=%lu first_video=%lu first_audio=%lu delta_frames=%ld\n",
+        (unsigned long)g_avsync_seek_target,
+        (unsigned long)g_avsync_seek_seekpoint,
+        (unsigned long)g_avsync_seek_first_video_frame,
+        (unsigned long)g_avsync_seek_first_audio_frame,
+        delta_frames);
+
+    g_avsync_seek_active = false;
+}
+
+/*
+    hfix71: manual A/V sync calibration (Settings -> AUDIO SYNC). Holds each
+    decoded audio frame's PCM bytes in a small ring for N frames before it
+    reaches audio_queue()/NDSP, so audio that currently plays *ahead* of its
+    matching video can be pulled back into line without re-encoding. One
+    direction only: this can only delay audio further, never advance it
+    (advancing would need decoding video+audio ahead of display, which is a
+    much bigger structural change). If audio is instead lagging behind video,
+    this setting cannot help -- use the encoder's --audio-offset-ms for a
+    permanent, bidirectional fix once the right value is known.
+
+    Bounded to MIVF_SETTINGS' audio_offset_ms clamp (0..3000 ms). Depth is in
+    whole audio *frames* (matching one decoded IA4M/PC16 packet each), not raw
+    ms, since that's the native unit this pipeline already works in.
+*/
+#define AUDIO_DELAY_MAX_FRAMES 128
+#define AUDIO_DELAY_SLOT_BYTES 8192
+
+typedef struct {
+    u8 data[AUDIO_DELAY_SLOT_BYTES];
+    u32 size; /* 0 = empty slot (treated as silence) */
+} AudioDelaySlot;
+
+static AudioDelaySlot g_audio_delay_ring[AUDIO_DELAY_MAX_FRAMES];
+static u32 g_audio_delay_ring_depth = 0;  /* configured depth in frames; 0 = disabled/passthrough */
+static u32 g_audio_delay_ring_head = 0;
+static u32 g_audio_delay_ring_filled = 0; /* real frames stored since (re)configure, saturates at depth */
+
+static void audio_delay_ring_reconfigure(u32 offset_ms) {
+    u32 depth = 0;
+
+    if (offset_ms > 0 && audio.rate > 0 && audio.samples_per_frame > 0) {
+        u32 frame_ms = (audio.samples_per_frame * 1000u) / audio.rate;
+        if (frame_ms == 0) {
+            frame_ms = 1;
+        }
+        depth = offset_ms / frame_ms;
+    }
+
+    if (depth > AUDIO_DELAY_MAX_FRAMES) {
+        depth = AUDIO_DELAY_MAX_FRAMES;
+    }
+
+    g_audio_delay_ring_depth = depth;
+    g_audio_delay_ring_head = 0;
+    g_audio_delay_ring_filled = 0;
+
+    for (u32 i = 0; i < AUDIO_DELAY_MAX_FRAMES; i++) {
+        g_audio_delay_ring[i].size = 0;
+    }
+
+    printf("audio_delay_ring: offset_ms=%lu depth_frames=%lu\n",
+        (unsigned long)offset_ms, (unsigned long)depth);
+}
+
+static void audio_delay_ring_submit(const u8 *data, u32 size) {
+    AudioDelaySlot *slot;
+
+    if (g_audio_delay_ring_depth == 0 || !data || size == 0) {
+        audio_queue(data, size);
+        return;
+    }
+
+    slot = &g_audio_delay_ring[g_audio_delay_ring_head];
+
+    if (g_audio_delay_ring_filled >= g_audio_delay_ring_depth) {
+        audio_queue(slot->data, slot->size);
+    } else {
+        g_audio_delay_ring_filled++;
+        /* Ring not full yet since (re)configure/seek -- emit silence instead
+           of real audio, i.e. "prepend N ms of silence" spread over frames. */
+        static const u8 silence[AUDIO_DELAY_SLOT_BYTES] = {0};
+        audio_queue(silence, size > AUDIO_DELAY_SLOT_BYTES ? AUDIO_DELAY_SLOT_BYTES : size);
+    }
+
+    if (size > AUDIO_DELAY_SLOT_BYTES) {
+        size = AUDIO_DELAY_SLOT_BYTES;
+    }
+    memcpy(slot->data, data, size);
+    slot->size = size;
+
+    g_audio_delay_ring_head = (g_audio_delay_ring_head + 1) % g_audio_delay_ring_depth;
+}
+
 static bool hfix58_queue_audio_packet(const Stream *a, const u8 *body, u32 psize, u32 frame_no) {
-    (void)frame_no;
+    if (g_avsync_audio_log_count < AVSYNC_LOG_LIMIT) {
+        printf("avsync: audio_submit frame=%lu tick=%llu\n",
+            (unsigned long)frame_no, (unsigned long long)svcGetSystemTick());
+        g_avsync_audio_log_count++;
+    }
+
+    if (!g_avsync_first_audio_seen) {
+        g_avsync_first_audio_seen = true;
+        g_avsync_first_audio_tick = svcGetSystemTick();
+        g_avsync_first_audio_frame = frame_no;
+        avsync_report_start_if_ready();
+    }
+
+    if (g_avsync_seek_active && !g_avsync_seek_first_audio_seen) {
+        g_avsync_seek_first_audio_seen = true;
+        g_avsync_seek_first_audio_frame = frame_no;
+        avsync_report_seek_if_ready();
+    }
     if (!a || !audio.ready || !body || psize == 0) {
         return false;
     }
@@ -8559,11 +8778,11 @@ static bool hfix58_queue_audio_packet(const Stream *a, const u8 *body, u32 psize
             return false;
         }
 
-        audio_queue((const u8*)ia4m_pcm, (u32)(ns * 2));
+        audio_delay_ring_submit((const u8*)ia4m_pcm, (u32)(ns * 2));
         return true;
     }
 
-    audio_queue(body, psize);
+    audio_delay_ring_submit(body, psize);
     return true;
 }
 
@@ -8839,10 +9058,31 @@ static void hfix59r3_present_video_frame(
         *have_prev = true;
     }
 
+    u32 shown_frame = *shown;
+
     (*shown)++;
     hfix58s_subtitles_set_frame_time(*shown, fpsn_abs, fpsd_abs);
 
     u64 now_tick = svcGetSystemTick();
+
+    if (g_avsync_video_log_count < AVSYNC_LOG_LIMIT) {
+        printf("avsync: video_show frame=%lu tick=%llu\n",
+            (unsigned long)shown_frame, (unsigned long long)now_tick);
+        g_avsync_video_log_count++;
+    }
+
+    if (!g_avsync_first_video_seen) {
+        g_avsync_first_video_seen = true;
+        g_avsync_first_video_tick = now_tick;
+        g_avsync_first_video_frame = shown_frame;
+        avsync_report_start_if_ready();
+    }
+
+    if (g_avsync_seek_active && !g_avsync_seek_first_video_seen) {
+        g_avsync_seek_first_video_seen = true;
+        g_avsync_seek_first_video_frame = shown_frame;
+        avsync_report_seek_if_ready();
+    }
 
     if (now_tick > *next_frame_tick + frame_ticks_abs * 2) {
         *next_frame_tick = now_tick + frame_ticks_abs;
@@ -11114,6 +11354,12 @@ static void hfix58f_request_relative_seek(int delta_frames) {
 }
 
 static void hfix58f_audio_flush_for_seek(void) {
+    /* Clear any decoded-but-not-yet-submitted audio sitting in the manual
+       sync delay ring (see hfix71 above) so stale pre-seek audio can't leak
+       out after the jump. Depth is recomputed from the same settings value;
+       harmless if unchanged. */
+    audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
+
     if (!audio_can_use_ndsp()) {
         return;
     }
@@ -11188,6 +11434,10 @@ static bool hfix58f_execute_pending_seek(
     if (!sp) {
         hfix58_alert_set("SEEK FAILED", 2);
         return false;
+    }
+
+    if (!preview_seek) {
+        avsync_arm_seek(g_hfix58f_seek_target, sp->frame);
     }
 
     hfix58f_audio_flush_for_seek();
@@ -11612,6 +11862,7 @@ static int play(void) {
 
     if (ha) {
         audio_init_from_stream(&a);
+        audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
     } else {
         printf("no audio stream\n");
     }
@@ -11724,6 +11975,7 @@ static int play(void) {
     /* Reset per-playback-session perf counters so max values from
        a previous file don't mislead the debug overlay. */
     hfix58_perf_diag_reset();
+    avsync_reset_startup();
 
     /* HFIX66: a DVD-style menu (if one ran before this play()) sets a one-shot
        launch directive that takes priority over the normal resume prompt --
