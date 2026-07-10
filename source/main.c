@@ -2808,7 +2808,7 @@ static const char *hfix59r3_settings_label(int idx) {
         "DEBUG",
         "CONTROLS",
         "CHAPTER MARKERS",
-        "AUDIO SYNC"
+        "A/V SYNC"
     };
 
     if (idx < 0 || idx >= HFIX59R3_SETTINGS_COUNT) {
@@ -2855,7 +2855,7 @@ static void hfix59r3_settings_value(int idx, char *out, size_t out_sz) {
         case 19: snprintf(out, out_sz, "%s", g_mivf_settings.debug_overlay_enabled ? "ON" : "OFF"); break;
         case 20: snprintf(out, out_sz, "A: VIEW"); break;
         case 21: snprintf(out, out_sz, "%s", g_mivf_settings.chapter_markers_enabled ? "ON" : "OFF"); break;
-        case 22: snprintf(out, out_sz, "+%lums", (unsigned long)g_mivf_settings.audio_offset_ms); break;
+        case 22: snprintf(out, out_sz, "%+dms", g_mivf_settings.audio_offset_ms); break;
         default: break;
     }
 }
@@ -2867,6 +2867,10 @@ static void hfix62_set_help_open(bool open);
 /* hfix71 forward decl: the Settings menu's AUDIO SYNC row reconfigures the
    manual sync delay ring, defined further down this file. */
 static void audio_delay_ring_reconfigure(u32 offset_ms);
+
+/* hfix77 forward decl: the Settings menu's A/V SYNC row routes its value to
+   the audio-hold / video-delay mechanisms, defined further down this file. */
+static void av_sync_offset_apply(int offset_ms);
 
 static bool hfix59r3_handle_settings_menu(u32 down) {
     char value[32];
@@ -3068,18 +3072,17 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
             snprintf(value, sizeof(value), "CHAPTER MARKERS %s", g_mivf_settings.chapter_markers_enabled ? "ON" : "OFF");
             break;
         case 22: {
-            /* Debug/manual A/V sync calibration: holds decoded audio this many
-               ms before NDSP submission (see audio_delay_ring_*). One-direction
-               only (audio can only be delayed further, not advanced) -- see
-               avsync diagnostics + encoder --audio-offset-ms for the other
-               direction and for a permanent, baked-in fix. */
+            /* Manual A/V sync calibration, tunable live by ear. Positive holds
+               audio later (hfix71 delay ring); negative delays video instead
+               (hfix77), which is what pulls late audio back into sync. Range
+               -600..+3000; same sign convention as encoder --audio-offset-ms. */
             int step = (down & KEY_DLEFT) ? -100 : 100;
-            int next = (int)g_mivf_settings.audio_offset_ms + step;
-            if (next < 0) next = 0;
+            int next = g_mivf_settings.audio_offset_ms + step;
+            if (next < -600) next = -600;
             if (next > 3000) next = 3000;
-            g_mivf_settings.audio_offset_ms = (u32)next;
-            audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
-            snprintf(value, sizeof(value), "AUDIO SYNC +%lums", (unsigned long)g_mivf_settings.audio_offset_ms);
+            g_mivf_settings.audio_offset_ms = next;
+            av_sync_offset_apply(g_mivf_settings.audio_offset_ms);
+            snprintf(value, sizeof(value), "A/V SYNC %+dms", g_mivf_settings.audio_offset_ms);
             break;
         }
         default:
@@ -9089,6 +9092,163 @@ static void audio_rate_sync_tick(void) {
     ndspChnSetRate(0, audio_rate_base() * corr);
 }
 
+/*
+    hfix77: video presentation delay -- the user-facing half of A/V sync.
+
+    Even with the queue bounded and steadied by the controller above, audio
+    still becomes audible a fixed amount after its matching video frame is
+    shown (the submit-queue floor, ~150ms, plus whatever the emulator/host
+    output buffer adds -- unmeasurable from in here). Since we can't pull audio
+    any earlier than the queue floor, the fix for a *constant* residual is to
+    push VIDEO later by the same amount so they realign.
+
+    The top screen is pure video and the UI lives entirely on the bottom
+    screen (see blit565_scaled / the draw_* overlays), so we can delay the top
+    framebuffer with zero effect on decode state or UI: after each real frame
+    is blitted, snapshot it into a ring and blit back the frame from `depth`
+    frames ago. Driven by the negative side of the A/V SYNC setting, tunable
+    live by ear. Decode is untouched and still sequential -- only what reaches
+    the panel is delayed.
+*/
+#define VIDEO_DELAY_MAX_MS 600
+
+static u8   **g_video_delay_ring = NULL;
+static int    g_video_delay_slots = 0;
+static size_t g_video_delay_slot_bytes = 0;
+static int    g_video_delay_head = 0;
+static int    g_video_delay_fill = 0;
+static int    g_video_delay_depth = 0;   /* active delay in frames */
+
+static void video_delay_free(void) {
+    if (g_video_delay_ring) {
+        for (int i = 0; i < g_video_delay_slots; i++) {
+            free(g_video_delay_ring[i]);
+        }
+        free(g_video_delay_ring);
+        g_video_delay_ring = NULL;
+    }
+    g_video_delay_slots = 0;
+    g_video_delay_slot_bytes = 0;
+    g_video_delay_head = 0;
+    g_video_delay_fill = 0;
+    g_video_delay_depth = 0;
+}
+
+/* Allocate the ring sized for VIDEO_DELAY_MAX_MS at this file's fps. Called
+   once per playback. If any allocation fails the feature just stays disabled
+   (returns false); playback is unaffected. */
+static bool video_delay_alloc(u32 fpsn, u32 fpsd) {
+    video_delay_free();
+
+    u32 fps = (fpsn && fpsd) ? (fpsn / fpsd) : 30u;
+    if (fps == 0) {
+        fps = 30u;
+    }
+
+    int max_frames = (int)((VIDEO_DELAY_MAX_MS * fps) / 1000u) + 2;
+    if (max_frames < 2) {
+        max_frames = 2;
+    }
+
+    size_t bytes = (size_t)TOP_W * (size_t)TOP_H * 2u;
+
+    g_video_delay_ring = (u8**)malloc((size_t)max_frames * sizeof(u8*));
+    if (!g_video_delay_ring) {
+        return false;
+    }
+    for (int i = 0; i < max_frames; i++) {
+        g_video_delay_ring[i] = NULL;
+    }
+    for (int i = 0; i < max_frames; i++) {
+        g_video_delay_ring[i] = (u8*)malloc(bytes);
+        if (!g_video_delay_ring[i]) {
+            video_delay_free();
+            return false;
+        }
+    }
+
+    g_video_delay_slots = max_frames;
+    g_video_delay_slot_bytes = bytes;
+    g_video_delay_head = 0;
+    g_video_delay_fill = 0;
+    g_video_delay_depth = 0;
+    return true;
+}
+
+/* Drop buffered history so post-seek video never shows pre-seek frames. The
+   first `depth` frames after a reset present undelayed while the ring
+   re-primes -- a brief, self-correcting transient, not stale content. */
+static void video_delay_reset(void) {
+    g_video_delay_head = 0;
+    g_video_delay_fill = 0;
+}
+
+static void video_delay_set_ms(int ms, u32 fpsn, u32 fpsd) {
+    int depth;
+
+    if (ms < 0) {
+        ms = 0;
+    }
+    if (ms > VIDEO_DELAY_MAX_MS) {
+        ms = VIDEO_DELAY_MAX_MS;
+    }
+
+    u32 fps_n = fpsn ? fpsn : 30u;
+    u32 fps_d = fpsd ? fpsd : 1u;
+    depth = (int)(((u64)ms * (u64)fps_n) / ((u64)fps_d * 1000u));
+
+    if (g_video_delay_slots > 0 && depth > g_video_delay_slots - 1) {
+        depth = g_video_delay_slots - 1;
+    }
+    if (depth < 0) {
+        depth = 0;
+    }
+
+    g_video_delay_depth = depth;
+    printf("video_delay: ms=%d depth_frames=%d slots=%d\n", ms, depth, g_video_delay_slots);
+}
+
+/* Called right after a fresh frame has been blitted to the TOP framebuffer.
+   Saves it and swaps in the frame from `depth` presents ago. */
+static void video_delay_apply(void) {
+    if (g_video_delay_depth <= 0 || !g_video_delay_ring || g_video_delay_slots <= 0) {
+        return;
+    }
+
+    u16 fw = 0, fh = 0;
+    u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
+    size_t n = (size_t)fw * (size_t)fh * 2u;
+
+    if (!fb || n == 0 || n > g_video_delay_slot_bytes) {
+        return;
+    }
+
+    memcpy(g_video_delay_ring[g_video_delay_head], fb, n);
+
+    if (g_video_delay_fill >= g_video_delay_depth) {
+        int idx = g_video_delay_head - g_video_delay_depth;
+        if (idx < 0) {
+            idx += g_video_delay_slots;
+        }
+        memcpy(fb, g_video_delay_ring[idx], n);
+    } else {
+        g_video_delay_fill++;
+    }
+
+    g_video_delay_head = (g_video_delay_head + 1) % g_video_delay_slots;
+}
+
+/* Route the single A/V SYNC setting to the two one-directional mechanisms:
+   positive -> hold audio (hfix71 delay ring); negative -> delay video
+   (hfix77). Exactly one is ever active; the other is set to zero. Reads the
+   current video fps from the globals set up in play(), so callers (including
+   the Settings UI) don't need to thread it through. */
+static void av_sync_offset_apply(int offset_ms) {
+    audio_delay_ring_reconfigure(offset_ms > 0 ? (u32)offset_ms : 0u);
+    video_delay_set_ms(offset_ms < 0 ? -offset_ms : 0,
+                       g_hfix59r2_video_fps_num, g_hfix59r2_video_fps_den);
+}
+
 static void avsync_audioq_report(u32 video_frame) {
     u32 pending = audio_count_pending_wavebufs();
     u32 free_bufs = (u32)AUDIO_BUFS - pending;
@@ -9321,6 +9481,11 @@ static void hfix59r3_present_video_frame(
         }
         blit565_scaled(*frame, v->w, v->h);
     }
+
+    /* hfix77: the fresh frame is now in the TOP framebuffer -- delay it by
+       swapping in an older one if the A/V SYNC setting asks for video delay.
+       No-op (returns immediately) when depth is 0. */
+    video_delay_apply();
 
     u8 *tmp = *prev;
     *prev = *frame;
@@ -11649,11 +11814,13 @@ static void hfix58f_request_relative_seek(int delta_frames) {
 }
 
 static void hfix58f_audio_flush_for_seek(void) {
-    /* Clear any decoded-but-not-yet-submitted audio sitting in the manual
-       sync delay ring (see hfix71 above) so stale pre-seek audio can't leak
-       out after the jump. Depth is recomputed from the same settings value;
-       harmless if unchanged. */
-    audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
+    /* Clear any decoded-but-not-yet-submitted audio in the manual sync delay
+       ring, and drop the video-delay ring's buffered frames, so neither can
+       leak pre-seek content across the jump. Routed through av_sync_offset_apply
+       so a negative (video-delay) setting is handled correctly instead of
+       wrapping through the u32 audio path. */
+    av_sync_offset_apply(g_mivf_settings.audio_offset_ms);
+    video_delay_reset();
 
     if (!audio_can_use_ndsp()) {
         return;
@@ -12171,18 +12338,22 @@ static int play(void) {
         v.fpsn,
         v.fpsd ? v.fpsd : 1);
 
+    g_hfix59r2_video_fps_num = v.fpsn ? v.fpsn : 30;
+    g_hfix59r2_video_fps_den = v.fpsd ? v.fpsd : 1;
+
     if (ha) {
         audio_init_from_stream(&a);
-        audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
         audio_rate_sync_reset();
+        /* hfix77: size the video-delay ring for this file's fps, then apply the
+           A/V SYNC setting (fps globals above are already set, so
+           av_sync_offset_apply can compute the video-delay depth). */
+        video_delay_alloc(g_hfix59r2_video_fps_num, g_hfix59r2_video_fps_den);
+        av_sync_offset_apply(g_mivf_settings.audio_offset_ms);
     } else {
         printf("no audio stream\n");
     }
 
     g_hfix58f_media_end_offset = 0;
-
-    g_hfix59r2_video_fps_num = v.fpsn ? v.fpsn : 30;
-    g_hfix59r2_video_fps_den = v.fpsd ? v.fpsd : 1;
 
     hfix58s_subtitles_load_for_video(MIVF_PATH);
     hfix60_chapters_load(MIVF_PATH, v.fpsn, v.fpsd);
@@ -12230,6 +12401,7 @@ static int play(void) {
         */
         mivf_stream_close(&stream);
         audio_shutdown();
+        video_delay_free();
         fclose(f);
 
         return -6;
@@ -12245,6 +12417,7 @@ static int play(void) {
             free(prev);
             mivf_stream_close(&stream);
             audio_shutdown();
+            video_delay_free();
             fclose(f);
             return -7;
         }
@@ -13009,6 +13182,7 @@ static int play(void) {
     printf("lifecycle: play() mivf_stream_close returned\n");
     hfix52a_y2r_shutdown();
     audio_shutdown();
+    video_delay_free();
     hfix58s_subtitles_unload();
 
     if (g_mivf_settings.resume_enabled && !g_mivf_play_reached_eof) {

@@ -234,8 +234,12 @@ void MIVF_SettingsClamp(MivfSettings *settings) {
         settings->subtitle_position = 0u;
     }
 
-    if (settings->audio_offset_ms > 3000u) {
-        settings->audio_offset_ms = 3000u;
+    if (settings->audio_offset_ms < -600) {
+        settings->audio_offset_ms = -600;
+    }
+
+    if (settings->audio_offset_ms > 3000) {
+        settings->audio_offset_ms = 3000;
     }
 }
 
@@ -294,7 +298,7 @@ bool MIVF_SettingsLoad(MivfSettings *settings) {
         else if (!strcmp(key, "subtitle_track_index")) settings->subtitle_track_index = (u32)strtoul(val, NULL, 10);
         else if (!strcmp(key, "subtitle_delay_ms")) settings->subtitle_delay_ms = atoi(val);
         else if (!strcmp(key, "subtitle_position")) settings->subtitle_position = (u32)strtoul(val, NULL, 10);
-        else if (!strcmp(key, "audio_offset_ms")) settings->audio_offset_ms = (u32)strtoul(val, NULL, 10);
+        else if (!strcmp(key, "audio_offset_ms")) settings->audio_offset_ms = atoi(val);
         else if (!strcmp(key, "theme_index")) settings->theme_index = (u32)strtoul(val, NULL, 10);
         else if (!strcmp(key, "font_scale")) settings->font_scale = (u32)strtoul(val, NULL, 10);
         else if (!strcmp(key, "aspect_mode")) settings->aspect_mode = (u32)strtoul(val, NULL, 10);
@@ -344,7 +348,7 @@ bool MIVF_SettingsSave(const MivfSettings *settings) {
     fprintf(fp, "subtitle_track_index=%lu\n", (unsigned long)settings->subtitle_track_index);
     fprintf(fp, "subtitle_delay_ms=%d\n", settings->subtitle_delay_ms);
     fprintf(fp, "subtitle_position=%lu\n", (unsigned long)settings->subtitle_position);
-    fprintf(fp, "audio_offset_ms=%lu\n", (unsigned long)settings->audio_offset_ms);
+    fprintf(fp, "audio_offset_ms=%d\n", settings->audio_offset_ms);
     fprintf(fp, "theme_index=%lu\n", (unsigned long)settings->theme_index);
     fprintf(fp, "font_scale=%lu\n", (unsigned long)settings->font_scale);
     fprintf(fp, "aspect_mode=%lu\n", (unsigned long)settings->aspect_mode);
