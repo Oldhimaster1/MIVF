@@ -9288,12 +9288,13 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
         if (b->label[0] == 0) {
             snprintf(b->label, sizeof(b->label), "%s", b->id[0] ? b->id : "BUTTON");
         }
-        /* HFIX71: root menu buttons now render on the 400x240 top screen
-           (previously the 320x240 bottom screen) -- clamp against TOP_W/
-           TOP_H accordingly. Existing .menu.ini rects (authored against the
-           old 320-wide bottom layout) still fit comfortably within 400x240,
-           just relocated to a different screen; no auto-layout heuristic
-           needed for the coordinates already in real use. */
+        /* HFIX72: the top-screen root menu auto-layouts its button stack
+           (mivf_menu_draw_top_root) instead of trusting these coordinates --
+           bottom-screen-authored rects collided with the title/divider zone
+           once buttons moved to the top screen. x/y/w/h are still parsed
+           and clamped here against TOP_W/TOP_H for a possible future
+           explicit/custom layout mode, just not read by the current
+           top-screen rendering path. */
         if (b->w <= 0) b->w = 120;
         if (b->h <= 0) b->h = 22;
         if (b->w > TOP_W) b->w = TOP_W;
@@ -9354,6 +9355,16 @@ static void mivf_menu_top_diamond(u8 *fb, int cx, int cy, int r, int g, int b) {
 /* HFIX71: background/title only -- used as-is while browsing Scene
    Selection (which stays bottom-screen-primary), and as the base layer
    for mivf_menu_draw_top_root below. */
+/* HFIX72: fixed title-zone heights for each background mode, so the button
+   auto-layout below always has a guaranteed collision-free start position
+   regardless of title length or button count. The old generated-fallback
+   layout centered its title at TOP_H/2, which is exactly where the button
+   stack needs to live -- that was the root cause of the title/button
+   overlap. Both modes now confine title+divider to a fixed strip near the
+   top instead. */
+#define MIVF_MENU_TOP_CONTENT_Y_BG 44
+#define MIVF_MENU_TOP_CONTENT_Y_FALLBACK 54
+
 static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
     int title_w;
 
@@ -9378,8 +9389,10 @@ static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
     }
 
     /* Generated "classic_dvd" fallback: dark blue/black vertical gradient,
-       a thin widescreen frame, centered title flanked by small diamond
-       flourishes, thin gold/theme divider, small disc-menu caption. */
+       a thin widescreen frame, title flanked by small diamond flourishes
+       confined to a fixed strip near the top (not screen-centered -- that
+       zone belongs to the button stack now), thin gold/theme divider right
+       below it, small disc-menu caption at the very bottom. */
     for (int yy = 0; yy < TOP_H; yy++) {
         int shade = 4 + (yy * 22) / TOP_H;
         hfix58s_top_rect565(fb, 0, yy, TOP_W, 1, shade / 3, shade / 2, shade + 8);
@@ -9392,14 +9405,15 @@ static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
     hfix58s_top_rect565(fb, 0, 0, 1, TOP_H, 30, 36, 48);
     hfix58s_top_rect565(fb, TOP_W - 1, 0, 1, TOP_H, 30, 36, 48);
 
-    hfix58s_top_rect565(fb, 0, TOP_H / 2 - 1, TOP_W, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-
     title_w = (int)strlen(menu->title) * 6 * 2;
-    hfix58s_top_draw_text_shadow(fb, (TOP_W - title_w) / 2, TOP_H / 2 - 24, menu->title, 2, 235, 245, 255);
+    hfix58s_top_draw_text_shadow(fb, (TOP_W - title_w) / 2, 14, menu->title, 2, 235, 245, 255);
 
-    mivf_menu_top_diamond(fb, (TOP_W - title_w) / 2 - 14, TOP_H / 2 - 17,
+    mivf_menu_top_diamond(fb, (TOP_W - title_w) / 2 - 14, 21,
         g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-    mivf_menu_top_diamond(fb, (TOP_W + title_w) / 2 + 14, TOP_H / 2 - 17,
+    mivf_menu_top_diamond(fb, (TOP_W + title_w) / 2 + 14, 21,
+        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+
+    hfix58s_top_rect565(fb, 0, MIVF_MENU_TOP_CONTENT_Y_FALLBACK - 10, TOP_W, 1,
         g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
 
     hfix58s_top_draw_text_shadow(fb, (TOP_W - (int)strlen("MIVF DISC MENU") * 6) / 2, TOP_H - 20,
@@ -9410,86 +9424,69 @@ static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
    put the interactive menu over the movie/disc art, not on a separate
    panel) -- same visual language as before, redrawn with the hfix58s_top_*
    family instead of the 320-wide bottom-screen helpers. */
-static void mivf_menu_draw_button_top(u8 *fb, const MivfMenuButton *b, bool is_selected, u32 pulse) {
-    int br, bg, bb, alpha;
+/* HFIX72: text-first button rendering -- a label centered at (cx, y), not a
+   full-width app-style box. Non-selected items are just shadowed text;
+   the selected item gets a highlight sized tightly to its own text (not
+   the whole row), a thin gold top/bottom rule, and a small arrow cursor to
+   its left. This is Option A from the layout fix: button rects from
+   .menu.ini are intentionally NOT used for top-screen root positioning --
+   see mivf_menu_load_for_movie's clamp comment and mivf_menu_draw_top_root
+   below. Coordinates are still parsed and clamped for possible future use
+   (a custom/explicit layout mode), just not read here. */
+static void mivf_menu_draw_button_top(u8 *fb, const char *label, int cx, int y, bool enabled, bool is_selected, u32 pulse) {
     int text_r, text_g, text_b;
-    int label_x = b->x + 10;
+    int w = (int)strlen(label) * 6;
+    int x = cx - w / 2;
 
-    if (!b->enabled) {
-        br = 16; bg = 17; bb = 20; alpha = 90;
-        text_r = 90; text_g = 96; text_b = 104;
+    if (!enabled) {
+        text_r = 95; text_g = 100; text_b = 108;
     } else if (is_selected) {
         /* Smooth triangle-wave pulse (0..30..0) instead of a hard sawtooth
            reset, so the glow breathes rather than snapping. */
         u32 phase = pulse % 60u;
         u32 tri = (phase < 30u) ? phase : (60u - phase);
+        enum { PAD_X = 10, PAD_Y = 3, GLYPH_H = 7 };
 
-        br = g_mivf_theme_r; bg = g_mivf_theme_g; bb = g_mivf_theme_b;
-        alpha = 165 + (int)tri;
         text_r = 255; text_g = 250; text_b = 235;
-        label_x += 14;
 
-        /* Outer glow bleed behind the button -- a soft, larger, low-alpha
-           halo reads as "glowing" more than a same-size fill ever can. */
-        hfix58s_top_blend_rect565(fb, b->x - 3, b->y - 3, b->w + 6, b->h + 6,
-            g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 40 + (int)tri / 2);
-    } else {
-        br = 26; bg = 32; bb = 46; alpha = 165;
-        text_r = 205; text_g = 215; text_b = 228;
-    }
+        hfix58s_top_blend_rect565(fb, x - PAD_X, y - PAD_Y, w + PAD_X * 2, GLYPH_H + PAD_Y * 2,
+            g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 60 + (int)tri);
+        hfix58s_top_rect565(fb, x - PAD_X, y - PAD_Y, w + PAD_X * 2, 1, 255, 222, 120);
+        hfix58s_top_rect565(fb, x - PAD_X, y + GLYPH_H + PAD_Y - 1, w + PAD_X * 2, 1, 255, 222, 120);
 
-    hfix58s_top_blend_rect565(fb, b->x, b->y, b->w, b->h, br, bg, bb, alpha);
-
-    if (b->enabled) {
-        hfix58s_top_rect565(fb, b->x, b->y, b->w, 1, br, bg, bb);
-    }
-
-    if (is_selected) {
-        /* Full gold outline, not just a left bar -- reads much more like a
-           real DVD menu's selection frame. */
-        hfix58s_top_rect565(fb, b->x, b->y, b->w, 2, 255, 222, 120);
-        hfix58s_top_rect565(fb, b->x, b->y + b->h - 2, b->w, 2, 255, 222, 120);
-        hfix58s_top_rect565(fb, b->x, b->y, 2, b->h, 255, 222, 120);
-        hfix58s_top_rect565(fb, b->x + b->w - 2, b->y, 2, b->h, 255, 222, 120);
-
-        for (int i = 0; i < 5; i++) {
-            int arm = 5 - i;
-            hfix58s_top_rect565(fb, b->x + 6 + i, b->y + b->h / 2 - arm, 1, arm * 2 + 1, 255, 222, 120);
+        for (int i = 0; i < 4; i++) {
+            int arm = 4 - i;
+            hfix58s_top_rect565(fb, x - PAD_X - 9 + i, y + 3 - arm, 1, arm * 2 + 1, 255, 222, 120);
         }
+    } else {
+        text_r = 195; text_g = 205; text_b = 220;
     }
 
-    hfix58s_top_draw_text_shadow(fb, label_x, b->y + b->h / 2 - 3, b->label, 1, text_r, text_g, text_b);
+    hfix58s_top_draw_text_shadow(fb, x, y, label, 1, text_r, text_g, text_b);
 }
 
-/* Draws the background/title (mivf_menu_draw_top above), then a translucent
-   safe-area panel behind the button stack for legibility over arbitrary
-   background art, then the buttons themselves. This is the new top-screen
-   root menu entry point. */
+/* Draws the background/title (mivf_menu_draw_top above), then the root
+   menu's button stack auto-laid-out as a centered vertical list starting
+   below the fixed title zone -- this is the new top-screen root menu
+   entry point. */
 static void mivf_menu_draw_top_root(u8 *fb, const MivfMenu *menu, u32 pulse) {
-    int panel_x0 = TOP_W;
-    int panel_x1 = 0;
-    int panel_y0 = TOP_H;
-    int panel_y1 = 0;
+    enum { ROW_H = 28, PANEL_W = 260 };
+    int content_y = menu->has_background ? MIVF_MENU_TOP_CONTENT_Y_BG : MIVF_MENU_TOP_CONTENT_Y_FALLBACK;
+    int cx = TOP_W / 2;
 
     mivf_menu_draw_top(fb, menu);
 
+    if (menu->has_background && menu->button_count > 0) {
+        /* Arbitrary background art needs more contrast help than our own
+           designed gradient -- one soft panel behind the whole stack, not
+           per-button boxes. */
+        int panel_h = ROW_H * menu->button_count + 12;
+        hfix58s_top_blend_rect565(fb, (TOP_W - PANEL_W) / 2, content_y - 10, PANEL_W, panel_h, 6, 9, 16, 110);
+    }
+
     for (int i = 0; i < menu->button_count; i++) {
         const MivfMenuButton *b = &menu->buttons[i];
-
-        if (b->x < panel_x0) panel_x0 = b->x;
-        if (b->x + b->w > panel_x1) panel_x1 = b->x + b->w;
-        if (b->y < panel_y0) panel_y0 = b->y;
-        if (b->y + b->h > panel_y1) panel_y1 = b->y + b->h;
-    }
-
-    if (menu->button_count > 0 && panel_x1 > panel_x0 && panel_y1 > panel_y0) {
-        hfix58s_top_blend_rect565(fb, panel_x0 - 10, panel_y0 - 10,
-            (panel_x1 - panel_x0) + 20, (panel_y1 - panel_y0) + 20,
-            6, 9, 16, 130);
-    }
-
-    for (int i = 0; i < menu->button_count; i++) {
-        mivf_menu_draw_button_top(fb, &menu->buttons[i], i == menu->selected, pulse);
+        mivf_menu_draw_button_top(fb, b->label, cx, content_y + i * ROW_H, b->enabled, i == menu->selected, pulse);
     }
 }
 
