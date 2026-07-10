@@ -375,6 +375,7 @@ static AudioState audio;
 
 static u32 g_audio_submit = 0;
 static u32 g_audio_drop = 0;
+static u32 g_audio_wait_events = 0; /* audio_queue_raw_ndsp had to gspWaitForVBlank at least once */
 static u32 g_last_audio_bytes = 0;
 static u32 g_last_audio_samples = 0;
 static bool g_ndsp_ready = false;
@@ -8948,6 +8949,9 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
             g_audio_submit++;
             g_last_audio_bytes = n;
             g_last_audio_samples = nsamples;
+            if (wait > 0) {
+                g_audio_wait_events++;
+            }
 
             return;
         }
@@ -8959,6 +8963,69 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
         No free audio buffer after a bounded wait.
     */
     g_audio_drop++;
+}
+
+/*
+    hfix75: NDSP queue-depth diagnostics. Counts wavebuf slots currently
+    QUEUED or PLAYING (i.e. submitted to the DSP but not yet finished) --
+    this is the actual number of audio frames sitting ahead of what's
+    audible right now, independent of whether submission *rate* or video
+    *pacing* look correct. A steady-state depth of D buffers means audio
+    that was decoded for video frame N doesn't become audible until roughly
+    D * (samples_per_frame / rate) seconds later, which the avsync/drift
+    diagnostics (frame-index and pacing-clock based) cannot see at all.
+*/
+static u32 audio_count_pending_wavebufs(void) {
+    u32 pending = 0;
+
+    for (int i = 0; i < AUDIO_BUFS; i++) {
+        if (audio.buf[i] &&
+            (audio.wb[i].status == NDSP_WBUF_QUEUED || audio.wb[i].status == NDSP_WBUF_PLAYING)) {
+            pending++;
+        }
+    }
+
+    return pending;
+}
+
+static void avsync_audioq_report(u32 video_frame) {
+    u32 pending = audio_count_pending_wavebufs();
+    u32 free_bufs = (u32)AUDIO_BUFS - pending;
+    u32 queued_audio_ms = (audio.rate > 0)
+        ? (u32)(((u64)pending * (u64)audio.samples_per_frame * 1000ull) / audio.rate)
+        : 0;
+
+    printf(
+        "avsync_audioq: video_frame=%lu submit_frame=%lu pending_wavebufs=%lu free_wavebufs=%lu "
+        "queued_audio_ms=%lu audio_submit=%lu audio_drop=%lu audio_wait_events=%lu\n",
+        (unsigned long)video_frame,
+        (unsigned long)g_avsync_first_audio_frame,
+        (unsigned long)pending,
+        (unsigned long)free_bufs,
+        (unsigned long)queued_audio_ms,
+        (unsigned long)g_audio_submit,
+        (unsigned long)g_audio_drop,
+        (unsigned long)g_audio_wait_events);
+}
+
+/* Same ~5s-of-nominal-video-time cadence as avsync_drift_maybe_report, and
+   deliberately reusing its frame-count schedule (g_avsync_drift_next_frame)
+   rather than a second independent counter, so the two lines land together
+   in the log and are trivial to compare side by side. Also fired once
+   immediately after a seek lands (see the call in hfix59r3_present_video_frame
+   right after avsync_drift_reset). */
+static void avsync_audioq_maybe_report(u32 video_frame, bool force) {
+    static u32 last_reported_frame = 0xFFFFFFFFu;
+
+    if (!force && video_frame == last_reported_frame) {
+        return;
+    }
+    if (!force && video_frame < g_avsync_drift_next_frame) {
+        return;
+    }
+
+    avsync_audioq_report(video_frame);
+    last_reported_frame = video_frame;
 }
 
 /*
@@ -9182,9 +9249,11 @@ static void hfix59r3_present_video_frame(
     if (g_avsync_drift_pending_reset || avsync_is_first_video_ever) {
         g_avsync_drift_pending_reset = false;
         avsync_drift_reset(now_tick, shown_frame, fpsn_abs, fpsd_abs);
+        avsync_audioq_maybe_report(shown_frame, true);
     }
 
     avsync_drift_maybe_report(now_tick, shown_frame, fpsn_abs, fpsd_abs);
+    avsync_audioq_maybe_report(shown_frame, false);
 
     if (now_tick > *next_frame_tick + frame_ticks_abs * 2) {
         *next_frame_tick = now_tick + frame_ticks_abs;
