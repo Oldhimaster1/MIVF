@@ -136,6 +136,32 @@ static void mivf_log_close(void) {
     }
 }
 
+/*
+    HFIX72: fflush() on a FILE* backed by the SD card is a real synchronous
+    stall on 3DS hardware -- measured at ~20ms for a single call (via the
+    avsync diagnostics: two svcGetSystemTick() calls with only one printf
+    between them, ~5.3M ticks apart at 268MHz). tee_printf used to fflush on
+    every single call, codebase-wide. During timeline scrubbing in particular,
+    hfix58j_request_preview_seek fires repeatedly as the user drags, and each
+    one printfs (idx: find, audio_delay_ring, etc.) -- turning one scrub
+    gesture into a burst of ~20ms stalls.
+
+    That matters for A/V sync specifically: hfix59r3_present_video_frame's
+    "late" catchup branch silently jumps next_frame_tick forward past any
+    stall of 2+ frame durations, permanently absorbing it -- but NDSP audio
+    is hardware-clocked and does not jump forward the same way. So a printf
+    burst leaves video's presentation clock permanently ahead of audio's
+    real playback position, which matches the reported symptom exactly:
+    sync is fine at the start, and drifts behind after scrubbing/seeking
+    around. This mirrors the exact tradeoff hfix59r3_set_settings_open
+    already documents for settings saves ("saving on every value change +
+    held-key repeat causes SD I/O stalls") -- same fix here: flush
+    periodically instead of on every call. Still durable enough for
+    post-crash log review (loses at most this many trailing lines, plus
+    mivf_log_close() always flushes on clean shutdown).
+*/
+#define TEE_PRINTF_FLUSH_EVERY 16
+
 static int tee_printf(const char *fmt, ...) {
     va_list ap;
 
@@ -144,10 +170,17 @@ static int tee_printf(const char *fmt, ...) {
     va_end(ap);
 
     if (g_mivf_log) {
+        static u32 tee_printf_calls_since_flush = 0;
+
         va_start(ap, fmt);
         vfprintf(g_mivf_log, fmt, ap);
         va_end(ap);
-        fflush(g_mivf_log);
+
+        tee_printf_calls_since_flush++;
+        if (tee_printf_calls_since_flush >= TEE_PRINTF_FLUSH_EVERY) {
+            fflush(g_mivf_log);
+            tee_printf_calls_since_flush = 0;
+        }
     }
 
     return r;
@@ -8663,6 +8696,62 @@ static void avsync_report_seek_if_ready(void) {
     g_avsync_seek_active = false;
 }
 
+/* Periodic drift diagnostics: reports every ~5s of nominal video time
+   (never per-frame -- see HFIX72 above for why hammering printf would
+   perturb the very timing being measured) comparing how much real wall
+   time has elapsed against how much video-nominal time the shown frame
+   count implies. A growing drift_ms means video's presentation clock is
+   running ahead of (negative) or behind (positive) real elapsed time;
+   audio_submit/audio_drop are the existing NDSP submit/drop counters so a
+   queue-starvation cause is visible in the same line. Reset at playback
+   start and after every real seek lands on its first displayed frame. */
+static u64 g_avsync_drift_base_tick = 0;
+static u32 g_avsync_drift_base_frame = 0;
+static u32 g_avsync_drift_next_frame = 0;
+
+static void avsync_drift_reset(u64 now_tick, u32 frame, u32 fpsn, u32 fpsd) {
+    u32 frames_per_report = fpsn ? ((5u * fpsn) / (fpsd ? fpsd : 1u)) : 120u;
+    if (frames_per_report == 0) {
+        frames_per_report = 1u;
+    }
+
+    g_avsync_drift_base_tick = now_tick;
+    g_avsync_drift_base_frame = frame;
+    g_avsync_drift_next_frame = frame + frames_per_report;
+}
+
+static void avsync_drift_maybe_report(u64 now_tick, u32 frame, u32 fpsn, u32 fpsd) {
+    u32 frames_per_report;
+    u32 frame_delta;
+    u64 expected_ms;
+    u64 real_ms;
+    long long drift_ms;
+
+    if (fpsn == 0 || frame < g_avsync_drift_next_frame) {
+        return;
+    }
+
+    frame_delta = frame - g_avsync_drift_base_frame;
+    expected_ms = ((u64)frame_delta * 1000ull * (fpsd ? fpsd : 1u)) / fpsn;
+    real_ms = ticks_to_us(now_tick - g_avsync_drift_base_tick) / 1000u;
+    drift_ms = (long long)real_ms - (long long)expected_ms;
+
+    printf(
+        "avsync: drift video_frame=%lu elapsed_video_ms=%llu real_elapsed_ms=%llu drift_ms=%lld audio_submit=%lu audio_drop=%lu\n",
+        (unsigned long)frame,
+        (unsigned long long)expected_ms,
+        (unsigned long long)real_ms,
+        drift_ms,
+        (unsigned long)g_audio_submit,
+        (unsigned long)g_audio_drop);
+
+    frames_per_report = (5u * fpsn) / (fpsd ? fpsd : 1u);
+    if (frames_per_report == 0) {
+        frames_per_report = 1u;
+    }
+    g_avsync_drift_next_frame = frame + frames_per_report;
+}
+
 /*
     hfix71: manual A/V sync calibration (Settings -> AUDIO SYNC). Holds each
     decoded audio frame's PCM bytes in a small ring for N frames before it
@@ -9076,13 +9165,17 @@ static void hfix59r3_present_video_frame(
         g_avsync_first_video_tick = now_tick;
         g_avsync_first_video_frame = shown_frame;
         avsync_report_start_if_ready();
+        avsync_drift_reset(now_tick, shown_frame, fpsn_abs, fpsd_abs);
     }
 
     if (g_avsync_seek_active && !g_avsync_seek_first_video_seen) {
         g_avsync_seek_first_video_seen = true;
         g_avsync_seek_first_video_frame = shown_frame;
         avsync_report_seek_if_ready();
+        avsync_drift_reset(now_tick, shown_frame, fpsn_abs, fpsd_abs);
     }
+
+    avsync_drift_maybe_report(now_tick, shown_frame, fpsn_abs, fpsd_abs);
 
     if (now_tick > *next_frame_tick + frame_ticks_abs * 2) {
         *next_frame_tick = now_tick + frame_ticks_abs;
