@@ -663,13 +663,42 @@ def collect_seek_index_data(mivf_path: Path) -> SeekIndexData:
     )
 
 
-def build_hfix58j_payload(file_size: int, first_offset: int, total_frames: int, seek_points: list[tuple[int, int]]) -> bytes:
+def build_hfix58j_payload(
+    file_size: int,
+    first_offset: int,
+    total_frames: int,
+    seek_points: list[tuple[int, int]],
+    include_total_frames_field: bool = False,
+) -> bytes:
+    """Builds the on-disk seek-index payload.
+
+    IMPORTANT -- there are currently two different C-side readers for this
+    payload in source/main.c, and as of this writing they expect two
+    different header layouts. Check both again before changing this:
+
+    - Sidecar .idx files are read by hfix58j_try_load_seek_cache, which
+      expects a 24-byte header with NO total_frames field: magic, version,
+      file_size, first_offset, count, then records (total_frames is
+      recomputed by that reader from the max frame seen in the records).
+      Use include_total_frames_field=False (the default) for sidecar
+      output -- this was the actual bug: this builder used to always
+      include total_frames, so the reader read total_frames where it
+      expected count and rejected every generated sidecar.
+
+    - The embedded MIDX footer is read by a *different* function,
+      hfix58f_try_load_embedded_index, which has NOT been updated and
+      still expects the OLD 28-byte header WITH total_frames before
+      count. Use include_total_frames_field=True there so the embedded
+      path keeps working exactly as it does today. Unifying the two
+      readers onto one format is a separate, player-code change.
+    """
     payload = bytearray()
     payload += struct.pack("<I", HFIX58J_IDX_MAGIC)
     payload += struct.pack("<I", HFIX58J_IDX_VERSION)
     payload += struct.pack("<Q", file_size)
     payload += struct.pack("<I", first_offset)
-    payload += struct.pack("<I", total_frames)
+    if include_total_frames_field:
+        payload += struct.pack("<I", total_frames)
     payload += struct.pack("<I", len(seek_points))
 
     # Record layout must match player's Hfix58FSeekPoint ABI:
@@ -708,9 +737,18 @@ def append_embedded_seek_index(mivf_path: Path, seek_data: SeekIndexData) -> dic
     base_size = mivf_path.stat().st_size
 
     # Payload length is independent of file_size field, so compute final size in 2 passes.
-    payload_probe = build_hfix58j_payload(base_size, seek_data.first_offset, seek_data.total_frames, seek_data.seek_points)
+    # include_total_frames_field=True: the embedded-footer reader
+    # (hfix58f_try_load_embedded_index) still expects the old 28-byte
+    # header -- see build_hfix58j_payload's docstring.
+    payload_probe = build_hfix58j_payload(
+        base_size, seek_data.first_offset, seek_data.total_frames, seek_data.seek_points,
+        include_total_frames_field=True,
+    )
     final_size = base_size + len(payload_probe) + MIVF_EMBED_IDX_FOOTER_SIZE
-    payload = build_hfix58j_payload(final_size, seek_data.first_offset, seek_data.total_frames, seek_data.seek_points)
+    payload = build_hfix58j_payload(
+        final_size, seek_data.first_offset, seek_data.total_frames, seek_data.seek_points,
+        include_total_frames_field=True,
+    )
 
     index_offset = base_size
     index_size = len(payload)
