@@ -8711,6 +8711,8 @@ static u32 g_avsync_drift_base_frame = 0;
 static u32 g_avsync_drift_next_frame = 0;
 static bool g_avsync_drift_pending_reset = false;
 
+static u32 g_avsync_audioq_next_frame = 0;
+
 static void avsync_drift_reset(u64 now_tick, u32 frame, u32 fpsn, u32 fpsd) {
     u32 frames_per_report = fpsn ? ((5u * fpsn) / (fpsd ? fpsd : 1u)) : 120u;
     if (frames_per_report == 0) {
@@ -8720,6 +8722,9 @@ static void avsync_drift_reset(u64 now_tick, u32 frame, u32 fpsn, u32 fpsd) {
     g_avsync_drift_base_tick = now_tick;
     g_avsync_drift_base_frame = frame;
     g_avsync_drift_next_frame = frame + frames_per_report;
+    /* Same schedule, but its own counter -- see avsync_audioq_maybe_report
+       for why this can't just read g_avsync_drift_next_frame directly. */
+    g_avsync_audioq_next_frame = frame + frames_per_report;
 }
 
 static void avsync_drift_maybe_report(u64 now_tick, u32 frame, u32 fpsn, u32 fpsd) {
@@ -9015,17 +9020,24 @@ static void avsync_audioq_report(u32 video_frame) {
    immediately after a seek lands (see the call in hfix59r3_present_video_frame
    right after avsync_drift_reset). */
 static void avsync_audioq_maybe_report(u32 video_frame, bool force) {
-    static u32 last_reported_frame = 0xFFFFFFFFu;
-
-    if (!force && video_frame == last_reported_frame) {
-        return;
-    }
-    if (!force && video_frame < g_avsync_drift_next_frame) {
+    if (!force && video_frame < g_avsync_audioq_next_frame) {
         return;
     }
 
     avsync_audioq_report(video_frame);
-    last_reported_frame = video_frame;
+
+    if (!force) {
+        /* Mirrors avsync_drift_maybe_report's own re-arm math so the two
+           stay on the same ~5s cadence without sharing (and each
+           self-consuming) a single counter. */
+        u32 fpsn = g_hfix59r2_video_fps_num ? g_hfix59r2_video_fps_num : 30u;
+        u32 fpsd = g_hfix59r2_video_fps_den ? g_hfix59r2_video_fps_den : 1u;
+        u32 frames_per_report = (5u * fpsn) / fpsd;
+        if (frames_per_report == 0) {
+            frames_per_report = 1u;
+        }
+        g_avsync_audioq_next_frame = video_frame + frames_per_report;
+    }
 }
 
 /*
