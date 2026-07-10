@@ -228,6 +228,21 @@ typedef struct {
 static MivfChapter g_mivf_chapters[MIVF_CHAP_MAX];
 static int g_mivf_chapters_count = 0;
 
+/* hfix84: chapter thumbnails, loaded from a ".chapthumbs" sidecar (see
+   tools/mivf_build_chapter_thumbs.py) -- generated once on a PC from the
+   original source video at each chapter's timestamp, not decoded on-device.
+   Deliberately no player-side decode-and-downscale path: this codebase has
+   already hit real, hard-to-diagnose-without-hardware issues from clever
+   framebuffer/decode tricks, and a multi-chapter on-device decode would
+   also risk a multi-minute Scene Selection load on a long movie (catchup
+   decode from the nearest seekpoint per chapter). Pre-rendering on a PC
+   matches how real DVD authoring generates scene-selection thumbnails in
+   the first place -- at author time, not at playback time. */
+#define MIVF_CHAPTHUMB_W 96
+#define MIVF_CHAPTHUMB_H 54
+static u16 g_mivf_chapthumbs[MIVF_CHAP_MAX * MIVF_CHAPTHUMB_W * MIVF_CHAPTHUMB_H];
+static int g_mivf_chapthumbs_count = 0;
+
 /* HFIX66: DVD-style MIVF Menu Packs.
    A ".menu.ini" sidecar next to a movie switches its browser-selection entry
    point from immediate playback to a simple DVD-menu-style screen (Play /
@@ -242,7 +257,10 @@ static int g_mivf_chapters_count = 0;
 #define MIVF_MENU_LABEL_MAX 32
 #define MIVF_MENU_ID_MAX 16
 #define MIVF_MENU_TITLE_MAX 64
-#define MIVF_MENU_CHAPTERS_VISIBLE_ROWS 8
+/* hfix84: 6 per page (2x3 thumbnail grid) now, not a text-row count --
+   still the single knob for both pagination math and the on-screen layout
+   (grid when thumbnails are loaded, plain list otherwise), same as before. */
+#define MIVF_MENU_CHAPTERS_VISIBLE_ROWS 6
 
 typedef enum {
     MIVF_MENU_ACTION_NONE = 0,
@@ -267,6 +285,10 @@ typedef struct {
     int button_count;
     int selected;
     MivfMenuButton buttons[MIVF_MENU_MAX_BUTTONS];
+    char movie_path[HFIX58_MAX_PATH]; /* for the last-selection memory (hfix81) */
+    bool has_resume_progress;         /* hfix79: valid bookmark_frame/total_frames below */
+    u32 resume_bookmark_frame;
+    u32 resume_total_frames;
 } MivfMenu;
 
 typedef enum {
@@ -286,6 +308,17 @@ typedef enum {
 
 static MivfLaunchMode g_mivf_launch_mode = MIVF_LAUNCH_DEFAULT;
 static int g_mivf_launch_chapter_index = -1;
+
+/* hfix81: remember the last-highlighted root button / chapter row per movie,
+   in-session only (resets on app restart, like most DVD players' menu
+   cursor memory) -- not written to settings.ini, since this is transient UI
+   state, not a user preference. Keyed by movie_path so switching files (or
+   coming back to one after browsing others) doesn't show a stale cursor
+   position from an unrelated title. */
+static char g_mivf_menu_last_path[HFIX58_MAX_PATH] = {0};
+static int  g_mivf_menu_last_button = -1;
+static bool g_mivf_menu_last_in_chapters = false;
+static int  g_mivf_menu_last_chapter = 0;
 
 /* Raw RGB565 top-screen-sized (400x240) still background, distinct from the
    browser's small preview ".cover" thumbnail (88x50) -- different extension,
@@ -9882,6 +9915,74 @@ static void hfix60_chapters_load(const char *video_path, u32 fpsn, u32 fpsd) {
     fclose(fp);
 }
 
+/* hfix84: load the ".chapthumbs" sidecar written by
+   tools/mivf_build_chapter_thumbs.py. Format (little-endian), 16-byte header:
+     bytes 0..3   "MCTH"
+     u32          version (only 1 defined)
+     u32          count
+     u16          thumb_w
+     u16          thumb_h
+     count * (thumb_w * thumb_h) u16 RGB565LE pixels, one thumbnail per
+     chapter, in chapter order.
+   Deliberately strict: any mismatch (wrong magic/version/dimensions, count
+   that doesn't match the already-loaded .chapters list, short read) just
+   leaves g_mivf_chapthumbs_count at 0 and the Scene Selection screen falls
+   back to its existing text-only rendering -- a stale or hand-edited
+   sidecar must never show the wrong thumbnail next to a chapter. */
+static void mivf_menu_load_chapter_thumbs(const char *video_path) {
+    char path[HFIX58_MAX_PATH];
+    FILE *fp;
+    u8 hdr[16];
+    u32 version, count;
+    u16 w, h;
+    size_t need;
+
+    g_mivf_chapthumbs_count = 0;
+
+    if (!video_path || !*video_path || g_mivf_chapters_count <= 0) {
+        return;
+    }
+
+    hfix60_make_sidecar_path(path, sizeof(path), video_path, ".chapthumbs");
+    if (!path[0]) {
+        return;
+    }
+
+    fp = fopen(path, "rb");
+    if (!fp) {
+        return;
+    }
+
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) ||
+        memcmp(hdr, "MCTH", 4) != 0) {
+        fclose(fp);
+        return;
+    }
+
+    version = le32(hdr + 4);
+    count = le32(hdr + 8);
+    w = (u16)le16(hdr + 12);
+    h = (u16)le16(hdr + 14);
+
+    if (version != 1 ||
+        w != MIVF_CHAPTHUMB_W || h != MIVF_CHAPTHUMB_H ||
+        count == 0 || count > (u32)MIVF_CHAP_MAX ||
+        count != (u32)g_mivf_chapters_count) {
+        fclose(fp);
+        return;
+    }
+
+    need = (size_t)count * (size_t)MIVF_CHAPTHUMB_W * (size_t)MIVF_CHAPTHUMB_H * sizeof(u16);
+    if (fread(g_mivf_chapthumbs, 1, need, fp) != need) {
+        fclose(fp);
+        g_mivf_chapthumbs_count = 0;
+        return;
+    }
+
+    fclose(fp);
+    g_mivf_chapthumbs_count = (int)count;
+}
+
 /* HFIX60: jump to the previous (dir<0) or next (dir>0) chapter. */
 static void hfix60_chapter_jump(int dir, u32 cur_frame) {
     int target = -1;
@@ -10217,6 +10318,54 @@ static char *mivf_menu_ini_trim(char *s) {
     return s;
 }
 
+/* hfix79: cheap standalone total-frame-count probe for the resume progress
+   bar. Reads only the 64-byte header + stream descriptors (read_header/
+   read_stream, the same parse play() itself uses) -- no page/packet scan, no
+   seek-index build, just enough to get duration + video fps. This is the
+   same total-frames formula hfix58f_total_frames() uses during real
+   playback, duplicated here (rather than called) because that function is
+   defined later in this file and depends on play()-time globals that
+   haven't been populated yet at menu-load time. */
+static u32 mivf_menu_probe_total_frames(const char *movie_path) {
+    FILE *f = fopen(movie_path, "rb");
+    Header h;
+    u32 fpsn = 0;
+    u32 fpsd = 1;
+
+    if (!f) {
+        return 0;
+    }
+
+    if (read_header(f, &h) != 0) {
+        fclose(f);
+        return 0;
+    }
+
+    for (u32 i = 0; i < h.streams; i++) {
+        Stream s;
+
+        if (read_stream(f, &s) != 0) {
+            break;
+        }
+        if (s.type == 1 && fpsn == 0) {
+            fpsn = s.fpsn;
+            fpsd = s.fpsd ? s.fpsd : 1;
+        }
+    }
+
+    fclose(f);
+
+    if (h.duration == 0 || fpsn == 0) {
+        return 0;
+    }
+
+    {
+        u64 den = 30000ull * (u64)fpsd;
+        u64 frames = (h.duration * (u64)fpsn + den - 1) / den;
+        return (frames > 0xffffffffull) ? 0xffffffffu : (u32)frames;
+    }
+}
+
 /* Only a safe subset is parsed: [MIVF_MENU]'s title=, and [BUTTON id]
    sections' label=/x=/y=/w=/h=/action=. Unrecognized keys (background=,
    style=, up=/down=/etc. from the wider spec) are intentionally ignored for
@@ -10230,6 +10379,7 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
 
     memset(menu, 0, sizeof(*menu));
     menu->selected = -1;
+    snprintf(menu->movie_path, sizeof(menu->movie_path), "%s", movie_path);
 
     hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".menu.ini");
     if (!path[0]) {
@@ -10368,8 +10518,10 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
 
         if (have_chapters_sidecar) {
             hfix60_chapters_load(movie_path, 30, 1);
+            mivf_menu_load_chapter_thumbs(movie_path);
         } else {
             g_mivf_chapters_count = 0;
+            g_mivf_chapthumbs_count = 0;
         }
 
         for (int i = 0; i < menu->button_count; i++) {
@@ -10380,6 +10532,19 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
             }
             if (b->action == MIVF_MENU_ACTION_CHAPTERS && g_mivf_chapters_count <= 0) {
                 b->enabled = false;
+            }
+        }
+
+        /* hfix79: resume progress bar data. Only bother probing total_frames
+           (a real file open + header/stream parse) when there's actually a
+           bookmark to show progress for. */
+        if (have_bookmark) {
+            u32 total = mivf_menu_probe_total_frames(movie_path);
+
+            if (total > 1 && bookmark.frame < total) {
+                menu->resume_bookmark_frame = bookmark.frame;
+                menu->resume_total_frames = total;
+                menu->has_resume_progress = true;
             }
         }
     }
@@ -10414,15 +10579,74 @@ static void mivf_menu_top_diamond(u8 *fb, int cx, int cy, int r, int g, int b) {
 #define MIVF_MENU_TOP_CONTENT_Y_BG 44
 #define MIVF_MENU_TOP_CONTENT_Y_FALLBACK 54
 
-static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
+/* hfix82: slow "Ken Burns" zoom+pan loop over the existing still background
+   -- no new decode pipeline, no higher-res source art needed. Zooms in by
+   shrinking the sampled window (integer math) and drifts the window's
+   center within the margin the zoom creates, easing via triangle waves
+   (same idiom already used for the button-select pulse glow elsewhere in
+   this file) rather than pulling in sin/cos for a purely cosmetic effect.
+   Zoom and pan use deliberately different periods so the motion doesn't
+   read as a mechanical loop. */
+#define MIVF_MENU_BG_ZOOM_PERIOD 240  /* frames for one zoom in+out cycle */
+#define MIVF_MENU_BG_PAN_PERIOD  360  /* frames for one pan cycle */
+#define MIVF_MENU_BG_ZOOM_PCT    10   /* max zoom-in, percent, each side */
+
+static void mivf_menu_draw_background_animated(u8 *fb, u32 pulse) {
+    u32 zoom_phase = pulse % MIVF_MENU_BG_ZOOM_PERIOD;
+    u32 zoom_half = MIVF_MENU_BG_ZOOM_PERIOD / 2;
+    u32 zoom_tri = (zoom_phase < zoom_half) ? zoom_phase : (MIVF_MENU_BG_ZOOM_PERIOD - zoom_phase);
+    int margin_x = (int)(((u64)(MIVF_MENU_BG_W * MIVF_MENU_BG_ZOOM_PCT / 100) * zoom_tri) / zoom_half);
+    int margin_y = (int)(((u64)(MIVF_MENU_BG_H * MIVF_MENU_BG_ZOOM_PCT / 100) * zoom_tri) / zoom_half);
+
+    u32 pan_phase = pulse % MIVF_MENU_BG_PAN_PERIOD;
+    u32 pan_half = MIVF_MENU_BG_PAN_PERIOD / 2;
+    long pan_tri = (long)((pan_phase < pan_half) ? pan_phase : (MIVF_MENU_BG_PAN_PERIOD - pan_phase));
+    /* -1..+1 triangle wave (scaled by margin) so pan never exceeds the crop
+       margin the current zoom level allows. */
+    int pan_x = (margin_x > 0)
+        ? (int)(((long)margin_x * (2 * pan_tri - (long)pan_half)) / (long)pan_half)
+        : 0;
+    int pan_y = (margin_y > 0) ? -(pan_x / 2) : 0; /* cheap diagonal drift, reusing pan_x's phase */
+
+    int src_x0 = margin_x + pan_x;
+    int src_y0 = margin_y + pan_y;
+    int src_w = MIVF_MENU_BG_W - 2 * margin_x;
+    int src_h = MIVF_MENU_BG_H - 2 * margin_y;
+
+    if (src_w <= 0 || src_w > MIVF_MENU_BG_W || src_h <= 0 || src_h > MIVF_MENU_BG_H) {
+        src_x0 = 0;
+        src_y0 = 0;
+        src_w = MIVF_MENU_BG_W;
+        src_h = MIVF_MENU_BG_H;
+    }
+    if (src_x0 < 0) {
+        src_x0 = 0;
+    }
+    if (src_y0 < 0) {
+        src_y0 = 0;
+    }
+    if (src_x0 + src_w > MIVF_MENU_BG_W) {
+        src_x0 = MIVF_MENU_BG_W - src_w;
+    }
+    if (src_y0 + src_h > MIVF_MENU_BG_H) {
+        src_y0 = MIVF_MENU_BG_H - src_h;
+    }
+
+    for (int yy = 0; yy < MIVF_MENU_BG_H; yy++) {
+        int sy = src_y0 + (yy * src_h) / MIVF_MENU_BG_H;
+
+        for (int xx = 0; xx < MIVF_MENU_BG_W; xx++) {
+            int sx = src_x0 + (xx * src_w) / MIVF_MENU_BG_W;
+            hfix58s_top_px565(fb, xx, yy, g_mivf_menu_bg[(size_t)sy * MIVF_MENU_BG_W + sx]);
+        }
+    }
+}
+
+static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu, u32 pulse) {
     int title_w;
 
     if (menu->has_background) {
-        for (int yy = 0; yy < MIVF_MENU_BG_H; yy++) {
-            for (int xx = 0; xx < MIVF_MENU_BG_W; xx++) {
-                hfix58s_top_px565(fb, xx, yy, g_mivf_menu_bg[(size_t)yy * MIVF_MENU_BG_W + xx]);
-            }
-        }
+        mivf_menu_draw_background_animated(fb, pulse);
 
         /* Title bar with a soft drop edge, and a matching footer-safe bar so
            any background art still leaves the top/bottom text legible. */
@@ -10523,7 +10747,7 @@ static void mivf_menu_draw_top_root(u8 *fb, const MivfMenu *menu, u32 pulse) {
     int content_y = menu->has_background ? MIVF_MENU_TOP_CONTENT_Y_BG : MIVF_MENU_TOP_CONTENT_Y_FALLBACK;
     int cx = TOP_W / 2;
 
-    mivf_menu_draw_top(fb, menu);
+    mivf_menu_draw_top(fb, menu, pulse);
 
     if (menu->has_background && menu->button_count > 0) {
         /* Arbitrary background art needs more contrast help than our own
@@ -10609,21 +10833,53 @@ static void mivf_menu_draw_info_bottom(u8 *fb, const MivfMenu *menu) {
 
         snprintf(info, sizeof(info), "%s", have_bookmark_hint ? "RESUME AVAILABLE" : "NO SAVED PROGRESS");
         hfix58_draw_text_shadow(fb, 18, 114, info, 1, 170, 190, 210);
+
+        /* hfix79: resume progress bar -- how far into the movie the saved
+           bookmark sits, instead of just a yes/no hint. */
+        if (menu->has_resume_progress && menu->resume_total_frames > 0) {
+            enum { BAR_X = 18, BAR_Y = 124, BAR_W = 200, BAR_H = 5 };
+            int fill_w = (int)(((u64)menu->resume_bookmark_frame * (u64)BAR_W) / (u64)menu->resume_total_frames);
+
+            if (fill_w < 0) {
+                fill_w = 0;
+            }
+            if (fill_w > BAR_W) {
+                fill_w = BAR_W;
+            }
+
+            hfix58_rect565(fb, BAR_X, BAR_Y, BAR_W, BAR_H, 20, 28, 42);
+            if (fill_w > 0) {
+                hfix58_rect565(fb, BAR_X, BAR_Y, fill_w, BAR_H, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+            }
+        }
     }
 
     if (g_mivf_chapters_count > 0) {
         char info[32];
 
         snprintf(info, sizeof(info), "%d SCENES", g_mivf_chapters_count);
-        hfix58_draw_text_shadow(fb, 18, 130, info, 1, 170, 190, 210);
+        hfix58_draw_text_shadow(fb, 18, 138, info, 1, 170, 190, 210);
     }
 
     hfix58_draw_text_shadow(fb, 18, 190, "D-PAD MOVE", 1, 150, 170, 195);
     hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
 }
 
+/* hfix84: blits one chapter's pre-rendered thumbnail (see
+   mivf_menu_load_chapter_thumbs) at (x0,y0) on the bottom screen. */
+static void mivf_menu_blit_chapthumb(u8 *fb, int x0, int y0, int chapter_idx) {
+    const u16 *src = &g_mivf_chapthumbs[(size_t)chapter_idx * MIVF_CHAPTHUMB_W * MIVF_CHAPTHUMB_H];
+
+    for (int yy = 0; yy < MIVF_CHAPTHUMB_H; yy++) {
+        for (int xx = 0; xx < MIVF_CHAPTHUMB_W; xx++) {
+            hfix58_px565(fb, x0 + xx, y0 + yy, src[(size_t)yy * MIVF_CHAPTHUMB_W + xx]);
+        }
+    }
+}
+
 static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
     enum { ROW_H = 22 };
+    bool have_thumbs = (g_mivf_chapthumbs_count > 0) && (g_mivf_chapthumbs_count == g_mivf_chapters_count);
     int start = 0;
     int page;
     int total_pages;
@@ -10644,20 +10900,54 @@ static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
 
     mivf_menu_draw_panel_header(fb, "SCENE SELECTION", page, total_pages);
 
-    for (int row = 0; row < MIVF_MENU_CHAPTERS_VISIBLE_ROWS && (start + row) < g_mivf_chapters_count; row++) {
-        int idx = start + row;
-        int y = 38 + row * ROW_H;
-        bool sel = (idx == selected);
-        char line[64];
+    if (have_thumbs) {
+        enum { COLS = 2, ITEM_W = 134, ITEM_H = 56, GAP_X = 8, GAP_Y = 4, GRID_X0 = 18, GRID_Y0 = 38 };
 
-        if (sel) {
-            hfix58_blend_rect565(fb, 18, y - 2, 284, 20, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 170);
-            hfix58_rect565(fb, 18, y - 2, 2, 20, 255, 222, 120);
+        for (int slot = 0; slot < MIVF_MENU_CHAPTERS_VISIBLE_ROWS && (start + slot) < g_mivf_chapters_count; slot++) {
+            int idx = start + slot;
+            int col = slot % COLS;
+            int row = slot / COLS;
+            int item_x = GRID_X0 + col * (ITEM_W + GAP_X);
+            int item_y = GRID_Y0 + row * (ITEM_H + GAP_Y);
+            int thumb_x = item_x + (ITEM_W - MIVF_CHAPTHUMB_W) / 2;
+            int thumb_y = item_y + (ITEM_H - MIVF_CHAPTHUMB_H) / 2;
+            bool sel = (idx == selected);
+            char label[24];
+
+            hfix58_rect565(fb, item_x, item_y, ITEM_W, ITEM_H, 8, 12, 20);
+            mivf_menu_blit_chapthumb(fb, thumb_x, thumb_y, idx);
+
+            /* Translucent label strip across the thumbnail's own bottom
+               edge -- chapter number + short title, like real DVD
+               scene-select grids, instead of a separate text row. */
+            hfix58_blend_rect565(fb, thumb_x, thumb_y + MIVF_CHAPTHUMB_H - 14,
+                MIVF_CHAPTHUMB_W, 14, 0, 0, 0, 170);
+            snprintf(label, sizeof(label), "%d. %.16s", idx + 1, g_mivf_chapters[idx].label);
+            hfix58_draw_text_shadow(fb, thumb_x + 3, thumb_y + MIVF_CHAPTHUMB_H - 11, label, 1, 230, 235, 245);
+
+            if (sel) {
+                hfix58_rect565(fb, thumb_x - 2, thumb_y - 2, MIVF_CHAPTHUMB_W + 4, 2, 255, 222, 120);
+                hfix58_rect565(fb, thumb_x - 2, thumb_y + MIVF_CHAPTHUMB_H, MIVF_CHAPTHUMB_W + 4, 2, 255, 222, 120);
+                hfix58_rect565(fb, thumb_x - 2, thumb_y - 2, 2, MIVF_CHAPTHUMB_H + 4, 255, 222, 120);
+                hfix58_rect565(fb, thumb_x + MIVF_CHAPTHUMB_W, thumb_y - 2, 2, MIVF_CHAPTHUMB_H + 4, 255, 222, 120);
+            }
         }
+    } else {
+        for (int row = 0; row < MIVF_MENU_CHAPTERS_VISIBLE_ROWS && (start + row) < g_mivf_chapters_count; row++) {
+            int idx = start + row;
+            int y = 38 + row * ROW_H;
+            bool sel = (idx == selected);
+            char line[64];
 
-        snprintf(line, sizeof(line), "%d. %.36s", idx + 1, g_mivf_chapters[idx].label);
-        hfix58_draw_text_shadow(fb, 26, y, line, 1,
-            sel ? 255 : 200, sel ? 250 : 210, sel ? 235 : 220);
+            if (sel) {
+                hfix58_blend_rect565(fb, 18, y - 2, 284, 20, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 170);
+                hfix58_rect565(fb, 18, y - 2, 2, 20, 255, 222, 120);
+            }
+
+            snprintf(line, sizeof(line), "%d. %.36s", idx + 1, g_mivf_chapters[idx].label);
+            hfix58_draw_text_shadow(fb, 26, y, line, 1,
+                sel ? 255 : 200, sel ? 250 : 210, sel ? 235 : 220);
+        }
     }
 
     if (total_pages > 1) {
@@ -10667,24 +10957,261 @@ static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* HFIX80: DVD menu sound effects                                            */
+/* ------------------------------------------------------------------------- */
+/*
+    Movie audio (audio_queue_raw_ndsp/AudioState) exclusively uses NDSP
+    channel 0, and only exists once play() calls audio_init_from_stream --
+    the menu runs before that, so channel 0 isn't configured yet. Menu SFX
+    uses channel 1 instead, which nothing else in this codebase ever touches
+    (grep confirms it), so there's no interaction with movie playback audio
+    at all, in either direction.
+
+    Tones are synthesized once, procedurally (sine + linear decay envelope,
+    using the same integer/triangle-wave idioms already used elsewhere in
+    this file rather than pulling in <math.h> for a one-shot need) -- no new
+    asset files, no MASB/encoder changes, nothing to ship or embed.
+*/
+#define MENU_SFX_CHANNEL 1
+#define MENU_SFX_RATE    22050
+#define MENU_SFX_RING    3   /* rotating wavebuf headers per tone, so a fast
+                                double-tap (D-pad auto-repeat) can't try to
+                                reuse a wavebuf still QUEUED/PLAYING */
+
+/* Quarter-sine lookup (0..90 degrees, 256 steps, Q15) -- enough resolution
+   for an audio envelope/tone and avoids <math.h> for a single use site. */
+static const s16 g_menu_sfx_qsin[257] = {
+    0,201,402,603,804,1005,1206,1407,1608,1809,2009,2210,2410,2611,2811,3011,
+    3211,3410,3610,3809,4008,4206,4405,4603,4801,4999,5196,5393,5590,5787,5983,6179,
+    6374,6569,6764,6958,7152,7346,7539,7731,7923,8115,8306,8496,8687,8876,9065,9254,
+    9441,9629,9815,10001,10187,10371,10555,10739,10921,11103,11284,11464,11644,11823,12001,12178,
+    12355,12530,12705,12879,13052,13224,13395,13565,13735,13903,14071,14237,14403,14567,14731,14893,
+    15055,15215,15375,15533,15690,15847,16002,16156,16309,16461,16612,16761,16910,17057,17203,17348,
+    17491,17634,17775,17915,18053,18191,18327,18461,18595,18727,18857,18987,19115,19241,19366,19490,
+    19612,19733,19853,19971,20087,20202,20315,20427,20538,20647,20754,20860,20964,21067,21168,21268,
+    21365,21462,21556,21649,21741,21830,21918,22004,22089,22172,22253,22332,22409,22485,22559,22631,
+    22701,22770,22836,22901,22964,23025,23085,23142,23198,23252,23304,23354,23402,23449,23493,23536,
+    23576,23615,23652,23687,23720,23751,23780,23807,23832,23855,23877,23896,23913,23929,23942,23954,
+    23963,23971,23977,23980,23982,23982,23980,23976,23970,23962,23952,23940,23927,23911,23893,23874,
+    23852,23829,23803,23776,23747,23716,23683,23648,23611,23572,23532,23489,23445,23399,23351,23301,
+    23249,23196,23140,23083,23024,22963,22901,22836,22770,22702,22633,22561,22488,22413,22337,22258,
+    22178,22096,22013,21927,21840,21751,21661,21569,21475,21379,21282,21183,21083,20981,20877,20772,
+    20665,20557,20447,20335,20222,20108,19992,19875,19756,19636,19514,19391,19266,19140,19013,18884,
+    18754
+};
+
+static s16 menu_sfx_sin_q15(u32 phase_deg_x4) {
+    u32 wrapped = phase_deg_x4 % 1440u; /* 360 degrees, quarter-degree steps */
+    u32 quarter = wrapped / 360u;       /* which 90-degree quadrant (0..3) */
+    u32 rem = wrapped % 360u;           /* 0..359, quarter-degree steps within quadrant -> 0..256 index */
+    u32 idx = rem * 256u / 360u;
+    s32 v = g_menu_sfx_qsin[idx];
+
+    if (quarter == 1) v = g_menu_sfx_qsin[256 - idx];
+    else if (quarter == 2) v = -(s32)g_menu_sfx_qsin[idx];
+    else if (quarter == 3) v = -(s32)g_menu_sfx_qsin[256 - idx];
+
+    return (s16)v;
+}
+
+typedef struct {
+    s16 *data;
+    u32 nsamples;
+    ndspWaveBuf wb[MENU_SFX_RING];
+    int next;
+} MenuSfxTone;
+
+static MenuSfxTone g_menu_sfx_move;
+static MenuSfxTone g_menu_sfx_select;
+static MenuSfxTone g_menu_sfx_back;
+static bool g_menu_sfx_ready = false;
+
+/* freq_start/end in Hz, ms duration, decay_shift controls how fast the
+   envelope falls off (higher = shorter/snappier). Allocates from linear
+   memory since NDSP DMAs directly from it, matching audio_queue_raw_ndsp's
+   own buffers. */
+static bool menu_sfx_synth(MenuSfxTone *tone, int freq_start, int freq_end, int ms, int decay_shift) {
+    u32 n = (u32)((MENU_SFX_RATE * ms) / 1000);
+
+    if (n == 0) {
+        return false;
+    }
+
+    tone->data = (s16*)linearAlloc(n * sizeof(s16));
+    if (!tone->data) {
+        return false;
+    }
+
+    for (u32 i = 0; i < n; i++) {
+        /* Linear frequency sweep from freq_start to freq_end over the tone. */
+        int freq = freq_start + (int)(((s64)(freq_end - freq_start) * (s64)i) / (s64)n);
+        u32 phase = (u32)(((u64)i * (u64)freq * 1440ull) / (u64)MENU_SFX_RATE);
+        s32 sample = menu_sfx_sin_q15(phase);
+
+        /* Simple exponential-ish decay via repeated halving, cheap and
+           avoids float entirely: envelope = 32768 >> (i * decay_shift / n). */
+        u32 decay_steps = (u32)(((u64)i * (u64)decay_shift) / (u64)n);
+        s32 env = (decay_steps < 15) ? (32768 >> decay_steps) : 1;
+
+        tone->data[i] = (s16)((sample * env) >> 15);
+    }
+
+    tone->nsamples = n;
+    tone->next = 0;
+    for (int i = 0; i < MENU_SFX_RING; i++) {
+        memset(&tone->wb[i], 0, sizeof(ndspWaveBuf));
+    }
+
+    DSP_FlushDataCache(tone->data, n * sizeof(s16));
+    return true;
+}
+
+static void menu_sfx_init(void) {
+    if (g_menu_sfx_ready || !g_ndsp_ready) {
+        return;
+    }
+
+    ndspChnReset(MENU_SFX_CHANNEL);
+    ndspChnSetInterp(MENU_SFX_CHANNEL, NDSP_INTERP_LINEAR);
+    ndspChnSetFormat(MENU_SFX_CHANNEL, NDSP_FORMAT_MONO_PCM16);
+    ndspChnSetRate(MENU_SFX_CHANNEL, (float)MENU_SFX_RATE);
+
+    float mix[12];
+    memset(mix, 0, sizeof(mix));
+    mix[0] = 0.5f;
+    mix[1] = 0.5f;
+    ndspChnSetMix(MENU_SFX_CHANNEL, mix);
+
+    bool ok = true;
+    ok = menu_sfx_synth(&g_menu_sfx_move, 1400, 1500, 40, 9) && ok;
+    ok = menu_sfx_synth(&g_menu_sfx_select, 900, 1500, 130, 6) && ok;
+    ok = menu_sfx_synth(&g_menu_sfx_back, 1100, 700, 90, 7) && ok;
+
+    g_menu_sfx_ready = ok;
+}
+
+static void menu_sfx_play(MenuSfxTone *tone) {
+    if (!g_menu_sfx_ready || !tone->data) {
+        return;
+    }
+
+    ndspWaveBuf *wb = &tone->wb[tone->next];
+
+    if (wb->status != NDSP_WBUF_FREE && wb->status != NDSP_WBUF_DONE) {
+        /* All ring slots busy (extremely fast repeat presses) -- drop this
+           one rather than corrupt a wavebuf still in flight. */
+        return;
+    }
+
+    memset(wb, 0, sizeof(*wb));
+    wb->data_pcm16 = tone->data;
+    wb->nsamples = tone->nsamples;
+    wb->looping = false;
+    ndspChnWaveBufAdd(MENU_SFX_CHANNEL, wb);
+
+    tone->next = (tone->next + 1) % MENU_SFX_RING;
+}
+
+static void menu_sfx_move(void)   { menu_sfx_play(&g_menu_sfx_move); }
+static void menu_sfx_select(void) { menu_sfx_play(&g_menu_sfx_select); }
+static void menu_sfx_back(void)   { menu_sfx_play(&g_menu_sfx_back); }
+
+/* hfix83: fade transitions. Redraws the CURRENT menu state fresh each step
+   (not just darkening whatever's already in the framebuffer), so this makes
+   no assumption about double/triple buffering -- same principle as the
+   existing autodim overlay (hfix59r3_dim_bottom_framebuffer), just animated
+   instead of a single fixed dim level. fade_alpha follows that same
+   function's blend convention: 255 = fully black, 0 = no effect. */
+static void mivf_menu_render_frame(const MivfMenu *menu, bool in_chapters, int chapter_selected, u32 pulse, int fade_alpha) {
+    u16 fw = 0, fh = 0;
+    u8 *fb_top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
+    u8 *fb_bot = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+
+    if (fb_top) {
+        if (in_chapters) {
+            mivf_menu_draw_top(fb_top, menu, pulse);
+        } else {
+            mivf_menu_draw_top_root(fb_top, menu, pulse);
+        }
+        if (fade_alpha > 0) {
+            hfix58s_top_blend_rect565(fb_top, 0, 0, TOP_W, TOP_H, 0, 0, 0, fade_alpha);
+        }
+    }
+
+    if (fb_bot) {
+        if (in_chapters) {
+            mivf_menu_draw_chapters_bottom(fb_bot, chapter_selected);
+        } else {
+            mivf_menu_draw_info_bottom(fb_bot, menu);
+        }
+        if (fade_alpha > 0) {
+            hfix58_blend_rect565(fb_bot, 0, 0, 320, 240, 0, 0, 0, fade_alpha);
+        }
+    }
+
+    gfxFlushBuffers();
+    gfxSwapBuffers();
+    gspWaitForVBlank();
+}
+
+#define MIVF_MENU_FADE_STEPS 10
+
+static void mivf_menu_fade(const MivfMenu *menu, bool in_chapters, int chapter_selected, u32 pulse, bool fade_out) {
+    for (int step = 1; step <= MIVF_MENU_FADE_STEPS; step++) {
+        int t = fade_out ? step : (MIVF_MENU_FADE_STEPS - step);
+        int alpha = (t * 255) / MIVF_MENU_FADE_STEPS;
+        mivf_menu_render_frame(menu, in_chapters, chapter_selected, pulse, alpha);
+    }
+}
+
 /* Runs the interactive menu loop. Returns PLAY once a launch-worthy action
    fires (having set g_mivf_launch_mode/g_mivf_launch_chapter_index as a
    side effect), or BACK to return to the browser without playing anything. */
 static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
+    MivfMenuResult result;
     bool in_chapters = false;
     int chapter_selected = 0;
     u32 pulse = 0;
+    bool have_last;
+
+    menu_sfx_init();
+
+    /* hfix81: restore the last-highlighted button/chapter for this exact
+       movie, if its menu was shown earlier this session. */
+    have_last = (g_mivf_menu_last_path[0] != 0) &&
+        !strcmp(g_mivf_menu_last_path, menu->movie_path);
 
     menu->selected = -1;
-    for (int i = 0; i < menu->button_count; i++) {
-        if (menu->buttons[i].enabled) {
-            menu->selected = i;
-            break;
+    if (have_last && g_mivf_menu_last_button >= 0 &&
+        g_mivf_menu_last_button < menu->button_count &&
+        menu->buttons[g_mivf_menu_last_button].enabled) {
+        menu->selected = g_mivf_menu_last_button;
+    }
+    if (menu->selected < 0) {
+        for (int i = 0; i < menu->button_count; i++) {
+            if (menu->buttons[i].enabled) {
+                menu->selected = i;
+                break;
+            }
         }
     }
     if (menu->selected < 0) {
         menu->selected = 0;
     }
+
+    if (have_last && g_mivf_menu_last_in_chapters && g_mivf_chapters_count > 0) {
+        in_chapters = true;
+        chapter_selected = g_mivf_menu_last_chapter;
+        if (chapter_selected < 0) {
+            chapter_selected = 0;
+        }
+        if (chapter_selected >= g_mivf_chapters_count) {
+            chapter_selected = g_mivf_chapters_count - 1;
+        }
+    }
+
+    mivf_menu_fade(menu, in_chapters, chapter_selected, pulse, false);
 
     while (aptMainLoop()) {
         hidScanInput();
@@ -10694,39 +11221,58 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
         if (in_chapters) {
             if ((down & KEY_DUP) && chapter_selected > 0) {
                 chapter_selected--;
+                menu_sfx_move();
             }
             if ((down & KEY_DDOWN) && chapter_selected < g_mivf_chapters_count - 1) {
                 chapter_selected++;
+                menu_sfx_move();
             }
             if (down & KEY_L) {
+                int prev = chapter_selected;
                 chapter_selected -= MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
                 if (chapter_selected < 0) {
                     chapter_selected = 0;
                 }
+                if (chapter_selected != prev) {
+                    menu_sfx_move();
+                }
             }
             if (down & KEY_R) {
+                int prev = chapter_selected;
                 chapter_selected += MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
                 if (chapter_selected > g_mivf_chapters_count - 1) {
                     chapter_selected = g_mivf_chapters_count - 1;
                 }
+                if (chapter_selected != prev) {
+                    menu_sfx_move();
+                }
             }
             if ((down & KEY_A) && g_mivf_chapters_count > 0) {
+                menu_sfx_select();
                 g_mivf_launch_mode = MIVF_LAUNCH_CHAPTER;
                 g_mivf_launch_chapter_index = chapter_selected;
-                return MIVF_MENU_RESULT_PLAY;
+                result = MIVF_MENU_RESULT_PLAY;
+                goto mivf_menu_exit;
             }
             if (down & (KEY_B | KEY_START)) {
+                menu_sfx_back();
+                mivf_menu_fade(menu, true, chapter_selected, pulse, true);
                 in_chapters = false;
+                mivf_menu_fade(menu, false, 0, pulse, false);
             }
         } else {
             if (down & (KEY_DUP | KEY_DDOWN) && menu->button_count > 0) {
                 int dir = (down & KEY_DUP) ? -1 : 1;
+                int prev = menu->selected;
                 for (int i = 1; i <= menu->button_count; i++) {
                     int idx = ((menu->selected + dir * i) % menu->button_count + menu->button_count) % menu->button_count;
                     if (menu->buttons[idx].enabled) {
                         menu->selected = idx;
                         break;
                     }
+                }
+                if (menu->selected != prev) {
+                    menu_sfx_move();
                 }
             }
 
@@ -10742,17 +11288,26 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
                 if (b->enabled) {
                     switch (b->action) {
                         case MIVF_MENU_ACTION_PLAY:
+                            menu_sfx_select();
                             g_mivf_launch_mode = MIVF_LAUNCH_START_OVER;
-                            return MIVF_MENU_RESULT_PLAY;
+                            result = MIVF_MENU_RESULT_PLAY;
+                            goto mivf_menu_exit;
                         case MIVF_MENU_ACTION_RESUME:
+                            menu_sfx_select();
                             g_mivf_launch_mode = MIVF_LAUNCH_RESUME;
-                            return MIVF_MENU_RESULT_PLAY;
+                            result = MIVF_MENU_RESULT_PLAY;
+                            goto mivf_menu_exit;
                         case MIVF_MENU_ACTION_CHAPTERS:
+                            menu_sfx_select();
+                            mivf_menu_fade(menu, false, 0, pulse, true);
                             in_chapters = true;
                             chapter_selected = 0;
+                            mivf_menu_fade(menu, true, chapter_selected, pulse, false);
                             break;
                         case MIVF_MENU_ACTION_BACK:
-                            return MIVF_MENU_RESULT_BACK;
+                            menu_sfx_back();
+                            result = MIVF_MENU_RESULT_BACK;
+                            goto mivf_menu_exit;
                         default:
                             break;
                     }
@@ -10760,35 +11315,27 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
             }
 
             if (down & (KEY_B | KEY_START)) {
-                return MIVF_MENU_RESULT_BACK;
+                menu_sfx_back();
+                result = MIVF_MENU_RESULT_BACK;
+                goto mivf_menu_exit;
             }
         }
 
-        u16 fw = 0, fh = 0;
-        u8 *fb_top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
-        u8 *fb_bot = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
-
-        if (fb_top) {
-            if (in_chapters) {
-                mivf_menu_draw_top(fb_top, menu);
-            } else {
-                mivf_menu_draw_top_root(fb_top, menu, pulse);
-            }
-        }
-        if (fb_bot) {
-            if (in_chapters) {
-                mivf_menu_draw_chapters_bottom(fb_bot, chapter_selected);
-            } else {
-                mivf_menu_draw_info_bottom(fb_bot, menu);
-            }
-        }
-
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+        mivf_menu_render_frame(menu, in_chapters, chapter_selected, pulse, 0);
     }
 
     return MIVF_MENU_RESULT_BACK;
+
+mivf_menu_exit:
+    /* hfix81: remember where the cursor was, whichever way we're leaving,
+       so the next visit to this same movie's menu resumes there. */
+    snprintf(g_mivf_menu_last_path, sizeof(g_mivf_menu_last_path), "%s", menu->movie_path);
+    g_mivf_menu_last_button = menu->selected;
+    g_mivf_menu_last_in_chapters = in_chapters;
+    g_mivf_menu_last_chapter = chapter_selected;
+
+    mivf_menu_fade(menu, in_chapters, chapter_selected, pulse, true);
+    return result;
 }
 
 static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up) {
