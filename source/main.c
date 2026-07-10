@@ -8919,6 +8919,10 @@ static u32 hfix58j_clamp_seek_target(u32 target_frame) {
 }
 
 static void hfix58j_request_absolute_seek(u32 target_frame) {
+    printf("idx: request target=%lu ready=%d count=%lu large=%d total=%lu\n",
+        (unsigned long)target_frame, g_hfix58f_seek.ready ? 1 : 0,
+        (unsigned long)g_hfix58f_seek.count, g_hfix58f_seek_large_file_mode ? 1 : 0,
+        (unsigned long)g_hfix58f_seek.total_frames);
     target_frame = hfix58j_clamp_seek_target(target_frame);
 
     /* HFIX67: a large file with no real index (g_hfix58f_seek_large_file_mode)
@@ -10174,55 +10178,147 @@ static bool hfix58j_write_u64(FILE *f, u64 v) {
     return fwrite(&v, 1, sizeof(v), f) == sizeof(v);
 }
 
+/* HFIX73: robust .idx diagnostics and sidecar loader.
+   The standalone generator writes a normal sidecar next to the movie
+   (cars.mivf -> cars.idx).  Older code tended to fail silently, which made
+   chapter launches and manual seek look like they were broken menu features.
+   Read the header explicitly and accept both possible on-disk seek-point
+   strides: 16 bytes (ARM padded u32+u64 struct) and 12 bytes (packed). */
 static bool hfix58j_try_load_seek_cache(const char *cache_path, u64 file_size, u32 first_offset) {
-    FILE *cf = fopen(cache_path, "rb");
-    if (!cf) {
+    FILE *fp = NULL;
+    u32 magic = 0, version = 0, count = 0, stored_first = 0;
+    u64 stored_size = 0;
+    long end_pos = 0;
+    long data_bytes = 0;
+    int stride = 0;
+
+    printf("idx: try sidecar %s\n", cache_path ? cache_path : "(null)");
+
+    if (!cache_path || !cache_path[0]) {
+        printf("idx: reject empty path\n");
         return false;
     }
 
-    u32 magic = 0;
-    u32 version = 0;
-    u64 cached_file_size = 0;
-    u32 cached_first = 0;
-    u32 total_frames = 0;
-    u32 count = 0;
-
-    bool ok =
-        hfix58j_read_u32(cf, &magic) &&
-        hfix58j_read_u32(cf, &version) &&
-        hfix58j_read_u64(cf, &cached_file_size) &&
-        hfix58j_read_u32(cf, &cached_first) &&
-        hfix58j_read_u32(cf, &total_frames) &&
-        hfix58j_read_u32(cf, &count);
-
-    if (!ok ||
-        magic != HFIX58J_IDX_MAGIC ||
-        version != HFIX58J_IDX_VERSION ||
-        cached_file_size != file_size ||
-        cached_first != first_offset ||
-        count == 0 ||
-        count > HFIX58F_MAX_SEEK_POINTS) {
-        fclose(cf);
+    fp = fopen(cache_path, "rb");
+    if (!fp) {
+        printf("idx: open failed %s\n", cache_path);
         return false;
     }
 
-    size_t bytes = (size_t)count * sizeof(g_hfix58f_seek.points[0]);
-
-    if (fread(g_hfix58f_seek.points, 1, bytes, cf) != bytes) {
-        fclose(cf);
+    if (fread(&magic, 1, 4, fp) != 4 ||
+        fread(&version, 1, 4, fp) != 4 ||
+        fread(&stored_size, 1, 8, fp) != 8 ||
+        fread(&stored_first, 1, 4, fp) != 4 ||
+        fread(&count, 1, 4, fp) != 4) {
+        printf("idx: reject short header\n");
+        fclose(fp);
         return false;
     }
 
-    fclose(cf);
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        printf("idx: reject fseek end failed\n");
+        fclose(fp);
+        return false;
+    }
+    end_pos = ftell(fp);
+    if (end_pos < 0) {
+        printf("idx: reject ftell failed\n");
+        fclose(fp);
+        return false;
+    }
 
+    printf("idx: hdr magic=%08lx version=%lu stored_size=%llu runtime_size=%llu stored_first=%lu runtime_first=%lu count=%lu bytes=%ld\n",
+        (unsigned long)magic, (unsigned long)version,
+        (unsigned long long)stored_size, (unsigned long long)file_size,
+        (unsigned long)stored_first, (unsigned long)first_offset,
+        (unsigned long)count, end_pos);
+
+    if (magic != HFIX58J_IDX_MAGIC || version != HFIX58J_IDX_VERSION) {
+        printf("idx: reject magic/version expected magic=%08lx version=%lu\n",
+            (unsigned long)HFIX58J_IDX_MAGIC, (unsigned long)HFIX58J_IDX_VERSION);
+        fclose(fp);
+        return false;
+    }
+    if (stored_size != file_size || stored_first != first_offset) {
+        printf("idx: reject file binding mismatch\n");
+        fclose(fp);
+        return false;
+    }
+    if (count == 0 || count > HFIX58F_MAX_SEEK_POINTS) {
+        printf("idx: reject invalid count=%lu max=%lu\n",
+            (unsigned long)count, (unsigned long)HFIX58F_MAX_SEEK_POINTS);
+        fclose(fp);
+        return false;
+    }
+
+    data_bytes = end_pos - 24;
+    if (data_bytes == (long)count * 16L) {
+        stride = 16;
+    } else if (data_bytes == (long)count * 12L) {
+        stride = 12;
+    } else {
+        printf("idx: reject record bytes=%ld not count*16=%ld or count*12=%ld\n",
+            data_bytes, (long)count * 16L, (long)count * 12L);
+        fclose(fp);
+        return false;
+    }
+
+    if (fseek(fp, 24, SEEK_SET) != 0) {
+        printf("idx: reject seek data failed\n");
+        fclose(fp);
+        return false;
+    }
+
+    memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
     g_hfix58f_seek.count = count;
-    g_hfix58f_seek.total_frames = total_frames;
-    g_hfix58f_seek.ready = true;
-    g_media_ctl.total_frames = total_frames;
+    g_hfix58f_seek.total_frames = 0;
 
-    hfix58_alert_set("SEEK CACHE HIT", 1);
+    for (u32 i = 0; i < count; i++) {
+        u32 frame = 0;
+        u64 offset = 0;
+        if (fread(&frame, 1, 4, fp) != 4) {
+            printf("idx: reject short frame at %lu\n", (unsigned long)i);
+            fclose(fp);
+            memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
+            return false;
+        }
+        if (stride == 16) {
+            u32 pad = 0;
+            if (fread(&pad, 1, 4, fp) != 4 || fread(&offset, 1, 8, fp) != 8) {
+                printf("idx: reject short padded record at %lu\n", (unsigned long)i);
+                fclose(fp);
+                memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
+                return false;
+            }
+        } else {
+            if (fread(&offset, 1, 8, fp) != 8) {
+                printf("idx: reject short packed record at %lu\n", (unsigned long)i);
+                fclose(fp);
+                memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
+                return false;
+            }
+        }
+        g_hfix58f_seek.points[i].frame = frame;
+        g_hfix58f_seek.points[i].file_offset = offset;
+        if (frame + 1u > g_hfix58f_seek.total_frames) {
+            g_hfix58f_seek.total_frames = frame + 1u;
+        }
+    }
+
+    fclose(fp);
+    g_hfix58f_seek.ready = true;
+    g_hfix58f_seek_large_file_mode = false;
+
+    printf("idx: loaded count=%lu stride=%d first_frame=%lu first_off=%llu last_frame=%lu last_off=%llu\n",
+        (unsigned long)g_hfix58f_seek.count, stride,
+        (unsigned long)g_hfix58f_seek.points[0].frame,
+        (unsigned long long)g_hfix58f_seek.points[0].file_offset,
+        (unsigned long)g_hfix58f_seek.points[g_hfix58f_seek.count - 1].frame,
+        (unsigned long long)g_hfix58f_seek.points[g_hfix58f_seek.count - 1].file_offset);
+
     return true;
 }
+
 
 static void hfix58j_save_seek_cache(const char *cache_path, u64 file_size, u32 first_offset) {
     if (!cache_path || !g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
@@ -10411,6 +10507,9 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
 
     if (file_size > HFIX58F_SYNC_INDEX_FAST_LIMIT_BYTES) {
         hfix58f_seed_total_frames_from_duration(v);
+        printf("idx: large file no sidecar/embedded index; entering fallback mode size=%llu first=%lu total=%lu\n",
+            (unsigned long long)file_size, (unsigned long)first_offset,
+            (unsigned long)g_hfix58f_seek.total_frames);
         g_hfix58f_seek_large_file_mode = true;
 
         if (saved >= 0) {
@@ -10756,6 +10855,9 @@ static bool hfix67_approx_seek_scan(FILE *f, const Stream *v, u32 target_frame) 
 }
 
 static const Hfix58FSeekPoint *hfix58f_find_seekpoint(u32 target_frame) {
+    printf("idx: find target=%lu ready=%d count=%lu total=%lu\n",
+        (unsigned long)target_frame, g_hfix58f_seek.ready ? 1 : 0,
+        (unsigned long)g_hfix58f_seek.count, (unsigned long)g_hfix58f_seek.total_frames);
     if (!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
         return NULL;
     }
@@ -11425,6 +11527,7 @@ static int play(void) {
        redundant. MIVF_LAUNCH_DEFAULT (normal browser selection, or no menu
        sidecar) falls through to the existing unmodified prompt behavior. */
     if (g_mivf_launch_mode == MIVF_LAUNCH_CHAPTER) {
+        printf("idx: launch chapter index=%d chapters=%d\n", g_mivf_launch_chapter_index, g_mivf_chapters_count);
         if (g_mivf_launch_chapter_index >= 0 && g_mivf_launch_chapter_index < g_mivf_chapters_count) {
             hfix58j_request_absolute_seek(g_mivf_chapters[g_mivf_launch_chapter_index].frame);
             (void)hfix58f_execute_pending_seek(
