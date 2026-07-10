@@ -162,6 +162,7 @@ void MIVF_SettingsInit(MivfSettings *settings) {
     settings->remember_favorites = true;
     settings->show_subtitle_tracks = true;
     settings->show_chapters = false;
+    settings->chapter_markers_enabled = true;
     settings->force_stereo = true;
     settings->debug_overlay_enabled = false;
     settings->subtitle_track_index = 0;
@@ -282,6 +283,7 @@ bool MIVF_SettingsLoad(MivfSettings *settings) {
         else if (!strcmp(key, "remember_favorites")) settings->remember_favorites = atoi(val) != 0;
         else if (!strcmp(key, "show_subtitle_tracks")) settings->show_subtitle_tracks = atoi(val) != 0;
         else if (!strcmp(key, "show_chapters")) settings->show_chapters = atoi(val) != 0;
+        else if (!strcmp(key, "chapter_markers_enabled")) settings->chapter_markers_enabled = atoi(val) != 0;
         else if (!strcmp(key, "force_stereo")) settings->force_stereo = atoi(val) != 0;
         else if (!strcmp(key, "debug_overlay_enabled")) settings->debug_overlay_enabled = atoi(val) != 0;
         else if (!strcmp(key, "subtitle_track_index")) settings->subtitle_track_index = (u32)strtoul(val, NULL, 10);
@@ -330,6 +332,7 @@ bool MIVF_SettingsSave(const MivfSettings *settings) {
     fprintf(fp, "remember_favorites=%d\n", settings->remember_favorites ? 1 : 0);
     fprintf(fp, "show_subtitle_tracks=%d\n", settings->show_subtitle_tracks ? 1 : 0);
     fprintf(fp, "show_chapters=%d\n", settings->show_chapters ? 1 : 0);
+    fprintf(fp, "chapter_markers_enabled=%d\n", settings->chapter_markers_enabled ? 1 : 0);
     fprintf(fp, "force_stereo=%d\n", settings->force_stereo ? 1 : 0);
     fprintf(fp, "debug_overlay_enabled=%d\n", settings->debug_overlay_enabled ? 1 : 0);
     fprintf(fp, "subtitle_track_index=%lu\n", (unsigned long)settings->subtitle_track_index);

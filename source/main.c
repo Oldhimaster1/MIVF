@@ -2736,7 +2736,7 @@ static void hfix59r3_apt_hook(APT_HookType hook, void *param) {
     }
 }
 
-#define HFIX59R3_SETTINGS_COUNT 21
+#define HFIX59R3_SETTINGS_COUNT 22
 #define HFIX59R3_SETTINGS_VISIBLE 13
 
 static const char *hfix59r3_settings_group(int idx) {
@@ -2745,7 +2745,8 @@ static const char *hfix59r3_settings_group(int idx) {
     if (idx == 9) return "AUDIO";
     if (idx <= 14) return "SUBS";
     if (idx <= 19) return "ADV";
-    return "HELP";
+    if (idx == 20) return "HELP";
+    return "SUBS"; /* HFIX68: idx 21, CHAPTER MARKERS -- grouped with CHAPTERS */
 }
 
 static const char *hfix59r3_settings_label(int idx) {
@@ -2770,7 +2771,8 @@ static const char *hfix59r3_settings_label(int idx) {
         "DIM TIME",
         "DIM LEVEL",
         "DEBUG",
-        "CONTROLS"
+        "CONTROLS",
+        "CHAPTER MARKERS"
     };
 
     if (idx < 0 || idx >= HFIX59R3_SETTINGS_COUNT) {
@@ -2816,6 +2818,7 @@ static void hfix59r3_settings_value(int idx, char *out, size_t out_sz) {
         case 18: snprintf(out, out_sz, "%lu", (unsigned long)g_mivf_settings.autodim_brightness); break;
         case 19: snprintf(out, out_sz, "%s", g_mivf_settings.debug_overlay_enabled ? "ON" : "OFF"); break;
         case 20: snprintf(out, out_sz, "A: VIEW"); break;
+        case 21: snprintf(out, out_sz, "%s", g_mivf_settings.chapter_markers_enabled ? "ON" : "OFF"); break;
         default: break;
     }
 }
@@ -3018,6 +3021,10 @@ static bool hfix59r3_handle_settings_menu(u32 down) {
                performs the actual resume check when Help closes). */
             g_hfix59r3_settings_visible = false;
             hfix62_set_help_open(true);
+            break;
+        case 21:
+            g_mivf_settings.chapter_markers_enabled = !g_mivf_settings.chapter_markers_enabled;
+            snprintf(value, sizeof(value), "CHAPTER MARKERS %s", g_mivf_settings.chapter_markers_enabled ? "ON" : "OFF");
             break;
         default:
             break;
@@ -8820,6 +8827,16 @@ typedef struct {
 static Hfix58FSeekIndex g_hfix58f_seek;
 static u64 g_hfix58f_media_end_offset = 0;
 
+/* HFIX67: set when hfix58f_build_seek_index skipped its up-front metadata
+   scan because the file is bigger than HFIX58F_SYNC_INDEX_FAST_LIMIT_BYTES
+   (and no embedded footer / .idx cache covered it) -- e.g. a full-length
+   movie encode with no seek-index sidecar. In this mode g_hfix58f_seek.count
+   is 0 (no real index), so a later seek request falls back to a small,
+   bounded on-demand scan (hfix67_approx_seek_scan) instead of failing
+   outright. This never re-scans the whole file. */
+static bool g_hfix58f_seek_large_file_mode = false;
+static u32 g_hfix58f_index_first_offset = 0;
+
 
 
 /* ------------------------------------------------------------------------- */
@@ -8851,7 +8868,11 @@ static u32 hfix58j_clamp_seek_target(u32 target_frame) {
 static void hfix58j_request_absolute_seek(u32 target_frame) {
     target_frame = hfix58j_clamp_seek_target(target_frame);
 
-    if (!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
+    /* HFIX67: a large file with no real index (g_hfix58f_seek_large_file_mode)
+       still gets a pending seek -- hfix58f_execute_pending_seek will try the
+       bounded on-demand scan before giving up. Only fail here outright when
+       there is truly no index and no way to build one on demand. */
+    if ((!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) && !g_hfix58f_seek_large_file_mode) {
         hfix58_alert_set("SEEK INDEX MISSING", 2);
         return;
     }
@@ -10103,6 +10124,8 @@ out:
 
 static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v) {
     memset(&g_hfix58f_seek, 0, sizeof(g_hfix58f_seek));
+    g_hfix58f_seek_large_file_mode = false;
+    g_hfix58f_index_first_offset = first_offset;
 
     if (!f || !v) {
         return false;
@@ -10151,6 +10174,7 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
 
     if (file_size > HFIX58F_SYNC_INDEX_FAST_LIMIT_BYTES) {
         hfix58f_seed_total_frames_from_duration(v);
+        g_hfix58f_seek_large_file_mode = true;
 
         if (saved >= 0) {
             fseek(f, saved, SEEK_SET);
@@ -10160,6 +10184,8 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
             Movie-sized uncached files must start playback immediately. A full
             first-run seek-index scan can walk gigabytes and looks like a hang.
             Existing .idx files are still used, and small files still build one.
+            g_hfix58f_seek_large_file_mode lets a later seek request fall back
+            to a small bounded on-demand scan (HFIX67) instead of just failing.
         */
         return false;
     }
@@ -10321,6 +10347,177 @@ static bool hfix58f_build_seek_index(FILE *f, u32 first_offset, const Stream *v)
     return true;
 }
 
+/* HFIX67: on-demand fallback for files where no seek index exists at all
+   (g_hfix58f_seek_large_file_mode). Interpolates a byte-offset guess from
+   target_frame/total_frames (assuming roughly uniform bytes-per-frame),
+   backs up a safety margin, then scans forward for the first real sync
+   point -- capped to HFIX67_APPROX_SEEK_SCAN_PAGES pages, so this costs at
+   most a small, bounded read at the moment a seek is requested. It never
+   walks the whole file. On success the found point is written into
+   g_hfix58f_seek.points[0] and treated as a valid (if approximate) index,
+   so hfix58f_find_seekpoint/hfix58f_execute_pending_seek need no changes --
+   they just see a 1-entry index for this seek. */
+#define HFIX67_APPROX_SEEK_SCAN_PAGES 600
+#define HFIX67_APPROX_SEEK_BACKUP_BYTES (512ull * 1024ull)
+
+static bool hfix67_approx_seek_scan(FILE *f, const Stream *v, u32 target_frame) {
+    if (!f || !v || g_hfix58f_seek.total_frames == 0) {
+        return false;
+    }
+
+    long saved = ftell(f);
+    bool have_best = false;
+    Hfix58FSeekPoint best;
+    memset(&best, 0, sizeof(best));
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        if (saved >= 0) fseek(f, saved, SEEK_SET);
+        return false;
+    }
+    long end_pos_l = ftell(f);
+    if (end_pos_l <= 0) {
+        if (saved >= 0) fseek(f, saved, SEEK_SET);
+        return false;
+    }
+    u64 file_size = (u64)end_pos_l;
+    u32 first_offset = g_hfix58f_index_first_offset;
+
+    if (first_offset >= file_size) {
+        if (saved >= 0) fseek(f, saved, SEEK_SET);
+        return false;
+    }
+
+    double frac = (double)target_frame / (double)g_hfix58f_seek.total_frames;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+
+    u64 est = (u64)first_offset + (u64)(frac * (double)(file_size - first_offset));
+    u64 pos = (est > (u64)first_offset + HFIX67_APPROX_SEEK_BACKUP_BYTES)
+        ? est - HFIX67_APPROX_SEEK_BACKUP_BYTES
+        : (u64)first_offset;
+
+    for (int page_i = 0; page_i < HFIX67_APPROX_SEEK_SCAN_PAGES && pos + MIVF_PAGE_HEADER_SIZE < file_size; page_i++) {
+        u8 page_hdr[MIVF_PAGE_HEADER_SIZE];
+
+        if (fseek(f, (long)pos, SEEK_SET) != 0) {
+            break;
+        }
+        if (fread(page_hdr, 1, MIVF_PAGE_HEADER_SIZE, f) != MIVF_PAGE_HEADER_SIZE) {
+            break;
+        }
+
+        u32 payload = le32(page_hdr + 0x10);
+        u16 packets = le16(page_hdr + 0x14);
+
+        if (payload == 0 || payload > (512 * 1024) || packets == 0 || packets > 128) {
+            break;
+        }
+
+        u64 page_payload_start = pos + MIVF_PAGE_HEADER_SIZE;
+        u64 page_end = page_payload_start + payload;
+
+        if (page_end > file_size) {
+            break;
+        }
+
+        u64 pkt_pos = page_payload_start;
+        bool stop_after_page = false;
+
+        for (u16 i = 0; i < packets && pkt_pos + 16 <= page_end; i++) {
+            u8 pkt_hdr[16];
+
+            if (fseek(f, (long)pkt_pos, SEEK_SET) != 0) {
+                break;
+            }
+            if (fread(pkt_hdr, 1, sizeof(pkt_hdr), f) != sizeof(pkt_hdr)) {
+                break;
+            }
+
+            u8 pkt_stream = pkt_hdr[0];
+            u8 flags = pkt_hdr[1];
+            u16 hsize = le16(pkt_hdr + 2);
+            u32 psize = le32(pkt_hdr + 8);
+            u32 pframe = le32(pkt_hdr + 12);
+
+            if (hsize < 16 || psize > payload || pkt_pos + hsize + psize > page_end) {
+                break;
+            }
+
+            if (pkt_stream != v->id) {
+                pkt_pos += (u64)hsize + (u64)psize;
+                continue;
+            }
+
+            bool sync = false;
+            u8 body_head[16];
+            memset(body_head, 0, sizeof(body_head));
+
+            if (psize >= 4 && pkt_pos + hsize + 4 <= page_end) {
+                u32 probe = psize < (u32)sizeof(body_head) ? psize : (u32)sizeof(body_head);
+
+                if (fseek(f, (long)(pkt_pos + hsize), SEEK_SET) == 0) {
+                    (void)fread(body_head, 1, probe, f);
+                }
+            }
+
+            if (body_head[0] == 'M' && body_head[1] == '2' && body_head[2] == 'Y' && body_head[3] == '0') {
+                sync = true;
+            }
+            if (hfix58f_body_is_m2y_delta_codec(body_head, psize)) {
+                sync = hfix58f_body_is_m2y_keyframe(body_head, psize);
+            }
+            if (body_head[0] == 'M' && body_head[1] == '1' && body_head[2] == 'P' && body_head[3] == '0') {
+                sync = true;
+            }
+            if (!hfix58f_body_is_m2y_delta_codec(body_head, psize) &&
+                (flags & 1) != 0 &&
+                body_head[0] == 'M' &&
+                (body_head[1] == '2' || body_head[1] == '1')) {
+                sync = true;
+            }
+            if (!strcmp(v->codec, "RAWV")) {
+                u32 raw_size = (u32)v->w * (u32)v->h * 2u;
+                if (raw_size != 0 && psize == raw_size) {
+                    sync = true;
+                }
+            }
+
+            if (sync) {
+                if (!have_best || (pframe <= target_frame && pframe > best.frame)) {
+                    best.frame = pframe;
+                    best.file_offset = pos;
+                    have_best = true;
+                }
+                if (pframe >= target_frame) {
+                    stop_after_page = true;
+                }
+                break;
+            }
+
+            pkt_pos += (u64)hsize + (u64)psize;
+        }
+
+        if (stop_after_page) {
+            break;
+        }
+
+        pos = page_end;
+    }
+
+    if (saved >= 0) {
+        fseek(f, saved, SEEK_SET);
+    }
+
+    if (!have_best) {
+        return false;
+    }
+
+    g_hfix58f_seek.points[0] = best;
+    g_hfix58f_seek.count = 1;
+    g_hfix58f_seek.ready = true;
+    return true;
+}
+
 static const Hfix58FSeekPoint *hfix58f_find_seekpoint(u32 target_frame) {
     if (!g_hfix58f_seek.ready || g_hfix58f_seek.count == 0) {
         return NULL;
@@ -10436,6 +10633,14 @@ static bool hfix58f_execute_pending_seek(
     g_hfix58f_seek_preview_pending = false;
 
     const Hfix58FSeekPoint *sp = hfix58f_find_seekpoint(g_hfix58f_seek_target);
+
+    if (!sp && g_hfix58f_seek_large_file_mode) {
+        /* HFIX67: no real index for this file -- try a small bounded
+           on-demand scan near the requested frame before giving up. */
+        if (hfix67_approx_seek_scan(f, v, g_hfix58f_seek_target)) {
+            sp = hfix58f_find_seekpoint(g_hfix58f_seek_target);
+        }
+    }
 
     if (!sp) {
         hfix58_alert_set("SEEK FAILED", 2);
@@ -10582,8 +10787,10 @@ static void hfix58f_draw_timeline(u8 *fb, int panel_y) {
         hfix58_rect565(fb, x, y + h - 1, fill_w, 1, 0, 100, 190);
     }
 
-    /* HFIX60: chapter tick markers along the timeline. */
-    if (g_mivf_chapters_count > 0 && total > 0) {
+    /* HFIX68: chapter tick markers along the timeline -- purely cosmetic;
+       chapter jump (L/R) and Scene Selection seeking are unaffected by this
+       flag either way. */
+    if (g_mivf_settings.chapter_markers_enabled && g_mivf_chapters_count > 0 && total > 0) {
         for (int ci = 0; ci < g_mivf_chapters_count; ci++) {
             u32 cf = g_mivf_chapters[ci].frame;
             int mx;

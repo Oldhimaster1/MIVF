@@ -34,6 +34,7 @@ typedef struct {
     bool remember_favorites;
     bool show_subtitle_tracks;
     bool show_chapters;
+    bool chapter_markers_enabled; /* draw chapter tick marks on the playback timeline */
     bool force_stereo;
     bool debug_overlay_enabled;
     u32 subtitle_track_index;
