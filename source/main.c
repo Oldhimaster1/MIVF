@@ -9024,12 +9024,32 @@ static u32 audio_count_pending_wavebufs(void) {
     judder). Bounded, principled, no NDSP resets or hard flushes in the steady
     state.
 */
-#define AUDIO_SYNC_TARGET_LOW   3    /* below this: let the queue refill (slow consume) */
-#define AUDIO_SYNC_TARGET_HIGH  6    /* above this: drain the queue (speed consume up)  */
-#define AUDIO_SYNC_STEP         0.0015f  /* per ~1s tick; ~2.6 cents, well under audible */
-#define AUDIO_SYNC_MAX_CORR     0.03f    /* clamp correction to +/-3% as a safety rail    */
+/*
+    hfix76b: the first cut of this controller was a bang-bang relay (nudge the
+    rate a fixed step whenever pending left a [3,6] band). On real logs that
+    limit-cycled -- corr swept 988<->1015 with a ~30-60s period and the queue
+    depth swung 1..8 (41..333ms) the whole time. A relay driving an integrator
+    (the queue is the integral of production-minus-consumption) always limit-
+    cycles; that's structural, not a tuning accident. So the audio latency,
+    while now bounded (the real win -- no more unbounded growth), was still a
+    wobbling ~187ms average instead of a steady, compensable value.
+
+    Replaced with a proper proportional controller on a low-pass-filtered queue
+    depth. P control of a single integrator is well-damped and settles instead
+    of oscillating; smoothing the measurement first keeps per-frame queue jitter
+    from turning into audible per-tick pitch jitter. It holds the queue at a
+    steady setpoint with only a small fixed steady-state offset (the constant
+    clock-mismatch bias), so the residual latency becomes a stable number a
+    fixed compensation can null -- rather than a moving target. Still: no drops,
+    video pacing untouched, sub-percent (inaudible) steady pitch trim.
+*/
+#define AUDIO_SYNC_SETPOINT     3.0f    /* target queued buffers (~125ms at 24fps/48k)     */
+#define AUDIO_SYNC_KP           0.005f  /* rate trim per buffer of smoothed error          */
+#define AUDIO_SYNC_EMA_ALPHA    0.3f    /* measurement low-pass; kills per-frame jitter    */
+#define AUDIO_SYNC_MAX_CORR     0.03f   /* clamp correction to +/-3% as a safety rail      */
 
 static float g_audio_rate_corr = 1.0f;
+static float g_audio_pending_ema = AUDIO_SYNC_SETPOINT;
 
 static float audio_rate_base(void) {
     return (float)audio.rate * (float)mivf_speed_pct() / 100.0f;
@@ -9040,6 +9060,7 @@ static float audio_rate_base(void) {
    from a clean slate rather than carry a stale correction. */
 static void audio_rate_sync_reset(void) {
     g_audio_rate_corr = 1.0f;
+    g_audio_pending_ema = AUDIO_SYNC_SETPOINT;
     if (audio_can_use_ndsp()) {
         ndspChnSetRate(0, audio_rate_base());
     }
@@ -9051,19 +9072,21 @@ static void audio_rate_sync_tick(void) {
     }
 
     u32 pending = audio_count_pending_wavebufs();
-    bool changed = false;
 
-    if (pending > AUDIO_SYNC_TARGET_HIGH && g_audio_rate_corr < 1.0f + AUDIO_SYNC_MAX_CORR) {
-        g_audio_rate_corr += AUDIO_SYNC_STEP;
-        changed = true;
-    } else if (pending < AUDIO_SYNC_TARGET_LOW && g_audio_rate_corr > 1.0f - AUDIO_SYNC_MAX_CORR) {
-        g_audio_rate_corr -= AUDIO_SYNC_STEP;
-        changed = true;
+    /* Low-pass the queue depth before acting on it, so a one-frame spike
+       doesn't yank the playback rate (which would be audible). */
+    g_audio_pending_ema += AUDIO_SYNC_EMA_ALPHA * ((float)pending - g_audio_pending_ema);
+
+    float corr = 1.0f + AUDIO_SYNC_KP * (g_audio_pending_ema - AUDIO_SYNC_SETPOINT);
+
+    if (corr > 1.0f + AUDIO_SYNC_MAX_CORR) {
+        corr = 1.0f + AUDIO_SYNC_MAX_CORR;
+    } else if (corr < 1.0f - AUDIO_SYNC_MAX_CORR) {
+        corr = 1.0f - AUDIO_SYNC_MAX_CORR;
     }
 
-    if (changed) {
-        ndspChnSetRate(0, audio_rate_base() * g_audio_rate_corr);
-    }
+    g_audio_rate_corr = corr;
+    ndspChnSetRate(0, audio_rate_base() * corr);
 }
 
 static void avsync_audioq_report(u32 video_frame) {
