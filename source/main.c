@@ -378,6 +378,20 @@ static u32 g_audio_drop = 0;
 static u32 g_audio_wait_events = 0; /* audio_queue_raw_ndsp had to gspWaitForVBlank at least once */
 static u32 g_last_audio_bytes = 0;
 static u32 g_last_audio_samples = 0;
+
+/* hfix78: real audio-playback clock. Every submitted wavebuf gets an
+   auto-assigned sequence_id (see ndspWaveBuf); ndspChnGetWaveBufSeq(0) reports
+   which sequence is *audible right now*. We map sequence_id -> the audio frame
+   that buffer carries, so we can read back the frame currently being heard --
+   as opposed to the frame most recently submitted. The difference between the
+   video frame on screen and that audible frame is the true A/V error, which
+   submit-side diagnostics (delta_frames, drift_ms) structurally cannot see. */
+#define AUDIO_SEQ_MAP 256   /* power of two >> the ~48 buffers ever in flight */
+static u32  g_audio_seq_to_frame[AUDIO_SEQ_MAP];
+static u32  g_audio_seq_to_nsamples[AUDIO_SEQ_MAP]; /* buffer length, for sub-buffer precision */
+static u32  g_audio_pending_submit_frame = 0; /* frame of the packet being submitted now */
+static u16  g_audio_last_submitted_seq = 0;
+static bool g_audio_have_submitted_seq = false;
 static bool g_ndsp_ready = false;
 static bool g_ndsp_init_attempted = false;
 
@@ -8847,6 +8861,12 @@ static void audio_delay_ring_submit(const u8 *data, u32 size) {
 }
 
 static bool hfix58_queue_audio_packet(const Stream *a, const u8 *body, u32 psize, u32 frame_no) {
+    /* Remember which frame is being submitted so audio_queue_raw_ndsp can tag
+       the resulting wavebuf's sequence_id with it (hfix78). Valid because the
+       decode+queue path below is synchronous; assumes audio passthrough
+       (audio_offset_ms <= 0), which is the sync-calibration case. */
+    g_audio_pending_submit_frame = frame_no;
+
     if (g_avsync_audio_log_count < AVSYNC_LOG_LIMIT) {
         printf("avsync: audio_submit frame=%lu tick=%llu\n",
             (unsigned long)frame_no, (unsigned long long)svcGetSystemTick());
@@ -8951,6 +8971,19 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
 
             DSP_FlushDataCache(audio.buf[i], n);
             ndspChnWaveBufAdd(0, &audio.wb[i]);
+
+            /* hfix78: sequence_id is assigned by ndspChnWaveBufAdd itself, so
+               it's only readable *after* the call. Record which video frame
+               this buffer carries so the playback-clock reader below can map
+               "sequence currently audible" back to a frame number. */
+            {
+                u16 seq = audio.wb[i].sequence_id;
+                u32 map_idx = (u32)seq % AUDIO_SEQ_MAP;
+                g_audio_seq_to_frame[map_idx] = g_audio_pending_submit_frame;
+                g_audio_seq_to_nsamples[map_idx] = nsamples;
+                g_audio_last_submitted_seq = seq;
+                g_audio_have_submitted_seq = true;
+            }
 
             audio.next = (i + 1) % AUDIO_BUFS;
 
@@ -9112,6 +9145,22 @@ static void audio_rate_sync_tick(void) {
 */
 #define VIDEO_DELAY_MAX_MS 600
 
+/* hfix77b: TEMPORARILY DISABLED. Reported blinking/flicker on real hardware
+   when active. Root cause not yet isolated -- the likely suspect is the
+   interaction between this ring's gfxGetFramebuffer() read/write and
+   hfix51c_present_finish()'s gfxSwapBuffers(), which runs once per loop
+   iteration regardless of got_video: if that call reads the framebuffer on
+   the "wrong side" of a swap relative to when this ring snapshots/restores
+   it, the ring could read a half-written back-buffer or restore into a
+   buffer about to be presented, producing exactly a blink. That needs to be
+   isolated on real hardware before re-enabling, not guessed at further from
+   here. Until then, video_delay_set_ms always forces depth to 0 -- the
+   negative side of the A/V SYNC setting is inert -- and the real fix for the
+   audible-lag question is the playback-clock measurement above (hfix78), not
+   this. All the alloc/free/reset/apply plumbing stays in place so re-enabling
+   is a one-line change (flip this to 1) once the blink is understood. */
+#define VIDEO_DELAY_FEATURE_ENABLED 0
+
 static u8   **g_video_delay_ring = NULL;
 static int    g_video_delay_slots = 0;
 static size_t g_video_delay_slot_bytes = 0;
@@ -9186,6 +9235,16 @@ static void video_delay_reset(void) {
 static void video_delay_set_ms(int ms, u32 fpsn, u32 fpsd) {
     int depth;
 
+#if !VIDEO_DELAY_FEATURE_ENABLED
+    (void)fpsn;
+    (void)fpsd;
+    g_video_delay_depth = 0;
+    if (ms > 0) {
+        printf("video_delay: disabled pending blink investigation (requested ms=%d ignored)\n", ms);
+    }
+    return;
+#endif
+
     if (ms < 0) {
         ms = 0;
     }
@@ -9249,6 +9308,86 @@ static void av_sync_offset_apply(int offset_ms) {
                        g_hfix59r2_video_fps_num, g_hfix59r2_video_fps_den);
 }
 
+/*
+    hfix78: the actual audio-playback clock, not a submit-side proxy.
+
+    ndspChnGetWaveBufSeq(0) returns the sequence_id of the wavebuf that's
+    playing *right now* on the DSP -- libctru auto-assigns sequence_id inside
+    ndspChnWaveBufAdd, and audio_queue_raw_ndsp records seq -> video_frame at
+    submit time. Looking that seq up here gives the video frame whose audio is
+    audible at this instant, independent of how deep the queue is or how far
+    ahead submission has gotten. ndspChnGetSamplePos(0) adds the sample offset
+    within that buffer for sub-frame precision. This is the missing
+    measurement: audio_submit proves decode/queue timing; this proves what's
+    actually coming out of the DSP.
+*/
+static bool audio_get_playing_frame(u32 *out_frame, u32 *out_sample_pos) {
+    if (!audio_can_use_ndsp() || !g_audio_have_submitted_seq) {
+        return false;
+    }
+    if (!ndspChnIsPlaying(0)) {
+        return false;
+    }
+
+    u16 seq = ndspChnGetWaveBufSeq(0);
+    u32 map_idx = (u32)seq % AUDIO_SEQ_MAP;
+
+    if (out_frame) {
+        *out_frame = g_audio_seq_to_frame[map_idx];
+    }
+    if (out_sample_pos) {
+        *out_sample_pos = ndspChnGetSamplePos(0);
+    }
+    return true;
+}
+
+/* Highest video frame among wavebufs currently in NDSP_WBUF_DONE state --
+   "audio has definitely finished playing through at least this frame." A
+   second, cross-check estimate independent of ndspChnGetWaveBufSeq. */
+static u32 audio_last_done_frame(void) {
+    u32 last_done = 0;
+    bool have = false;
+
+    for (int i = 0; i < AUDIO_BUFS; i++) {
+        if (audio.buf[i] && audio.wb[i].status == NDSP_WBUF_DONE) {
+            u32 mapped = g_audio_seq_to_frame[(u32)audio.wb[i].sequence_id % AUDIO_SEQ_MAP];
+            if (!have || mapped > last_done) {
+                last_done = mapped;
+                have = true;
+            }
+        }
+    }
+
+    return have ? last_done : 0;
+}
+
+static void avsync_played_report(u32 video_frame) {
+    u32 playing_frame = 0;
+    u32 sample_pos = 0;
+    bool have_playing = audio_get_playing_frame(&playing_frame, &sample_pos);
+    u32 last_done = audio_last_done_frame();
+    long audible_lag_frames = have_playing ? (long)video_frame - (long)playing_frame : 0;
+    long long audible_lag_ms = 0;
+
+    if (have_playing && audio.rate > 0 && audio.samples_per_frame > 0) {
+        audible_lag_ms = ((long long)audible_lag_frames * (long long)audio.samples_per_frame * 1000ll)
+            / (long long)audio.rate;
+    }
+
+    printf(
+        "avsync_played: video_frame=%lu last_submitted_audio_frame=%lu last_done_audio_frame=%lu "
+        "estimated_playing_audio_frame=%lu sample_pos=%lu playing_known=%d audible_lag_frames=%ld "
+        "audible_lag_ms=%lld\n",
+        (unsigned long)video_frame,
+        (unsigned long)g_audio_pending_submit_frame,
+        (unsigned long)last_done,
+        (unsigned long)playing_frame,
+        (unsigned long)sample_pos,
+        have_playing ? 1 : 0,
+        audible_lag_frames,
+        audible_lag_ms);
+}
+
 static void avsync_audioq_report(u32 video_frame) {
     u32 pending = audio_count_pending_wavebufs();
     u32 free_bufs = (u32)AUDIO_BUFS - pending;
@@ -9274,6 +9413,8 @@ static void avsync_audioq_report(u32 video_frame) {
         (unsigned long)g_audio_drop,
         (unsigned long)g_audio_wait_events,
         (unsigned long)rate_corr_ppt);
+
+    avsync_played_report(video_frame);
 }
 
 /* Same ~5s-of-nominal-video-time cadence as avsync_drift_maybe_report, and
@@ -11838,6 +11979,15 @@ static void hfix58f_audio_flush_for_seek(void) {
     g_audio_drop = 0;
     g_last_audio_bytes = 0;
     g_last_audio_samples = 0;
+
+    /* hfix78: ndspChnReset (called via audio_configure_ndsp_channel above)
+       restarts the DSP's own sequence_id counter, so post-seek sequence IDs
+       can collide with stale pre-seek entries still sitting in
+       g_audio_seq_to_frame at the same modulo slot. Drop the "have a
+       submitted seq" flag so audio_get_playing_frame() reports unknown
+       (playing_known=0) until a genuinely new post-seek buffer is submitted,
+       rather than briefly reporting a stale frame number. */
+    g_audio_have_submitted_seq = false;
 
     /* Queue was just emptied -- restart the sync controller neutral so it
        re-converges for the new position instead of holding a stale rate.
