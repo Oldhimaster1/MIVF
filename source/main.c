@@ -10632,13 +10632,30 @@ static void mivf_menu_draw_background_animated(u8 *fb, u32 pulse) {
         src_y0 = MIVF_MENU_BG_H - src_h;
     }
 
+    /* hfix82b: this used to compute `src_x0 + (xx * src_w) / MIVF_MENU_BG_W`
+       fresh for every one of the 400*240 pixels -- ARMv6 (this 3DS's ARM11
+       core) has no hardware integer divide, so each of those ~96,000
+       divisions per frame was a slow software (libgcc) call, and that was
+       the actual cause of the reported stutter, not the effect itself.
+       Fixed-point DDA instead: compute the per-pixel step ONCE per frame
+       (one division each for x and y, not one per pixel) and walk the
+       source position by plain integer addition, which is cheap. Same
+       math, same visual result, ~96,000x fewer divisions per frame. */
+    u32 step_x = ((u32)src_w << 16) / (u32)MIVF_MENU_BG_W;
+    u32 step_y = ((u32)src_h << 16) / (u32)MIVF_MENU_BG_H;
+    u32 sy_acc = (u32)src_y0 << 16;
+
     for (int yy = 0; yy < MIVF_MENU_BG_H; yy++) {
-        int sy = src_y0 + (yy * src_h) / MIVF_MENU_BG_H;
+        int sy = (int)(sy_acc >> 16);
+        const u16 *row = &g_mivf_menu_bg[(size_t)sy * MIVF_MENU_BG_W];
+        u32 sx_acc = (u32)src_x0 << 16;
 
         for (int xx = 0; xx < MIVF_MENU_BG_W; xx++) {
-            int sx = src_x0 + (xx * src_w) / MIVF_MENU_BG_W;
-            hfix58s_top_px565(fb, xx, yy, g_mivf_menu_bg[(size_t)sy * MIVF_MENU_BG_W + sx]);
+            hfix58s_top_px565(fb, xx, yy, row[sx_acc >> 16]);
+            sx_acc += step_x;
         }
+
+        sy_acc += step_y;
     }
 }
 
