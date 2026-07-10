@@ -8708,6 +8708,7 @@ static void avsync_report_seek_if_ready(void) {
 static u64 g_avsync_drift_base_tick = 0;
 static u32 g_avsync_drift_base_frame = 0;
 static u32 g_avsync_drift_next_frame = 0;
+static bool g_avsync_drift_pending_reset = false;
 
 static void avsync_drift_reset(u64 now_tick, u32 frame, u32 fpsn, u32 fpsd) {
     u32 frames_per_report = fpsn ? ((5u * fpsn) / (fpsd ? fpsd : 1u)) : 120u;
@@ -9160,18 +9161,26 @@ static void hfix59r3_present_video_frame(
         g_avsync_video_log_count++;
     }
 
+    bool avsync_is_first_video_ever = !g_avsync_first_video_seen;
+
     if (!g_avsync_first_video_seen) {
         g_avsync_first_video_seen = true;
         g_avsync_first_video_tick = now_tick;
         g_avsync_first_video_frame = shown_frame;
         avsync_report_start_if_ready();
-        avsync_drift_reset(now_tick, shown_frame, fpsn_abs, fpsd_abs);
     }
 
     if (g_avsync_seek_active && !g_avsync_seek_first_video_seen) {
         g_avsync_seek_first_video_seen = true;
         g_avsync_seek_first_video_frame = shown_frame;
         avsync_report_seek_if_ready();
+    }
+
+    /* Covers every jump -- preview/scrub or real -- not just real seeks, so
+       the drift baseline never compares "time since session start" against
+       a frame number from after a scrub. See hfix58f_execute_pending_seek. */
+    if (g_avsync_drift_pending_reset || avsync_is_first_video_ever) {
+        g_avsync_drift_pending_reset = false;
         avsync_drift_reset(now_tick, shown_frame, fpsn_abs, fpsd_abs);
     }
 
@@ -11532,6 +11541,16 @@ static bool hfix58f_execute_pending_seek(
     if (!preview_seek) {
         avsync_arm_seek(g_hfix58f_seek_target, sp->frame);
     }
+
+    /* Any jump -- preview (scrub) or real -- discontinues the frame/tick
+       relationship the drift baseline assumes, so it must be re-armed here
+       too, independent of the seek-alignment report above (which is only
+       meaningful for real seeks). Without this, a scrub burst leaves the
+       drift diagnostic comparing "time since session start" against a
+       frame number that just jumped tens of thousands of frames, producing
+       meaningless multi-minute "drift" numbers that look alarming but
+       aren't real -- see the log analysis that caught this. */
+    g_avsync_drift_pending_reset = true;
 
     hfix58f_audio_flush_for_seek();
 
