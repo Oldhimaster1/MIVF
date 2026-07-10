@@ -172,6 +172,7 @@ class EncodeSettings:
     audio_rate: int = DEFAULT_AUDIO_RATE
     audio_channels: int = DEFAULT_AUDIO_CHANNELS
     audio_codec: str = "ia4m"
+    audio_offset_ms: int = 0
     keyint: int = DEFAULT_KEYINT
     qp: int = DEFAULT_QP
     c_qp_offset: int = DEFAULT_C_QP_OFFSET
@@ -1794,7 +1795,7 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
     print(f"Parallel Engine: Master container unified with {running_frame_idx} sequential frames.")
 
 
-def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate: int, channels: int, workdir: Path, audio_codec: str = "ia4m") -> None:
+def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate: int, channels: int, workdir: Path, audio_codec: str = "ia4m", audio_offset_ms: int = 0) -> None:
     audio_codec = audio_codec.lower()
     if audio_codec not in {"ia4m", "pc16"}:
         raise SystemExit(f"unsupported audio codec: {audio_codec}")
@@ -1850,6 +1851,35 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
 
         audio_proc = start_ffmpeg_audio_pipe(audio_src, rate, channels)
 
+        # --audio-offset-ms: shift the whole audio track relative to video by
+        # a constant number of samples, computed once up front. Positive:
+        # delay audio (prepend silence). Negative: advance audio (drop
+        # samples from the start). Applied to the raw linear PCM stream
+        # before it's chopped into samples_per_frame packets below, so every
+        # packet after the shift keeps its normal size/frame alignment --
+        # only the content of the first affected packet(s) changes.
+        offset_samples = int(round(audio_offset_ms * rate / 1000.0))
+        silence_samples_remaining = offset_samples if offset_samples > 0 else 0
+        samples_to_trim = -offset_samples if offset_samples < 0 else 0
+
+        if samples_to_trim > 0:
+            trim_bytes = samples_to_trim * channels * 2
+            drained = 0
+            while drained < trim_bytes and audio_proc.stdout:
+                chunk = audio_proc.stdout.read(min(65536, trim_bytes - drained))
+                if not chunk:
+                    break
+                drained += len(chunk)
+            print(
+                f"AUDIO OFFSET: audio_offset_ms={audio_offset_ms} trimmed {drained // (channels * 2)} "
+                f"samples ({drained} bytes) from the start of the audio track"
+            )
+        elif silence_samples_remaining > 0:
+            print(
+                f"AUDIO OFFSET: audio_offset_ms={audio_offset_ms} prepending {silence_samples_remaining} "
+                f"samples ({silence_samples_remaining * channels * 2} bytes) of silence before the audio track"
+            )
+
         try:
             while True:
                 page_header = vf.read(PAGE_HEADER_SIZE)
@@ -1871,7 +1901,15 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
                     raise SystemExit(f"short page payload at frame {frame_no}")
 
                 pcm_bytes_needed = samples_per_frame * channels * 2
-                if audio_proc.stdout:
+
+                if silence_samples_remaining > 0:
+                    silence_here = min(silence_samples_remaining, samples_per_frame)
+                    pcm = b"\x00" * (silence_here * channels * 2)
+                    silence_samples_remaining -= silence_here
+                    remaining_bytes = pcm_bytes_needed - len(pcm)
+                    if remaining_bytes > 0 and audio_proc.stdout:
+                        pcm += audio_proc.stdout.read(remaining_bytes)
+                elif audio_proc.stdout:
                     pcm = audio_proc.stdout.read(pcm_bytes_needed)
                 else:
                     pcm = b""
@@ -2113,7 +2151,7 @@ def encode_one(
         print(f"2. Multiplexing Audio ({settings.audio_codec.upper()})")
         print("============================================================")
         mux_t0 = time.time()
-        mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir, settings.audio_codec)
+        mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir, settings.audio_codec, settings.audio_offset_ms)
         mux_elapsed = time.time() - mux_t0
 
         if make_m2y2:
@@ -2258,6 +2296,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE)
     parser.add_argument("--audio-channels", type=int, default=DEFAULT_AUDIO_CHANNELS)
     parser.add_argument("--audio-codec", choices=["ia4m", "pc16"], default="ia4m", help="audio mux format: ia4m is small ADPCM mono, pc16 is larger high-quality PCM")
+    parser.add_argument("--audio-offset-ms", type=int, default=0, help="shift audio relative to video by this many ms; positive delays audio (prepends silence), negative advances it (trims samples from the start)")
     parser.add_argument("--keyint", type=int, default=DEFAULT_KEYINT)
     parser.add_argument("--qp", type=int, default=DEFAULT_QP)
     parser.add_argument("--c-qp-offset", type=int, default=DEFAULT_C_QP_OFFSET)
@@ -2320,6 +2359,7 @@ def main() -> None:
         audio_rate=args.audio_rate,
         audio_channels=args.audio_channels,
         audio_codec=args.audio_codec,
+        audio_offset_ms=args.audio_offset_ms,
         keyint=args.keyint,
         qp=args.qp,
         c_qp_offset=args.c_qp_offset,
