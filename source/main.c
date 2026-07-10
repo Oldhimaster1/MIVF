@@ -5674,6 +5674,53 @@ static void hfix58s_top_rect565(u8 *fb, int x, int y, int w, int h, int r, int g
     }
 }
 
+/* HFIX71: top-screen translucent blend, mirroring hfix58_blend_px565/
+   hfix58_blend_rect565 exactly but addressed for the 400x240 top framebuffer
+   (TOP_W/TOP_H) instead of the 320x240 bottom one. Needed now that menu
+   buttons/panels render on the top screen. */
+static inline void hfix58s_top_blend_px565(u8 *fb8, int x, int y, int r, int g, int b, int a) {
+    if (!fb8 || x < 0 || x >= TOP_W || y < 0 || y >= TOP_H) {
+        return;
+    }
+
+    if (a <= 0) {
+        return;
+    }
+
+    if (a >= 255) {
+        hfix58s_top_px565(fb8, x, y, hfix58_rgb565(r, g, b));
+        return;
+    }
+
+    u16 *fb = (u16*)fb8;
+    int idx = x * TOP_H + (TOP_H - 1 - y);
+
+    int dr, dg, db;
+    hfix58_unpack565(fb[idx], &dr, &dg, &db);
+
+    int nr = (dr * (255 - a) + r * a) / 255;
+    int ng = (dg * (255 - a) + g * a) / 255;
+    int nb = (db * (255 - a) + b * a) / 255;
+
+    fb[idx] = hfix58_rgb565(nr, ng, nb);
+}
+
+static void hfix58s_top_blend_rect565(u8 *fb, int x, int y, int w, int h, int r, int g, int b, int a) {
+    int x2 = x + w;
+    int y2 = y + h;
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x2 > TOP_W) x2 = TOP_W;
+    if (y2 > TOP_H) y2 = TOP_H;
+
+    for (int xx = x; xx < x2; xx++) {
+        for (int yy = y; yy < y2; yy++) {
+            hfix58s_top_blend_px565(fb, xx, yy, r, g, b, a);
+        }
+    }
+}
+
 static void hfix58s_top_draw_char(u8 *fb, int x, int y, char c, int scale, int r, int g, int b) {
     const u8 *glyph = hfix58_glyph(c);
     u16 color = hfix58_rgb565(r, g, b);
@@ -9241,14 +9288,20 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
         if (b->label[0] == 0) {
             snprintf(b->label, sizeof(b->label), "%s", b->id[0] ? b->id : "BUTTON");
         }
+        /* HFIX71: root menu buttons now render on the 400x240 top screen
+           (previously the 320x240 bottom screen) -- clamp against TOP_W/
+           TOP_H accordingly. Existing .menu.ini rects (authored against the
+           old 320-wide bottom layout) still fit comfortably within 400x240,
+           just relocated to a different screen; no auto-layout heuristic
+           needed for the coordinates already in real use. */
         if (b->w <= 0) b->w = 120;
         if (b->h <= 0) b->h = 22;
-        if (b->w > 320) b->w = 320;
-        if (b->h > 240) b->h = 240;
+        if (b->w > TOP_W) b->w = TOP_W;
+        if (b->h > TOP_H) b->h = TOP_H;
         if (b->x < 0) b->x = 0;
         if (b->y < 0) b->y = 0;
-        if (b->x + b->w > 320) b->x = 320 - b->w;
-        if (b->y + b->h > 240) b->y = 240 - b->h;
+        if (b->x + b->w > TOP_W) b->x = TOP_W - b->w;
+        if (b->y + b->h > TOP_H) b->y = TOP_H - b->h;
     }
 
     /* Resume needs an actual bookmark; Chapters needs the sidecar to exist
@@ -9298,6 +9351,9 @@ static void mivf_menu_top_diamond(u8 *fb, int cx, int cy, int r, int g, int b) {
     }
 }
 
+/* HFIX71: background/title only -- used as-is while browsing Scene
+   Selection (which stays bottom-screen-primary), and as the base layer
+   for mivf_menu_draw_top_root below. */
 static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
     int title_w;
 
@@ -9350,7 +9406,11 @@ static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
         "MIVF DISC MENU", 1, 130, 150, 175);
 }
 
-static void mivf_menu_draw_button(u8 *fb, const MivfMenuButton *b, bool is_selected, u32 pulse) {
+/* HFIX71: root menu buttons now render on the top screen (real DVD menus
+   put the interactive menu over the movie/disc art, not on a separate
+   panel) -- same visual language as before, redrawn with the hfix58s_top_*
+   family instead of the 320-wide bottom-screen helpers. */
+static void mivf_menu_draw_button_top(u8 *fb, const MivfMenuButton *b, bool is_selected, u32 pulse) {
     int br, bg, bb, alpha;
     int text_r, text_g, text_b;
     int label_x = b->x + 10;
@@ -9371,34 +9431,78 @@ static void mivf_menu_draw_button(u8 *fb, const MivfMenuButton *b, bool is_selec
 
         /* Outer glow bleed behind the button -- a soft, larger, low-alpha
            halo reads as "glowing" more than a same-size fill ever can. */
-        hfix58_blend_rect565(fb, b->x - 3, b->y - 3, b->w + 6, b->h + 6,
+        hfix58s_top_blend_rect565(fb, b->x - 3, b->y - 3, b->w + 6, b->h + 6,
             g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 40 + (int)tri / 2);
     } else {
         br = 26; bg = 32; bb = 46; alpha = 165;
         text_r = 205; text_g = 215; text_b = 228;
     }
 
-    hfix58_blend_rect565(fb, b->x, b->y, b->w, b->h, br, bg, bb, alpha);
+    hfix58s_top_blend_rect565(fb, b->x, b->y, b->w, b->h, br, bg, bb, alpha);
 
     if (b->enabled) {
-        hfix58_rect565(fb, b->x, b->y, b->w, 1, br, bg, bb);
+        hfix58s_top_rect565(fb, b->x, b->y, b->w, 1, br, bg, bb);
     }
 
     if (is_selected) {
         /* Full gold outline, not just a left bar -- reads much more like a
            real DVD menu's selection frame. */
-        hfix58_rect565(fb, b->x, b->y, b->w, 2, 255, 222, 120);
-        hfix58_rect565(fb, b->x, b->y + b->h - 2, b->w, 2, 255, 222, 120);
-        hfix58_rect565(fb, b->x, b->y, 2, b->h, 255, 222, 120);
-        hfix58_rect565(fb, b->x + b->w - 2, b->y, 2, b->h, 255, 222, 120);
+        hfix58s_top_rect565(fb, b->x, b->y, b->w, 2, 255, 222, 120);
+        hfix58s_top_rect565(fb, b->x, b->y + b->h - 2, b->w, 2, 255, 222, 120);
+        hfix58s_top_rect565(fb, b->x, b->y, 2, b->h, 255, 222, 120);
+        hfix58s_top_rect565(fb, b->x + b->w - 2, b->y, 2, b->h, 255, 222, 120);
 
         for (int i = 0; i < 5; i++) {
             int arm = 5 - i;
-            hfix58_rect565(fb, b->x + 6 + i, b->y + b->h / 2 - arm, 1, arm * 2 + 1, 255, 222, 120);
+            hfix58s_top_rect565(fb, b->x + 6 + i, b->y + b->h / 2 - arm, 1, arm * 2 + 1, 255, 222, 120);
         }
     }
 
-    hfix58_draw_text_shadow(fb, label_x, b->y + b->h / 2 - 3, b->label, 1, text_r, text_g, text_b);
+    hfix58s_top_draw_text_shadow(fb, label_x, b->y + b->h / 2 - 3, b->label, 1, text_r, text_g, text_b);
+}
+
+/* Draws the background/title (mivf_menu_draw_top above), then a translucent
+   safe-area panel behind the button stack for legibility over arbitrary
+   background art, then the buttons themselves. This is the new top-screen
+   root menu entry point. */
+static void mivf_menu_draw_top_root(u8 *fb, const MivfMenu *menu, u32 pulse) {
+    int panel_x0 = TOP_W;
+    int panel_x1 = 0;
+    int panel_y0 = TOP_H;
+    int panel_y1 = 0;
+
+    mivf_menu_draw_top(fb, menu);
+
+    for (int i = 0; i < menu->button_count; i++) {
+        const MivfMenuButton *b = &menu->buttons[i];
+
+        if (b->x < panel_x0) panel_x0 = b->x;
+        if (b->x + b->w > panel_x1) panel_x1 = b->x + b->w;
+        if (b->y < panel_y0) panel_y0 = b->y;
+        if (b->y + b->h > panel_y1) panel_y1 = b->y + b->h;
+    }
+
+    if (menu->button_count > 0 && panel_x1 > panel_x0 && panel_y1 > panel_y0) {
+        hfix58s_top_blend_rect565(fb, panel_x0 - 10, panel_y0 - 10,
+            (panel_x1 - panel_x0) + 20, (panel_y1 - panel_y0) + 20,
+            6, 9, 16, 130);
+    }
+
+    for (int i = 0; i < menu->button_count; i++) {
+        mivf_menu_draw_button_top(fb, &menu->buttons[i], i == menu->selected, pulse);
+    }
+}
+
+/* Short, human-readable description of what the selected root-menu button
+   does, shown on the bottom-screen info panel. */
+static const char *mivf_menu_action_description(MivfMenuAction action) {
+    switch (action) {
+        case MIVF_MENU_ACTION_PLAY:     return "START FROM THE BEGINNING";
+        case MIVF_MENU_ACTION_RESUME:   return "CONTINUE WHERE YOU LEFT OFF";
+        case MIVF_MENU_ACTION_CHAPTERS: return "BROWSE MOVIE SCENES";
+        case MIVF_MENU_ACTION_BACK:     return "RETURN TO THE FILE BROWSER";
+        default:                        return "";
+    }
 }
 
 /* HFIX70: shared header treatment for both bottom-screen menu panels -- a
@@ -9410,7 +9514,7 @@ static void mivf_menu_draw_panel_header(u8 *fb, const char *title, int page, int
     hfix58_rect565(fb, 18, 28, (int)strlen(title) * 6, 1, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
 
     if (total_pages > 1) {
-        char page_str[16];
+        char page_str[32];
         int w;
 
         snprintf(page_str, sizeof(page_str), "PAGE %d/%d", page, total_pages);
@@ -9419,7 +9523,12 @@ static void mivf_menu_draw_panel_header(u8 *fb, const char *title, int page, int
     }
 }
 
-static void mivf_menu_draw_bottom(u8 *fb, const MivfMenu *menu, u32 pulse) {
+/* HFIX71: bottom screen is now a helper/info panel for the root menu --
+   the interactive buttons live on the top screen instead. */
+static void mivf_menu_draw_info_bottom(u8 *fb, const MivfMenu *menu) {
+    const MivfMenuButton *sel = NULL;
+    bool have_bookmark_hint = false;
+
     hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
     hfix58_blend_rect565(fb, 10, 8, 300, 210, 14, 22, 38, 225);
     hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
@@ -9427,10 +9536,43 @@ static void mivf_menu_draw_bottom(u8 *fb, const MivfMenu *menu, u32 pulse) {
 
     mivf_menu_draw_panel_header(fb, "DISC MENU", 1, 1);
 
-    for (int i = 0; i < menu->button_count; i++) {
-        mivf_menu_draw_button(fb, &menu->buttons[i], i == menu->selected, pulse);
+    if (menu->selected >= 0 && menu->selected < menu->button_count) {
+        sel = &menu->buttons[menu->selected];
     }
 
+    if (sel) {
+        hfix58_draw_text_shadow(fb, 18, 50, sel->label, 1,
+            sel->enabled ? 235 : 140, sel->enabled ? 245 : 148, sel->enabled ? 255 : 158);
+        hfix58_draw_text_shadow(fb, 18, 66, mivf_menu_action_description(sel->action), 1, 170, 190, 210);
+
+        if (!sel->enabled) {
+            hfix58_draw_text_shadow(fb, 18, 82, "NOT AVAILABLE", 1, 200, 120, 120);
+        }
+    }
+
+    hfix58_rect565(fb, 18, 100, 284, 1, 30, 42, 58);
+
+    for (int i = 0; i < menu->button_count; i++) {
+        if (menu->buttons[i].action == MIVF_MENU_ACTION_RESUME && menu->buttons[i].enabled) {
+            have_bookmark_hint = true;
+        }
+    }
+
+    {
+        char info[48];
+
+        snprintf(info, sizeof(info), "%s", have_bookmark_hint ? "RESUME AVAILABLE" : "NO SAVED PROGRESS");
+        hfix58_draw_text_shadow(fb, 18, 114, info, 1, 170, 190, 210);
+    }
+
+    if (g_mivf_chapters_count > 0) {
+        char info[32];
+
+        snprintf(info, sizeof(info), "%d SCENES", g_mivf_chapters_count);
+        hfix58_draw_text_shadow(fb, 18, 130, info, 1, 170, 190, 210);
+    }
+
+    hfix58_draw_text_shadow(fb, 18, 190, "D-PAD MOVE", 1, 150, 170, 195);
     hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
 }
 
@@ -9542,19 +9684,11 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
                 }
             }
 
-            if (down & KEY_TOUCH) {
-                touchPosition tp;
-                hidTouchRead(&tp);
-                for (int i = 0; i < menu->button_count; i++) {
-                    MivfMenuButton *b = &menu->buttons[i];
-                    if (b->enabled &&
-                        tp.px >= b->x && tp.px < b->x + b->w &&
-                        tp.py >= b->y && tp.py < b->y + b->h) {
-                        menu->selected = i;
-                        break;
-                    }
-                }
-            }
+            /* HFIX71: touch-select removed here -- button rects are now top-
+               screen coordinates, and touch input only ever comes from the
+               bottom screen, so bottom-screen touch coordinates no longer
+               correspond to button positions. D-pad + A/B is the supported
+               input for the top-screen root menu. */
 
             if ((down & KEY_A) && menu->selected >= 0 && menu->selected < menu->button_count) {
                 MivfMenuButton *b = &menu->buttons[menu->selected];
@@ -9589,13 +9723,17 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
         u8 *fb_bot = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
 
         if (fb_top) {
-            mivf_menu_draw_top(fb_top, menu);
+            if (in_chapters) {
+                mivf_menu_draw_top(fb_top, menu);
+            } else {
+                mivf_menu_draw_top_root(fb_top, menu, pulse);
+            }
         }
         if (fb_bot) {
             if (in_chapters) {
                 mivf_menu_draw_chapters_bottom(fb_bot, chapter_selected);
             } else {
-                mivf_menu_draw_bottom(fb_bot, menu, pulse);
+                mivf_menu_draw_info_bottom(fb_bot, menu);
             }
         }
 
