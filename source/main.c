@@ -209,6 +209,7 @@ static int g_mivf_chapters_count = 0;
 #define MIVF_MENU_LABEL_MAX 32
 #define MIVF_MENU_ID_MAX 16
 #define MIVF_MENU_TITLE_MAX 64
+#define MIVF_MENU_CHAPTERS_VISIBLE_ROWS 8
 
 typedef enum {
     MIVF_MENU_ACTION_NONE = 0,
@@ -5572,6 +5573,10 @@ static const u8 *hfix58_glyph(char c) {
     static const u8 dash[7] = {0,0,0,31,0,0,0};
     static const u8 colon[7] = {0,12,12,0,12,12,0};
     static const u8 us[7] = {0,0,0,0,0,0,31};
+    /* HFIX70: apostrophe -- also used for straight double-quote (") so
+       quoted chapter/menu titles like "Life Is a Highway" don't fall
+       through to the qn/"?" glyph below. */
+    static const u8 apos[7] = {12,12,8,0,0,0,0};
 
     if (c >= 'a' && c <= 'z') {
         c = (char)(c - 32);
@@ -5583,6 +5588,7 @@ static const u8 *hfix58_glyph(char c) {
     if (c == '-') return dash;
     if (c == ':') return colon;
     if (c == '_') return us;
+    if (c == '\'' || c == '"') return apos;
 
     if (c >= '0' && c <= '9') {
         const u8 *digits[10] = {d0,d1,d2,d3,d4,d5,d6,d7,d8,d9};
@@ -9280,6 +9286,18 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
     return true;
 }
 
+/* HFIX70: small diamond flourish flanking centered titles -- a cheap,
+   recognizable "cinematic menu" accent that doesn't need new font glyphs. */
+static void mivf_menu_top_diamond(u8 *fb, int cx, int cy, int r, int g, int b) {
+    for (int i = 0; i <= 2; i++) {
+        int half = 2 - i;
+        hfix58s_top_rect565(fb, cx - half, cy - 2 + i, half * 2 + 1, 1, r, g, b);
+        if (i > 0) {
+            hfix58s_top_rect565(fb, cx - half, cy + 2 - i, half * 2 + 1, 1, r, g, b);
+        }
+    }
+}
+
 static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
     int title_w;
 
@@ -9289,23 +9307,45 @@ static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu) {
                 hfix58s_top_px565(fb, xx, yy, g_mivf_menu_bg[(size_t)yy * MIVF_MENU_BG_W + xx]);
             }
         }
+
+        /* Title bar with a soft drop edge, and a matching footer-safe bar so
+           any background art still leaves the top/bottom text legible. */
         hfix58s_top_rect565(fb, 0, 0, TOP_W, 30, 4, 8, 16);
         hfix58s_top_rect565(fb, 0, 28, TOP_W, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+        hfix58s_top_rect565(fb, 0, 30, TOP_W, 1, 8, 12, 20);
+        hfix58s_top_rect565(fb, 0, TOP_H - 14, TOP_W, 14, 4, 8, 16);
+        hfix58s_top_rect565(fb, 0, TOP_H - 14, TOP_W, 1, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+
         hfix58s_top_draw_text_shadow(fb, 12, 9, menu->title, 1, 235, 245, 255);
+        hfix58s_top_draw_text_shadow(fb, 12, TOP_H - 11, "MIVF DISC MENU", 1, 150, 170, 195);
         return;
     }
 
     /* Generated "classic_dvd" fallback: dark blue/black vertical gradient,
-       centered title, thin gold/theme divider, small disc-menu caption. */
+       a thin widescreen frame, centered title flanked by small diamond
+       flourishes, thin gold/theme divider, small disc-menu caption. */
     for (int yy = 0; yy < TOP_H; yy++) {
         int shade = 4 + (yy * 22) / TOP_H;
         hfix58s_top_rect565(fb, 0, yy, TOP_W, 1, shade / 3, shade / 2, shade + 8);
     }
 
+    /* Faint widescreen frame -- a single low-key border reads as
+       "cinematic" without competing with the title. */
+    hfix58s_top_rect565(fb, 0, 0, TOP_W, 1, 30, 36, 48);
+    hfix58s_top_rect565(fb, 0, TOP_H - 1, TOP_W, 1, 30, 36, 48);
+    hfix58s_top_rect565(fb, 0, 0, 1, TOP_H, 30, 36, 48);
+    hfix58s_top_rect565(fb, TOP_W - 1, 0, 1, TOP_H, 30, 36, 48);
+
     hfix58s_top_rect565(fb, 0, TOP_H / 2 - 1, TOP_W, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
 
     title_w = (int)strlen(menu->title) * 6 * 2;
     hfix58s_top_draw_text_shadow(fb, (TOP_W - title_w) / 2, TOP_H / 2 - 24, menu->title, 2, 235, 245, 255);
+
+    mivf_menu_top_diamond(fb, (TOP_W - title_w) / 2 - 14, TOP_H / 2 - 17,
+        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+    mivf_menu_top_diamond(fb, (TOP_W + title_w) / 2 + 14, TOP_H / 2 - 17,
+        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+
     hfix58s_top_draw_text_shadow(fb, (TOP_W - (int)strlen("MIVF DISC MENU") * 6) / 2, TOP_H - 20,
         "MIVF DISC MENU", 1, 130, 150, 175);
 }
@@ -9316,31 +9356,67 @@ static void mivf_menu_draw_button(u8 *fb, const MivfMenuButton *b, bool is_selec
     int label_x = b->x + 10;
 
     if (!b->enabled) {
-        br = 20; bg = 22; bb = 28; alpha = 130;
-        text_r = 110; text_g = 118; text_b = 128;
+        br = 16; bg = 17; bb = 20; alpha = 90;
+        text_r = 90; text_g = 96; text_b = 104;
     } else if (is_selected) {
+        /* Smooth triangle-wave pulse (0..30..0) instead of a hard sawtooth
+           reset, so the glow breathes rather than snapping. */
+        u32 phase = pulse % 60u;
+        u32 tri = (phase < 30u) ? phase : (60u - phase);
+
         br = g_mivf_theme_r; bg = g_mivf_theme_g; bb = g_mivf_theme_b;
-        alpha = 150 + (int)(pulse % 60u);
+        alpha = 165 + (int)tri;
         text_r = 255; text_g = 250; text_b = 235;
-        label_x += 12;
+        label_x += 14;
+
+        /* Outer glow bleed behind the button -- a soft, larger, low-alpha
+           halo reads as "glowing" more than a same-size fill ever can. */
+        hfix58_blend_rect565(fb, b->x - 3, b->y - 3, b->w + 6, b->h + 6,
+            g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 40 + (int)tri / 2);
     } else {
         br = 26; bg = 32; bb = 46; alpha = 165;
         text_r = 205; text_g = 215; text_b = 228;
     }
 
     hfix58_blend_rect565(fb, b->x, b->y, b->w, b->h, br, bg, bb, alpha);
-    hfix58_rect565(fb, b->x, b->y, b->w, 1, br, bg, bb);
+
+    if (b->enabled) {
+        hfix58_rect565(fb, b->x, b->y, b->w, 1, br, bg, bb);
+    }
 
     if (is_selected) {
+        /* Full gold outline, not just a left bar -- reads much more like a
+           real DVD menu's selection frame. */
+        hfix58_rect565(fb, b->x, b->y, b->w, 2, 255, 222, 120);
+        hfix58_rect565(fb, b->x, b->y + b->h - 2, b->w, 2, 255, 222, 120);
         hfix58_rect565(fb, b->x, b->y, 2, b->h, 255, 222, 120);
+        hfix58_rect565(fb, b->x + b->w - 2, b->y, 2, b->h, 255, 222, 120);
 
-        for (int i = 0; i < 4; i++) {
-            int arm = 4 - i;
-            hfix58_rect565(fb, b->x + 5 + i, b->y + b->h / 2 - arm, 1, arm * 2 + 1, 255, 222, 120);
+        for (int i = 0; i < 5; i++) {
+            int arm = 5 - i;
+            hfix58_rect565(fb, b->x + 6 + i, b->y + b->h / 2 - arm, 1, arm * 2 + 1, 255, 222, 120);
         }
     }
 
     hfix58_draw_text_shadow(fb, label_x, b->y + b->h / 2 - 3, b->label, 1, text_r, text_g, text_b);
+}
+
+/* HFIX70: shared header treatment for both bottom-screen menu panels -- a
+   title, a small bullet divider, and (when total_pages > 1) a right-aligned
+   "PAGE X/Y" indicator, so Scene Selection reads like a real DVD scene menu
+   instead of a plain list. total_pages <= 1 draws no page indicator. */
+static void mivf_menu_draw_panel_header(u8 *fb, const char *title, int page, int total_pages) {
+    hfix58_draw_text_shadow(fb, 18, 16, title, 1, 235, 245, 255);
+    hfix58_rect565(fb, 18, 28, (int)strlen(title) * 6, 1, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+
+    if (total_pages > 1) {
+        char page_str[16];
+        int w;
+
+        snprintf(page_str, sizeof(page_str), "PAGE %d/%d", page, total_pages);
+        w = (int)strlen(page_str) * 6;
+        hfix58_draw_text_shadow(fb, 302 - w, 16, page_str, 1, 170, 195, 220);
+    }
 }
 
 static void mivf_menu_draw_bottom(u8 *fb, const MivfMenu *menu, u32 pulse) {
@@ -9349,7 +9425,7 @@ static void mivf_menu_draw_bottom(u8 *fb, const MivfMenu *menu, u32 pulse) {
     hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
     hfix58_rect565(fb, 10, 216, 300, 2, 2, 4, 8);
 
-    hfix58_draw_text_shadow(fb, 18, 16, "DISC MENU", 1, 170, 195, 220);
+    mivf_menu_draw_panel_header(fb, "DISC MENU", 1, 1);
 
     for (int i = 0; i < menu->button_count; i++) {
         mivf_menu_draw_button(fb, &menu->buttons[i], i == menu->selected, pulse);
@@ -9359,19 +9435,28 @@ static void mivf_menu_draw_bottom(u8 *fb, const MivfMenu *menu, u32 pulse) {
 }
 
 static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
-    enum { VISIBLE_ROWS = 8, ROW_H = 22 };
+    enum { ROW_H = 22 };
     int start = 0;
+    int page;
+    int total_pages;
 
-    if (selected >= VISIBLE_ROWS) {
-        start = selected - VISIBLE_ROWS + 1;
+    if (selected >= MIVF_MENU_CHAPTERS_VISIBLE_ROWS) {
+        start = selected - MIVF_MENU_CHAPTERS_VISIBLE_ROWS + 1;
+    }
+
+    page = (g_mivf_chapters_count > 0) ? (start / MIVF_MENU_CHAPTERS_VISIBLE_ROWS) + 1 : 1;
+    total_pages = (g_mivf_chapters_count + MIVF_MENU_CHAPTERS_VISIBLE_ROWS - 1) / MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+    if (total_pages < 1) {
+        total_pages = 1;
     }
 
     hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
     hfix58_blend_rect565(fb, 10, 8, 300, 210, 14, 22, 38, 225);
     hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-    hfix58_draw_text_shadow(fb, 18, 16, "SCENE SELECTION", 1, 235, 245, 255);
 
-    for (int row = 0; row < VISIBLE_ROWS && (start + row) < g_mivf_chapters_count; row++) {
+    mivf_menu_draw_panel_header(fb, "SCENE SELECTION", page, total_pages);
+
+    for (int row = 0; row < MIVF_MENU_CHAPTERS_VISIBLE_ROWS && (start + row) < g_mivf_chapters_count; row++) {
         int idx = start + row;
         int y = 38 + row * ROW_H;
         bool sel = (idx == selected);
@@ -9379,6 +9464,7 @@ static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
 
         if (sel) {
             hfix58_blend_rect565(fb, 18, y - 2, 284, 20, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 170);
+            hfix58_rect565(fb, 18, y - 2, 2, 20, 255, 222, 120);
         }
 
         snprintf(line, sizeof(line), "%d. %.36s", idx + 1, g_mivf_chapters[idx].label);
@@ -9386,7 +9472,11 @@ static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
             sel ? 255 : 200, sel ? 250 : 210, sel ? 235 : 220);
     }
 
-    hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
+    if (total_pages > 1) {
+        hfix58_draw_text_shadow(fb, 18, 224, "A SELECT  B BACK  L/R PAGE", 1, 150, 170, 195);
+    } else {
+        hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
+    }
 }
 
 /* Runs the interactive menu loop. Returns PLAY once a launch-worthy action
@@ -9419,6 +9509,18 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
             }
             if ((down & KEY_DDOWN) && chapter_selected < g_mivf_chapters_count - 1) {
                 chapter_selected++;
+            }
+            if (down & KEY_L) {
+                chapter_selected -= MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+                if (chapter_selected < 0) {
+                    chapter_selected = 0;
+                }
+            }
+            if (down & KEY_R) {
+                chapter_selected += MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+                if (chapter_selected > g_mivf_chapters_count - 1) {
+                    chapter_selected = g_mivf_chapters_count - 1;
+                }
             }
             if ((down & KEY_A) && g_mivf_chapters_count > 0) {
                 g_mivf_launch_mode = MIVF_LAUNCH_CHAPTER;
