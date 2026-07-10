@@ -1801,6 +1801,15 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
         out_file.write(desc0)
         out_file.write(desc1)
 
+        # Phase 1 perf: these three are constant for the whole file (same
+        # samples_per_frame/format string every iteration), so build them
+        # once here instead of having struct.pack/unpack re-parse a format
+        # string (and, for pcm_struct, re-concatenate "<" + "h"*N) on every
+        # single frame. Pure bookkeeping -- same bytes in, same bytes out.
+        pcm_struct = struct.Struct("<" + "h" * samples_per_frame)
+        packet_hdr_struct = struct.Struct("<BBHIII")
+        page_struct = struct.Struct("<2sBBIQIHHII")
+
         audio_proc = start_ffmpeg_audio_pipe(audio_src, rate, channels)
 
         try:
@@ -1832,17 +1841,16 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
                     pcm += b"\x00" * (pcm_bytes_needed - len(pcm))
 
                 if audio_codec == "ia4m":
-                    samples = list(struct.unpack("<" + "h" * samples_per_frame, pcm[:samples_per_frame * 2]))
+                    samples = list(pcm_struct.unpack(pcm[:samples_per_frame * 2]))
                     abody = encode_ia4m_packet(samples, frame_no)
                 else:
                     abody = pcm
-                apkt = struct.pack("<BBHIII", 1, 0, PACKET_HEADER_SIZE, 0, len(abody), frame_no) + abody
+                apkt = packet_hdr_struct.pack(1, 0, PACKET_HEADER_SIZE, 0, len(abody), frame_no) + abody
 
                 new_payload = payload + apkt
                 crc = zlib.crc32(new_payload) & 0xFFFFFFFF
 
-                page = struct.pack(
-                    "<2sBBIQIHHII",
+                page = page_struct.pack(
                     b"MP",
                     PAGE_HEADER_SIZE,
                     page_flags,
@@ -2049,6 +2057,10 @@ def encode_one(
     seek_index_sidecar: Path | None = None,
 ) -> None:
     workdir = make_temp_workdir()
+    total_t0 = time.time()
+    mux_elapsed = 0.0
+    m2y2_elapsed = 0.0
+    seek_index_elapsed = 0.0
     try:
         temp_video_only = workdir / "temp_video_only.mivf"
 
@@ -2062,22 +2074,27 @@ def encode_one(
         print("============================================================")
         print(f"2. Multiplexing Audio ({settings.audio_codec.upper()})")
         print("============================================================")
+        mux_t0 = time.time()
         mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir, settings.audio_codec)
+        mux_elapsed = time.time() - mux_t0
 
         if make_m2y2:
             print()
             print("============================================================")
             print("3. Range-coding video to M2Y2 (lossless, smaller file)")
             print("============================================================")
+            m2y2_t0 = time.time()
             tmp_m2y2 = output_path.with_name(output_path.stem + ".m2y2tmp")
             transcode_to_m2y2(output_path, tmp_m2y2)
             os.replace(tmp_m2y2, output_path)
+            m2y2_elapsed = time.time() - m2y2_t0
 
         if make_seek_index:
             print()
             print("============================================================")
             print("4. Generating Seek Index Metadata")
             print("============================================================")
+            seek_index_t0 = time.time()
             try:
                 seek_data = collect_seek_index_data(output_path)
                 if not seek_data.seek_points:
@@ -2107,6 +2124,7 @@ def encode_one(
                     )
             except Exception as exc:
                 print(f"WARNING: seek index generation failed: {exc}")
+            seek_index_elapsed = time.time() - seek_index_t0
 
         packet_stats: dict | None = None
         if report_packet_sizes:
@@ -2121,6 +2139,22 @@ def encode_one(
 
         if deploy_sd:
             deploy_output(output_path)
+
+        total_elapsed = time.time() - total_t0
+        video_elapsed = encode_stats.get("elapsed_sec", 0.0)
+
+        print()
+        print("============================================================")
+        print("STAGE TIMING")
+        print("============================================================")
+        print(f"  1. video encode:      {fmt_time(video_elapsed)} ({video_elapsed:.1f}s)")
+        print(f"  2. audio mux:         {fmt_time(mux_elapsed)} ({mux_elapsed:.1f}s)")
+        if make_m2y2:
+            print(f"  3. m2y2 transcode:    {fmt_time(m2y2_elapsed)} ({m2y2_elapsed:.1f}s)")
+        if make_seek_index:
+            print(f"  4. seek index:        {fmt_time(seek_index_elapsed)} ({seek_index_elapsed:.1f}s)")
+        print(f"  total:                {fmt_time(total_elapsed)} ({total_elapsed:.1f}s)")
+        print("============================================================")
 
         print_encode_summary(
             input_path=input_path,
