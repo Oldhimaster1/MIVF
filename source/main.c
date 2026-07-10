@@ -8993,6 +8993,79 @@ static u32 audio_count_pending_wavebufs(void) {
     return pending;
 }
 
+/*
+    hfix76: audio-clock sync controller -- the actual fix for the perceived
+    "audio gets later over time" problem.
+
+    Root cause (proven by the avsync_audioq: log): one audio wavebuf is
+    submitted per presented video frame, paced by the video presentation
+    clock (svcGetSystemTick). NDSP drains wavebufs at the DSP's own audio
+    clock. Those two clocks are NOT the same oscillator, and the DSP's is a
+    touch slower here (~0.5% measured), so audio is produced slightly faster
+    than it's consumed. The surplus accumulates in the wavebuf queue:
+    pending_wavebufs climbed 1 -> 12 over ~110s of steady playback in the
+    log, and each queued buffer is 41.67ms of latency between "submitted near
+    video frame N" and "actually audible". Left alone it keeps growing until
+    the 48-buffer pool saturates at ~2s of lag (then starts dropping) -- i.e.
+    audio that starts in sync drifts seconds late over a few minutes, exactly
+    the reported symptom. drift_ms / delta_frames can't see this because they
+    track submission, and submission is correct; the latency is entirely
+    downstream of it, in the queue.
+
+    Fix: gently steer the DSP playback rate so consumption matches production,
+    holding the queue at a small, bounded depth. When the queue is deeper than
+    target we nudge the rate up (drain faster); when shallower we nudge it down
+    (let it refill). The correction converges to the real production/consumption
+    ratio (~0.5% here) and then sits in a dead zone, so the steady-state pitch
+    change is a fixed sub-percent (< ~9 cents) shift -- inaudible, and constant,
+    so no wobble. This keeps audio perfectly continuous (no drops -- important
+    for a wall-to-wall musical) and leaves video pacing untouched, unlike a
+    drop-when-full cap (audible gaps in singing) or loop backpressure (video
+    judder). Bounded, principled, no NDSP resets or hard flushes in the steady
+    state.
+*/
+#define AUDIO_SYNC_TARGET_LOW   3    /* below this: let the queue refill (slow consume) */
+#define AUDIO_SYNC_TARGET_HIGH  6    /* above this: drain the queue (speed consume up)  */
+#define AUDIO_SYNC_STEP         0.0015f  /* per ~1s tick; ~2.6 cents, well under audible */
+#define AUDIO_SYNC_MAX_CORR     0.03f    /* clamp correction to +/-3% as a safety rail    */
+
+static float g_audio_rate_corr = 1.0f;
+
+static float audio_rate_base(void) {
+    return (float)audio.rate * (float)mivf_speed_pct() / 100.0f;
+}
+
+/* Re-arm to neutral. Called at playback start and after a seek flush, since
+   the wavebuf queue is emptied there and the controller should re-converge
+   from a clean slate rather than carry a stale correction. */
+static void audio_rate_sync_reset(void) {
+    g_audio_rate_corr = 1.0f;
+    if (audio_can_use_ndsp()) {
+        ndspChnSetRate(0, audio_rate_base());
+    }
+}
+
+static void audio_rate_sync_tick(void) {
+    if (!audio_can_use_ndsp() || audio.rate == 0) {
+        return;
+    }
+
+    u32 pending = audio_count_pending_wavebufs();
+    bool changed = false;
+
+    if (pending > AUDIO_SYNC_TARGET_HIGH && g_audio_rate_corr < 1.0f + AUDIO_SYNC_MAX_CORR) {
+        g_audio_rate_corr += AUDIO_SYNC_STEP;
+        changed = true;
+    } else if (pending < AUDIO_SYNC_TARGET_LOW && g_audio_rate_corr > 1.0f - AUDIO_SYNC_MAX_CORR) {
+        g_audio_rate_corr -= AUDIO_SYNC_STEP;
+        changed = true;
+    }
+
+    if (changed) {
+        ndspChnSetRate(0, audio_rate_base() * g_audio_rate_corr);
+    }
+}
+
 static void avsync_audioq_report(u32 video_frame) {
     u32 pending = audio_count_pending_wavebufs();
     u32 free_bufs = (u32)AUDIO_BUFS - pending;
@@ -9000,9 +9073,15 @@ static void avsync_audioq_report(u32 video_frame) {
         ? (u32)(((u64)pending * (u64)audio.samples_per_frame * 1000ull) / audio.rate)
         : 0;
 
+    /* rate_corr_ppt = the sync controller's current correction in parts per
+       thousand (1000 = neutral). It should settle near the real clock
+       mismatch (~1005 for the measured ~0.5%) and then hold, with
+       queued_audio_ms bounded instead of climbing. */
+    u32 rate_corr_ppt = (u32)(g_audio_rate_corr * 1000.0f + 0.5f);
+
     printf(
         "avsync_audioq: video_frame=%lu submit_frame=%lu pending_wavebufs=%lu free_wavebufs=%lu "
-        "queued_audio_ms=%lu audio_submit=%lu audio_drop=%lu audio_wait_events=%lu\n",
+        "queued_audio_ms=%lu audio_submit=%lu audio_drop=%lu audio_wait_events=%lu rate_corr_ppt=%lu\n",
         (unsigned long)video_frame,
         (unsigned long)g_avsync_first_audio_frame,
         (unsigned long)pending,
@@ -9010,7 +9089,8 @@ static void avsync_audioq_report(u32 video_frame) {
         (unsigned long)queued_audio_ms,
         (unsigned long)g_audio_submit,
         (unsigned long)g_audio_drop,
-        (unsigned long)g_audio_wait_events);
+        (unsigned long)g_audio_wait_events,
+        (unsigned long)rate_corr_ppt);
 }
 
 /* Same ~5s-of-nominal-video-time cadence as avsync_drift_maybe_report, and
@@ -9266,6 +9346,15 @@ static void hfix59r3_present_video_frame(
 
     avsync_drift_maybe_report(now_tick, shown_frame, fpsn_abs, fpsd_abs);
     avsync_audioq_maybe_report(shown_frame, false);
+
+    /* hfix76: run the audio-clock sync controller ~once per second. The modulo
+       gate self-aligns across seeks (no per-session counter to reset) and is
+       coarse on purpose -- adjusting the DSP rate at most once a second keeps
+       the correction gradual and the steady state a fixed sub-percent offset
+       rather than a per-frame wobble. */
+    if (fpsn_abs > 0 && (shown_frame % fpsn_abs) == 0) {
+        audio_rate_sync_tick();
+    }
 
     if (now_tick > *next_frame_tick + frame_ticks_abs * 2) {
         *next_frame_tick = now_tick + frame_ticks_abs;
@@ -11559,6 +11648,12 @@ static void hfix58f_audio_flush_for_seek(void) {
     g_audio_drop = 0;
     g_last_audio_bytes = 0;
     g_last_audio_samples = 0;
+
+    /* Queue was just emptied -- restart the sync controller neutral so it
+       re-converges for the new position instead of holding a stale rate.
+       (audio_configure_ndsp_channel above already set the base rate; this
+       just clears the correction factor to match.) */
+    audio_rate_sync_reset();
 }
 
 static void hfix58f_reset_m2y_frame(M2Y0Frame *f) {
@@ -12056,6 +12151,7 @@ static int play(void) {
     if (ha) {
         audio_init_from_stream(&a);
         audio_delay_ring_reconfigure(g_mivf_settings.audio_offset_ms);
+        audio_rate_sync_reset();
     } else {
         printf("no audio stream\n");
     }
