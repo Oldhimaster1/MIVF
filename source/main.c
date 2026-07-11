@@ -9194,19 +9194,39 @@ static u32 audio_count_pending_wavebufs(void) {
    there. A time-varying ramp can never be fixed by a single baked-in
    encoder offset (which is why that approach kept not quite working); the
    only real fix is to lower what this controller is holding the queue at.
-   Lowered from 3.0 to 1.5 (~62ms target instead of ~125ms) -- still a real
-   safety margin above the single in-flight buffer (pending counts QUEUED +
-   PLAYING, so this keeps roughly one buffer queued behind the one actually
-   playing), just a much smaller one. If this reintroduces audible
-   stutter/underrun, that's the tradeoff to re-tune, not a sign this
-   approach is wrong. */
+   Lowered from 3.0 to 1.5 (~62ms target instead of ~125ms).
+
+   hfix76d: but a proportional-ONLY controller cannot actually PARK the queue
+   at that setpoint. The hardware log after the 1.5 change proved it: setpoint
+   1.5, yet the queue sat flat at pending=3 (queued 125ms, audible_lag 83ms),
+   with corr climbing to ~1.007. That is exactly the classic P-controller
+   steady-state error: the constant ~0.5% DSP-vs-CPU clock mismatch is a
+   standing disturbance, and to counter it the loop MUST hold corr at ~1.007,
+   which a pure P term can only produce by maintaining a standing error of
+   0.007/KP = ~1.4 buffers above setpoint. So it parks at 1.5 + 1.4 ~= 3, not
+   1.5 -- the target is physically unreachable with P alone.
+
+   The fix is an integral term (P -> PI). The integrator accumulates error and
+   absorbs the constant clock-bias load itself, driving steady-state error to
+   ZERO -- so the queue settles AT 1.5 (~62ms, ~1 frame of audible lag) rather
+   than 1.4 buffers above it. And because the integral term is DC, it carries
+   that load WITHOUT adding pitch jitter; the small KP is kept only for fast
+   response. This is the textbook reason PI (not higher P) is the right tool
+   here: raising KP would shrink the standing error but amplify measurement
+   jitter into audible pitch wobble, whereas I nulls the error with no wobble.
+   The loop ticks at 1 Hz (once per fps frames), so the gains are sized for
+   that slow rate; the integral contribution is clamped (anti-windup) so a
+   startup transient or a seek can never wind it into a runaway pitch shift. */
 #define AUDIO_SYNC_SETPOINT     1.5f    /* target queued buffers (~62ms at 24fps/48k)      */
-#define AUDIO_SYNC_KP           0.005f  /* rate trim per buffer of smoothed error          */
+#define AUDIO_SYNC_KP           0.005f  /* proportional: rate trim per buffer of error     */
+#define AUDIO_SYNC_KI           0.0007f /* integral: per-tick(1Hz) accrual; nulls DC bias  */
 #define AUDIO_SYNC_EMA_ALPHA    0.3f    /* measurement low-pass; kills per-frame jitter    */
-#define AUDIO_SYNC_MAX_CORR     0.03f   /* clamp correction to +/-3% as a safety rail      */
+#define AUDIO_SYNC_MAX_CORR     0.03f   /* clamp total correction to +/-3% (safety rail)   */
+#define AUDIO_SYNC_I_CLAMP      0.02f   /* clamp integral term alone to +/-2% (anti-windup)*/
 
 static float g_audio_rate_corr = 1.0f;
 static float g_audio_pending_ema = AUDIO_SYNC_SETPOINT;
+static float g_audio_rate_integ = 0.0f; /* accumulated integral term, expressed as a corr offset */
 
 static float audio_rate_base(void) {
     return (float)audio.rate * (float)mivf_speed_pct() / 100.0f;
@@ -9218,6 +9238,7 @@ static float audio_rate_base(void) {
 static void audio_rate_sync_reset(void) {
     g_audio_rate_corr = 1.0f;
     g_audio_pending_ema = AUDIO_SYNC_SETPOINT;
+    g_audio_rate_integ = 0.0f;   /* drop the learned bias: the flushed queue re-converges clean */
     if (audio_can_use_ndsp()) {
         ndspChnSetRate(0, audio_rate_base());
     }
@@ -9234,7 +9255,24 @@ static void audio_rate_sync_tick(void) {
        doesn't yank the playback rate (which would be audible). */
     g_audio_pending_ema += AUDIO_SYNC_EMA_ALPHA * ((float)pending - g_audio_pending_ema);
 
-    float corr = 1.0f + AUDIO_SYNC_KP * (g_audio_pending_ema - AUDIO_SYNC_SETPOINT);
+    float error = g_audio_pending_ema - AUDIO_SYNC_SETPOINT;
+
+    /* Integral: accumulate the error as a corr offset. This is what actually
+       parks the queue at the setpoint -- it grows until it supplies the exact
+       standing correction the constant clock-mismatch needs, at which point
+       the error (and thus further accrual) is zero. Clamp it on its own
+       (anti-windup) so a long startup fill or a post-seek transient can't wind
+       it past a sane pitch trim and take seconds to unwind. */
+    g_audio_rate_integ += AUDIO_SYNC_KI * error;
+    if (g_audio_rate_integ > AUDIO_SYNC_I_CLAMP) {
+        g_audio_rate_integ = AUDIO_SYNC_I_CLAMP;
+    } else if (g_audio_rate_integ < -AUDIO_SYNC_I_CLAMP) {
+        g_audio_rate_integ = -AUDIO_SYNC_I_CLAMP;
+    }
+
+    /* Proportional term kept small (fast response, low jitter); the integral
+       carries the DC load with no jitter. */
+    float corr = 1.0f + AUDIO_SYNC_KP * error + g_audio_rate_integ;
 
     if (corr > 1.0f + AUDIO_SYNC_MAX_CORR) {
         corr = 1.0f + AUDIO_SYNC_MAX_CORR;
