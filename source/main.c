@@ -423,6 +423,20 @@ static AudioState audio;
 static u32 g_audio_submit = 0;
 static u32 g_audio_drop = 0;
 static u32 g_audio_wait_events = 0; /* audio_queue_raw_ndsp had to gspWaitForVBlank at least once */
+static u32 g_audio_submit_diag_count = 0; /* HFIX86: how many submitted-buffer content lines logged */
+
+/* Integer sqrt of a u64, for the HFIX86 rms diagnostic -- avoids pulling in
+   <math.h>/float sqrt for a single bounded-count use. */
+static u32 hfix_isqrt64(u64 v) {
+    u64 x = v, r = 0, b = 1ull << 62;
+    while (b > x) b >>= 2;
+    while (b) {
+        if (x >= r + b) { x -= r + b; r = (r >> 1) + b; }
+        else { r >>= 1; }
+        b >>= 2;
+    }
+    return (u32)r;
+}
 static u32 g_last_audio_bytes = 0;
 static u32 g_last_audio_samples = 0;
 
@@ -522,7 +536,26 @@ static bool app_audio_system_init(void) {
     }
 
     g_ndsp_ready = true;
-    printf("app audio: ndspInit ok\n");
+
+    /* HFIX86: configure the GLOBAL DSP output here, at audio-system init,
+       before anything can play a channel. Previously the output mode and
+       master volume were only ever set lazily inside play()'s
+       audio_configure_ndsp_channel -- which was fine as long as nothing
+       touched the DSP before the first movie. The DVD-menu sound effects
+       (HFIX80, channel 1) broke that assumption: the menu runs before any
+       play(), so menu SFX became the first thing to submit to the DSP, with
+       the global output still unconfigured. Kicking a channel before global
+       output setup can leave NDSP's output path wedged (observed as total
+       silence on *both* channels -- menu SFX and, afterwards, movie audio --
+       even though per-channel state looked healthy). Setting global output
+       once, up front, is both the fix and the correct place for it.
+       audio_configure_ndsp_channel still sets the mode per-movie (mono files
+       want NDSP_OUTPUT_MONO); this just guarantees a sane global output
+       exists from the very first audio of the session. */
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+    ndspSetMasterVol(1.0f);
+
+    printf("app audio: ndspInit ok (output=stereo mastervol=1.0)\n");
     return true;
 #endif
 }
@@ -9012,6 +9045,30 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
             memset(&audio.wb[i], 0, sizeof(audio.wb[i]));
             memcpy(audio.buf[i], data, n);
 
+            /* HFIX86 diag: log the actual sample content of the first few
+               submitted buffers, so "healthy queue but no sound" can be told
+               apart from "real audio isn't reaching NDSP". If peak/rms are
+               non-zero here, real audio is going to the DSP and any remaining
+               silence is downstream (output routing / host). If they're zero,
+               the problem is upstream (decode/gain). Bounded, then silent. */
+            if (g_audio_submit_diag_count < 8) {
+                const s16 *sp = (const s16*)audio.buf[i];
+                u32 count = n / 2;
+                int peak = 0;
+                u64 sumsq = 0;
+                for (u32 s = 0; s < count; s++) {
+                    int a = sp[s] < 0 ? -sp[s] : sp[s];
+                    if (a > peak) peak = a;
+                    sumsq += (u64)((int)sp[s] * (int)sp[s]);
+                }
+                u32 rms = count ? (u32)hfix_isqrt64(sumsq / count) : 0;
+                printf("hfix86_audio_out: submit#%lu nsamples=%lu bytes=%lu peak=%d rms=%lu mastervol=%d\n",
+                    (unsigned long)g_audio_submit_diag_count,
+                    (unsigned long)nsamples, (unsigned long)n, peak, (unsigned long)rms,
+                    (int)(ndspGetMasterVol() * 1000.0f));
+                g_audio_submit_diag_count++;
+            }
+
             audio.wb[i].data_pcm16 = (s16*)audio.buf[i];
             audio.wb[i].nsamples = nsamples;
             audio.wb[i].looping = false;
@@ -13354,6 +13411,7 @@ static int play(void) {
        a previous file don't mislead the debug overlay. */
     hfix58_perf_diag_reset();
     avsync_reset_startup();
+    g_audio_submit_diag_count = 0; /* HFIX86: re-log submitted-buffer content for each new file */
 
     /* HFIX66: a DVD-style menu (if one ran before this play()) sets a one-shot
        launch directive that takes priority over the normal resume prompt --
