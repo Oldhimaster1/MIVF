@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from fractions import Fraction
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from multiprocessing import cpu_count
@@ -164,11 +165,140 @@ def finalize_helper_psnr(agg: dict[str, dict[str, float]]) -> dict[str, float]:
     return out
 
 
+# MIVF_RATIONAL_FPS_V1
+
+def parse_frame_rate(value: str | int | Fraction) -> Fraction:
+    """Parse an exact positive MIVF frame rate.
+
+    Accepted CLI forms include 24, 30, 24000/1001, and 30000/1001.
+    Floating-point spellings are deliberately rejected so timing never depends
+    on binary-float approximation. MIVF stores numerator and denominator as
+    unsigned 16-bit fields, so the reduced values must fit 1..65535.
+    """
+    if isinstance(value, Fraction):
+        rate = value
+    elif isinstance(value, int):
+        rate = Fraction(value, 1)
+    else:
+        raw = str(value).strip()
+        if not raw or "." in raw or "e" in raw.lower():
+            raise argparse.ArgumentTypeError(
+                "FPS must be an integer or exact fraction such as 24 or 24000/1001"
+            )
+        try:
+            rate = Fraction(raw)
+        except (ValueError, ZeroDivisionError) as exc:
+            raise argparse.ArgumentTypeError(f"invalid FPS {raw!r}") from exc
+    if rate <= 0:
+        raise argparse.ArgumentTypeError("FPS must be greater than zero")
+    if rate.numerator > 0xFFFF or rate.denominator > 0xFFFF:
+        raise argparse.ArgumentTypeError(
+            f"reduced FPS {rate.numerator}/{rate.denominator} does not fit MIVF u16 fields"
+        )
+    return rate
+
+
+def frame_to_ticks(frame: int, fps_num: int, fps_den: int) -> int:
+    if frame < 0 or fps_num <= 0 or fps_den <= 0:
+        raise ValueError("invalid frame/FPS for timestamp conversion")
+    return frame * 30000 * fps_den // fps_num
+
+
+def fixed_audio_samples_per_frame(rate: int, fps_num: int, fps_den: int) -> int:
+    if rate <= 0 or fps_num <= 0 or fps_den <= 0:
+        raise ValueError("invalid audio rate/FPS")
+    numerator = rate * fps_den
+    quotient, remainder = divmod(numerator, fps_num)
+    if remainder:
+        raise SystemExit(
+            f"audio rate {rate} Hz and FPS {fps_num}/{fps_den} require variable-size "
+            "audio packets; this safe first rational-FPS patch supports only an exact "
+            "fixed samples/frame ratio. For 24000/1001 use --audio-rate 48000."
+        )
+    if quotient <= 0 or quotient > 0xFFFF:
+        raise SystemExit(f"audio samples/frame {quotient} does not fit the MIVF audio descriptor")
+    return quotient
+
+
+def read_exact_or_eof(pipe, byte_count: int) -> bytes:
+    """Accumulate a full pipe read; return short only after confirmed EOF."""
+    data = bytearray()
+    while len(data) < byte_count:
+        chunk = pipe.read(byte_count - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
+
+
+def patch_video_timing_metadata(path: Path, fps_num: int, fps_den: int) -> None:
+    """Retimestamp one helper-produced video-only MIVF segment in place.
+
+    The native helper currently accepts integer FPS only. Video coding itself is
+    frame-index based, so immediately patching its descriptor, duration, and page
+    PTS yields an exact rationally-timed segment without changing one coded pixel.
+    """
+    with path.open("r+b") as f:
+        header = bytearray(f.read(HEADER_SIZE))
+        if len(header) != HEADER_SIZE or header[:4] != b"MIVF":
+            raise RuntimeError(f"{path}: helper output is not MIVF")
+        first = le64(header, 36)
+        streams = le32(header, 12)
+        if streams != 1 or first <= HEADER_SIZE or first > 4096:
+            raise RuntimeError(f"{path}: unexpected helper container layout")
+
+        desc_len = first - HEADER_SIZE
+        desc = bytearray(f.read(desc_len))
+        if len(desc) != desc_len or len(desc) < STREAM_DESC_SIZE:
+            raise RuntimeError(f"{path}: short video descriptor")
+        if desc[1] != 1:
+            raise RuntimeError(f"{path}: first helper stream is not video")
+        struct.pack_into("<HH", desc, 20, fps_num, fps_den)
+        f.seek(HEADER_SIZE)
+        f.write(desc)
+
+        frame_count = 0
+        pos = first
+        file_size = path.stat().st_size
+        while pos < file_size:
+            f.seek(pos)
+            page = bytearray(f.read(PAGE_HEADER_SIZE))
+            if not page:
+                break
+            if len(page) != PAGE_HEADER_SIZE or page[:2] != b"MP":
+                raise RuntimeError(f"{path}: bad page at offset {pos}")
+            payload = le32(page, 16)
+            seq = le32(page, 4)
+            end = pos + PAGE_HEADER_SIZE + payload
+            if payload <= 0 or end > file_size:
+                raise RuntimeError(f"{path}: invalid page payload at frame {seq}")
+            struct.pack_into("<Q", page, 8, frame_to_ticks(seq, fps_num, fps_den))
+            f.seek(pos)
+            f.write(page)
+            frame_count += 1
+            pos = end
+
+        struct.pack_into("<Q", header, 20, frame_to_ticks(frame_count, fps_num, fps_den))
+        f.seek(0)
+        f.write(header)
+
+
 @dataclass
 class EncodeSettings:
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
-    fps: int = DEFAULT_FPS
+    fps_num: int = DEFAULT_FPS
+    fps_den: int = 1
+
+    @property
+    def fps_text(self) -> str:
+        return f"{self.fps_num}/{self.fps_den}"
+
+    @property
+    def helper_fps(self) -> int:
+        # Codec decisions are frame-index based; this is temporary helper
+        # metadata only and is replaced by patch_video_timing_metadata().
+        return max(1, int(Fraction(self.fps_num, self.fps_den) + Fraction(1, 2)))
     audio_rate: int = DEFAULT_AUDIO_RATE
     audio_channels: int = DEFAULT_AUDIO_CHANNELS
     audio_codec: str = "ia4m"
@@ -1121,7 +1251,7 @@ def encoder_segment_cmd(
         "--height",
         str(settings.height),
         "--fps",
-        str(settings.fps),
+        str(settings.helper_fps),
         "--keyint",
         str(settings.keyint),
         "--qp",
@@ -1183,6 +1313,7 @@ def run_encoder_segment(
         )
     if not output_path.exists():
         raise RuntimeError(f"encoder segment did not create {output_path}")
+    patch_video_timing_metadata(output_path, settings.fps_num, settings.fps_den)
     stdout_text = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
     return output_path, stdout_text
 
@@ -1463,7 +1594,7 @@ def merge_video_segments(
             total_frames += copied
             print(f"merged segment {idx}: frames={copied}", flush=True)
 
-        duration = total_frames * 30000 // settings.fps
+        duration = frame_to_ticks(total_frames, settings.fps_num, settings.fps_den)
         out_file.seek(20)
         out_file.write(struct.pack("<Q", duration))
 
@@ -1711,7 +1842,7 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
             "--height",
             str(settings.height),
             "--fps",
-            str(settings.fps),
+            str(settings.helper_fps),
             "--keyint",
             str(settings.keyint),
             "--qp",
@@ -1763,8 +1894,8 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
         first_chunk = chunk_outputs[0].read_bytes()
         header = bytearray(first_chunk[:96])
 
-        chunk_duration = (total_frames // cores) * 30000 // settings.fps
-        total_duration = total_frames * 30000 // settings.fps
+        chunk_duration = frame_to_ticks(total_frames // cores, settings.fps_num, settings.fps_den)
+        total_duration = frame_to_ticks(total_frames, settings.fps_num, settings.fps_den)
         chunk_dur_bytes = struct.pack("<Q", chunk_duration)
         total_dur_bytes = struct.pack("<Q", total_duration)
         idx = header.find(chunk_dur_bytes)
@@ -1782,7 +1913,7 @@ def build_parallel_mivf(workdir: Path, temp_master_yuv: Path, temp_video_only: P
                 page_header = bytearray(data[offset:offset + 32])
                 payload_size = struct.unpack_from("<I", page_header, 16)[0]
                 wr_u32le(page_header, 4, running_frame_idx)
-                wr_u64le(page_header, 8, running_frame_idx * 30000 // settings.fps)
+                wr_u64le(page_header, 8, frame_to_ticks(running_frame_idx, settings.fps_num, settings.fps_den))
                 out_file.write(page_header)
                 out_file.write(data[offset + 32:offset + 32 + payload_size])
                 offset += 32 + payload_size
@@ -1824,7 +1955,7 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
 
         fpsn = le16(desc0, 20) or DEFAULT_FPS
         fpsd = le16(desc0, 22) or 1
-        samples_per_frame = rate * fpsd // fpsn
+        samples_per_frame = fixed_audio_samples_per_frame(rate, fpsn, fpsd)
         if samples_per_frame <= 0:
             raise SystemExit("bad audio samples/frame")
 
@@ -1908,9 +2039,9 @@ def mux_audio_into_mivf(video_mivf: Path, audio_src: Path, out_path: Path, rate:
                     silence_samples_remaining -= silence_here
                     remaining_bytes = pcm_bytes_needed - len(pcm)
                     if remaining_bytes > 0 and audio_proc.stdout:
-                        pcm += audio_proc.stdout.read(remaining_bytes)
+                        pcm += read_exact_or_eof(audio_proc.stdout, remaining_bytes)
                 elif audio_proc.stdout:
-                    pcm = audio_proc.stdout.read(pcm_bytes_needed)
+                    pcm = read_exact_or_eof(audio_proc.stdout, pcm_bytes_needed)
                 else:
                     pcm = b""
                 if len(pcm) < pcm_bytes_needed:
@@ -2063,7 +2194,7 @@ def print_encode_summary(
     print(f"  input:                {input_path}")
     print(f"  output:               {output_path}")
     print(f"  motion-search:        {settings.motion_search}")
-    print(f"  resolution:           {settings.width}x{settings.height} @ {settings.fps} fps")
+    print(f"  resolution:           {settings.width}x{settings.height} @ {settings.fps_text} fps")
     print(f"  qp:                   {settings.qp} (c-qp-offset {settings.c_qp_offset})")
     print(f"  lambda:               {settings.lambda_value}")
     print(f"  keep:                 {settings.keep}")
@@ -2292,7 +2423,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("output", help="output .mivf file or output folder")
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
-    parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
+    parser.add_argument("--fps", type=parse_frame_rate, default=Fraction(DEFAULT_FPS, 1), help="exact frame rate: integer or rational, e.g. 24 or 24000/1001")
     parser.add_argument("--audio-rate", type=int, default=DEFAULT_AUDIO_RATE)
     parser.add_argument("--audio-channels", type=int, default=DEFAULT_AUDIO_CHANNELS)
     parser.add_argument("--audio-codec", choices=["ia4m", "pc16"], default="ia4m", help="audio mux format: ia4m is small ADPCM mono, pc16 is larger high-quality PCM")
@@ -2355,7 +2486,8 @@ def main() -> None:
     settings = EncodeSettings(
         width=args.width,
         height=args.height,
-        fps=args.fps,
+        fps_num=args.fps.numerator,
+        fps_den=args.fps.denominator,
         audio_rate=args.audio_rate,
         audio_channels=args.audio_channels,
         audio_codec=args.audio_codec,
@@ -2408,7 +2540,7 @@ def main() -> None:
     print("============================================================")
     print(f"  profile:         {args.profile}")
     print(f"  resolution:      {settings.width}x{settings.height}")
-    print(f"  fps:             {settings.fps}")
+    print(f"  fps:             {settings.fps_text}")
     print(f"  keyint:          {settings.keyint}")
     print(f"  qp:              {settings.qp}")
     print(f"  c_qp_offset:     {settings.c_qp_offset}")
