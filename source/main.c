@@ -289,6 +289,7 @@ typedef struct {
     bool has_resume_progress;         /* hfix79: valid bookmark_frame/total_frames below */
     u32 resume_bookmark_frame;
     u32 resume_total_frames;
+    bool has_screensaver_image;       /* hfix85: custom bounce image loaded into g_mivf_screensaver_img */
 } MivfMenu;
 
 typedef enum {
@@ -326,6 +327,19 @@ static int  g_mivf_menu_last_chapter = 0;
 #define MIVF_MENU_BG_W TOP_W
 #define MIVF_MENU_BG_H TOP_H
 static u16 g_mivf_menu_bg[MIVF_MENU_BG_W * MIVF_MENU_BG_H];
+
+/* hfix85: idle-menu "bouncing logo" screensaver, classic DVD-player style --
+   corner-hunting included for free, since that's just what the physics do.
+   Bounces an original MIVF mark by default; if a ".screensaver.cover"
+   sidecar exists next to the movie (same raw-RGB565, no-header convention
+   as ".menu_bg.cover"), that image bounces instead. This is deliberately
+   how a user could bounce their own 3DS logo image (or anything else) --
+   this codebase doesn't ship a reproduction of Nintendo's trademarked logo
+   itself, but the mechanism to bounce *any* image the user supplies is
+   exactly this. */
+#define MIVF_SCREENSAVER_W 96
+#define MIVF_SCREENSAVER_H 54
+static u16 g_mivf_screensaver_img[MIVF_SCREENSAVER_W * MIVF_SCREENSAVER_H];
 
 /* Playback-speed table (percent of normal). Index 2 == 100% (1.0x). */
 static const u32 g_mivf_speed_table[] = { 50u, 75u, 100u, 125u, 150u, 200u };
@@ -10293,6 +10307,31 @@ static bool mivf_menu_load_background(const char *movie_path) {
     return mivf_assets_load_exact(movie_path, "menu_bg.cover", g_mivf_menu_bg, need);
 }
 
+/* hfix85: optional custom bounce image for the idle screensaver -- exact
+   raw RGB565 size, no header, same simplicity as ".menu_bg.cover". Absent
+   or wrong-sized sidecar just means the default drawn MIVF mark bounces
+   instead (see mivf_menu_draw_screensaver); this never blocks the menu. */
+static bool mivf_menu_load_screensaver_image(const char *movie_path) {
+    char path[HFIX58_MAX_PATH];
+    FILE *f;
+    size_t need = (size_t)MIVF_SCREENSAVER_W * (size_t)MIVF_SCREENSAVER_H * 2u;
+    size_t got;
+
+    hfix60_make_sidecar_path(path, sizeof(path), movie_path, ".screensaver.cover");
+    if (!path[0]) {
+        return false;
+    }
+
+    f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+
+    got = fread(g_mivf_screensaver_img, 1, need, f);
+    fclose(f);
+    return got == need;
+}
+
 static MivfMenuAction mivf_menu_parse_action(const char *s) {
     if (!strcmp(s, "play")) return MIVF_MENU_ACTION_PLAY;
     if (!strcmp(s, "resume")) return MIVF_MENU_ACTION_RESUME;
@@ -10550,6 +10589,7 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
     }
 
     menu->has_background = mivf_menu_load_background(movie_path);
+    menu->has_screensaver_image = mivf_menu_load_screensaver_image(movie_path);
     menu->valid = true;
     return true;
 }
@@ -11134,6 +11174,110 @@ static void menu_sfx_move(void)   { menu_sfx_play(&g_menu_sfx_move); }
 static void menu_sfx_select(void) { menu_sfx_play(&g_menu_sfx_select); }
 static void menu_sfx_back(void)   { menu_sfx_play(&g_menu_sfx_back); }
 
+/* ------------------------------------------------------------------------- */
+/* HFIX85: idle-menu bouncing-logo screensaver                               */
+/* ------------------------------------------------------------------------- */
+#define MIVF_MENU_SCREENSAVER_IDLE_FRAMES 1200 /* ~20-40s depending on actual loop rate */
+
+static const u8 g_mivf_screensaver_palette[][3] = {
+    {255, 80, 80}, {80, 200, 255}, {120, 255, 120}, {255, 220, 90},
+    {200, 120, 255}, {255, 150, 60}, {90, 255, 220}, {255, 100, 200},
+};
+#define MIVF_SCREENSAVER_PALETTE_COUNT \
+    ((int)(sizeof(g_mivf_screensaver_palette) / sizeof(g_mivf_screensaver_palette[0])))
+
+static int g_mivf_screensaver_x = 20;
+static int g_mivf_screensaver_y = 20;
+static int g_mivf_screensaver_vx = 2;
+static int g_mivf_screensaver_vy = 2;
+static int g_mivf_screensaver_color_idx = 0;
+
+static void mivf_menu_screensaver_reset(void) {
+    g_mivf_screensaver_x = 20;
+    g_mivf_screensaver_y = 20;
+    g_mivf_screensaver_vx = 2;
+    g_mivf_screensaver_vy = 2;
+    g_mivf_screensaver_color_idx = 0;
+}
+
+/* Advances the bounce physics by one frame and draws it. Top screen shows
+   the bouncing mark/image on black; bottom screen goes dark with a plain
+   wake hint, matching a real screensaver minimizing what's lit up. */
+static void mivf_menu_draw_screensaver(u8 *fb_top, u8 *fb_bot, const MivfMenu *menu) {
+    enum { BOX_W = MIVF_SCREENSAVER_W, BOX_H = MIVF_SCREENSAVER_H };
+    bool bounced = false;
+    int cr, cg, cb;
+
+    g_mivf_screensaver_x += g_mivf_screensaver_vx;
+    g_mivf_screensaver_y += g_mivf_screensaver_vy;
+
+    if (g_mivf_screensaver_x <= 0) {
+        g_mivf_screensaver_x = 0;
+        g_mivf_screensaver_vx = -g_mivf_screensaver_vx;
+        bounced = true;
+    } else if (g_mivf_screensaver_x + BOX_W >= TOP_W) {
+        g_mivf_screensaver_x = TOP_W - BOX_W;
+        g_mivf_screensaver_vx = -g_mivf_screensaver_vx;
+        bounced = true;
+    }
+
+    if (g_mivf_screensaver_y <= 0) {
+        g_mivf_screensaver_y = 0;
+        g_mivf_screensaver_vy = -g_mivf_screensaver_vy;
+        bounced = true;
+    } else if (g_mivf_screensaver_y + BOX_H >= TOP_H) {
+        g_mivf_screensaver_y = TOP_H - BOX_H;
+        g_mivf_screensaver_vy = -g_mivf_screensaver_vy;
+        bounced = true;
+    }
+
+    if (bounced) {
+        g_mivf_screensaver_color_idx = (g_mivf_screensaver_color_idx + 1) % MIVF_SCREENSAVER_PALETTE_COUNT;
+    }
+
+    cr = g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][0];
+    cg = g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][1];
+    cb = g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][2];
+
+    if (fb_top) {
+        hfix58s_top_rect565(fb_top, 0, 0, TOP_W, TOP_H, 0, 0, 0);
+
+        if (menu->has_screensaver_image) {
+            for (int yy = 0; yy < BOX_H; yy++) {
+                for (int xx = 0; xx < BOX_W; xx++) {
+                    hfix58s_top_px565(fb_top, g_mivf_screensaver_x + xx, g_mivf_screensaver_y + yy,
+                        g_mivf_screensaver_img[(size_t)yy * BOX_W + xx]);
+                }
+            }
+            /* A custom image keeps its own colors -- cycle a border ring
+               instead of re-tinting pixel content, so it still visibly
+               "changes color on bounce" like the classic effect. */
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x - 2, g_mivf_screensaver_y - 2, BOX_W + 4, 2, cr, cg, cb);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x - 2, g_mivf_screensaver_y + BOX_H, BOX_W + 4, 2, cr, cg, cb);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x - 2, g_mivf_screensaver_y - 2, 2, BOX_H + 4, cr, cg, cb);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x + BOX_W, g_mivf_screensaver_y - 2, 2, BOX_H + 4, cr, cg, cb);
+        } else {
+            /* Default: an original MIVF mark drawn with existing shape/text
+               primitives -- no bitmap asset at all, just a themed card that
+               fully re-tints with the bounce color. */
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y, BOX_W, BOX_H, cr / 5, cg / 5, cb / 5);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y, BOX_W, 2, cr, cg, cb);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y + BOX_H - 2, BOX_W, 2, cr, cg, cb);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y, 2, BOX_H, cr, cg, cb);
+            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x + BOX_W - 2, g_mivf_screensaver_y, 2, BOX_H, cr, cg, cb);
+
+            mivf_menu_top_diamond(fb_top, g_mivf_screensaver_x + BOX_W / 2, g_mivf_screensaver_y + 16, cr, cg, cb);
+            hfix58s_top_draw_text_shadow(fb_top, g_mivf_screensaver_x + BOX_W / 2 - 12,
+                g_mivf_screensaver_y + 26, "MIVF", 1, cr, cg, cb);
+        }
+    }
+
+    if (fb_bot) {
+        hfix58_rect565(fb_bot, 0, 0, 320, 240, 0, 0, 0);
+        hfix58_draw_text_shadow(fb_bot, 96, 220, "PRESS ANY BUTTON", 1, 120, 130, 145);
+    }
+}
+
 /* hfix83: fade transitions. Redraws the CURRENT menu state fresh each step
    (not just darkening whatever's already in the framebuffer), so this makes
    no assumption about double/triple buffering -- same principle as the
@@ -11191,6 +11335,8 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
     int chapter_selected = 0;
     u32 pulse = 0;
     bool have_last;
+    bool screensaver_active = false;
+    u32 idle_frames = 0;
 
     menu_sfx_init();
 
@@ -11234,6 +11380,39 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
         hidScanInput();
         u32 down = hidKeysDown();
         pulse++;
+
+        /* hfix85: idle screensaver -- scoped to the root menu view only
+           (Scene Selection keeps its own paging state, and exiting the
+           screensaver back into the middle of a scrub/page felt like more
+           complexity than this playful feature is worth). Any key wakes it
+           and is consumed by waking it, not also treated as a menu action
+           (that's what `continue` below is for). */
+        if (down != 0) {
+            if (screensaver_active) {
+                screensaver_active = false;
+                mivf_menu_fade(menu, in_chapters, chapter_selected, pulse, false);
+            }
+            idle_frames = 0;
+        } else if (!in_chapters) {
+            idle_frames++;
+            if (!screensaver_active && idle_frames >= MIVF_MENU_SCREENSAVER_IDLE_FRAMES) {
+                mivf_menu_fade(menu, false, 0, pulse, true);
+                screensaver_active = true;
+                mivf_menu_screensaver_reset();
+            }
+        }
+
+        if (screensaver_active) {
+            u16 fw = 0, fh = 0;
+            u8 *fb_top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
+            u8 *fb_bot = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+
+            mivf_menu_draw_screensaver(fb_top, fb_bot, menu);
+            gfxFlushBuffers();
+            gfxSwapBuffers();
+            gspWaitForVBlank();
+            continue;
+        }
 
         if (in_chapters) {
             if ((down & KEY_DUP) && chapter_selected > 0) {
