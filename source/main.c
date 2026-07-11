@@ -9183,7 +9183,24 @@ static u32 audio_count_pending_wavebufs(void) {
     fixed compensation can null -- rather than a moving target. Still: no drops,
     video pacing untouched, sub-percent (inaudible) steady pitch trim.
 */
-#define AUDIO_SYNC_SETPOINT     3.0f    /* target queued buffers (~125ms at 24fps/48k)     */
+/* hfix76c: the whole "residual audio lag" this session chased was NOT a
+   fixed, unmeasurable downstream/host latency -- it's simply this
+   controller's own target queue depth. Proven by a flash+beep sync test:
+   sync looked correct at the very start of playback (before the queue had
+   filled toward the old setpoint of 3.0 buffers/~125ms) and only drifted
+   late as the queue ramped up toward that target over the following ~10-20s
+   -- exactly matching every avsync_played log this session, which always
+   showed audible_lag_ms=0 immediately after a seek/start and climbing from
+   there. A time-varying ramp can never be fixed by a single baked-in
+   encoder offset (which is why that approach kept not quite working); the
+   only real fix is to lower what this controller is holding the queue at.
+   Lowered from 3.0 to 1.5 (~62ms target instead of ~125ms) -- still a real
+   safety margin above the single in-flight buffer (pending counts QUEUED +
+   PLAYING, so this keeps roughly one buffer queued behind the one actually
+   playing), just a much smaller one. If this reintroduces audible
+   stutter/underrun, that's the tradeoff to re-tune, not a sign this
+   approach is wrong. */
+#define AUDIO_SYNC_SETPOINT     1.5f    /* target queued buffers (~62ms at 24fps/48k)      */
 #define AUDIO_SYNC_KP           0.005f  /* rate trim per buffer of smoothed error          */
 #define AUDIO_SYNC_EMA_ALPHA    0.3f    /* measurement low-pass; kills per-frame jitter    */
 #define AUDIO_SYNC_MAX_CORR     0.03f   /* clamp correction to +/-3% as a safety rail      */
