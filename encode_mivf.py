@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
+import json
 import contextlib
 from fractions import Fraction
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -317,7 +320,7 @@ class EncodeSettings:
     chunk_frames: int = DEFAULT_CHUNK_FRAMES
     max_video_packet_kb: int = 0  # 0 = disabled (default, unchanged behavior)
     warm_start_chunks: bool = False  # experimental, opt-in (see --warm-start-chunks)
-    motion_search: str = "full"  # full (default, unchanged) | diamond | fast | hybrid (all experimental)
+    motion_search: str = "full"  # full (default, unchanged) | diamond | fast | hybrid | hierarchical (all experimental)
 
 
 @dataclass
@@ -951,6 +954,101 @@ def clamp_s16(value: int) -> int:
     return max(-32768, min(32767, int(value)))
 
 
+# MIVF_ENCODER_E0_E1_V1
+# Reliability/profiling state. Defaults preserve the old temporary-workdir path.
+E0_JOB_DIR: Path | None = None
+E0_KEEP_INTERMEDIATES = False
+E0_RESUME_JOB = False
+E0_FINALIZE_VIDEO: Path | None = None
+E1_TIMING_JSON: Path | None = None
+
+
+def e0_sha256(path: Path) -> str:
+    h=hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda:f.read(1<<20),b""): h.update(block)
+    return h.hexdigest()
+
+
+def e0_atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix(path.suffix+".tmp")
+    tmp.write_text(json.dumps(value,indent=2,sort_keys=True)+"\n",encoding="utf-8",newline="\n")
+    os.replace(tmp,path)
+
+
+def e0_settings_fingerprint(input_path: Path, settings: "EncodeSettings") -> dict:
+    st=input_path.stat()
+    return {
+        "schema":"mivf-encode-job-v1", "input":str(input_path.resolve()),
+        "input_size":st.st_size, "input_mtime_ns":st.st_mtime_ns, "input_sha256":e0_sha256(input_path),
+        "width":settings.width,"height":settings.height,
+        "fps_num":settings.fps_num,"fps_den":settings.fps_den,
+        "audio_rate":settings.audio_rate,"audio_channels":settings.audio_channels,
+        "audio_codec":settings.audio_codec,"audio_offset_ms":settings.audio_offset_ms,
+        "keyint":settings.keyint,"qp":settings.qp,"c_qp_offset":settings.c_qp_offset,
+        "lambda":settings.lambda_value,"keep":settings.keep,"mv_range":settings.mv_range,
+        "motion_search":settings.motion_search,"jobs":settings.jobs,
+        "chunk_frames":settings.chunk_frames,"warm_start_chunks":settings.warm_start_chunks,
+        "max_video_packet_kb":settings.max_video_packet_kb,
+    }
+
+
+def e0_validate_preflight(input_path: Path, settings: "EncodeSettings") -> int:
+    if not input_path.exists() or not input_path.is_file():
+        raise SystemExit(f"input file does not exist: {input_path}")
+    if settings.width<=0 or settings.height<=0 or settings.width%2 or settings.height%2:
+        raise SystemExit("MIVF width and height must be positive even numbers")
+    if settings.jobs<1 or settings.chunk_frames<1: raise SystemExit("--jobs and --chunk-frames must be >= 1")
+    if settings.audio_codec=="ia4m" and settings.audio_channels!=1:
+        raise SystemExit("IA4M requires --audio-channels 1")
+    # Crucially executed before FFmpeg/video workers start.
+    return fixed_audio_samples_per_frame(settings.audio_rate,settings.fps_num,settings.fps_den)
+
+
+def e0_prepare_job(input_path: Path, output_path: Path, settings: "EncodeSettings") -> tuple[Path,dict]:
+    global E0_JOB_DIR
+    if E0_JOB_DIR is None:
+        work=make_temp_workdir(); persistent=False
+    else:
+        work=E0_JOB_DIR.resolve(); work.mkdir(parents=True,exist_ok=True); persistent=True
+    fp=e0_settings_fingerprint(input_path,settings)
+    mp=work/"job_manifest.json"
+    if E0_RESUME_JOB:
+        if not mp.exists(): raise SystemExit(f"--resume-job requires {mp}")
+        old=json.loads(mp.read_text(encoding="utf-8"))
+        if old.get("fingerprint")!=fp:
+            raise SystemExit("resume refused: input/settings fingerprint differs from job manifest")
+    state={"schema":"mivf-encode-job-v1","fingerprint":fp,"output":str(output_path.resolve()),
+           "persistent":persistent,"stage":"preflight","updated_utc":dt.datetime.now(dt.timezone.utc).isoformat()}
+    e0_atomic_json(mp,state)
+    return work,state
+
+
+def e0_stage(work: Path, state: dict, stage: str, timings: dict, **artifacts) -> None:
+    state["stage"]=stage; state["updated_utc"]=dt.datetime.now(dt.timezone.utc).isoformat()
+    state["timings_seconds"]={k:round(float(v),6) for k,v in timings.items()}
+    state.setdefault("artifacts",{}).update(artifacts)
+    e0_atomic_json(work/"job_manifest.json",state)
+
+
+def e1_write_report(path: Path, input_path: Path, output_path: Path, settings: "EncodeSettings",
+                    timings: dict, total_frames: int, encode_stats: dict) -> None:
+    total=max(0.0,float(timings.get("total",0.0)))
+    stages=[]
+    for name,value in timings.items():
+        value=float(value); stages.append({"stage":name,"seconds":round(value,6),
+            "percent_total":round(value*100.0/total,3) if total else 0.0})
+    report={"schema":"mivf-encoder-stage-timings-v1","input":str(input_path.resolve()),
+        "output":str(output_path.resolve()),"frames":int(total_frames),
+        "fps":f"{settings.fps_num}/{settings.fps_den}","jobs":settings.jobs,
+        "chunk_frames":settings.chunk_frames,"stages":stages,"encode_stats":encode_stats}
+    e0_atomic_json(path,report)
+    csvp=path.with_suffix('.csv')
+    csvp.write_text("stage,seconds,percent_total\n"+"".join(
+        f"{r['stage']},{r['seconds']:.6f},{r['percent_total']:.3f}\n" for r in stages),encoding='utf-8',newline='\n')
+    print(f"E1 TIMINGS: {path}")
+
 def make_temp_workdir() -> Path:
     return Path(tempfile.mkdtemp(prefix="mivf_encode_"))
 
@@ -1422,6 +1520,7 @@ def run_encoder_segment_capped(
     page -- the warm-up is always a forced keyframe and is discarded before
     merging, so judging the cap against it would waste retries on a packet
     that never reaches the final output."""
+    segment_t0 = time.perf_counter()
     initial_dump = output_path.with_name(output_path.stem + "_cap0.recon") if recon_dump_path else None
     _, best_stdout = run_encoder_segment(helper, output_path, settings, start_frame, frame_count, raw_frames, workdir, initial_dump)
 
@@ -1442,6 +1541,9 @@ def run_encoder_segment_capped(
         # when a --max-video-packet-kb retry replaced the initial attempt.
         result["helper_stats"] = parse_helper_stats_line(best_stdout)
         result["helper_psnr"] = parse_helper_psnr_line(best_stdout)
+        result["wall_seconds"] = time.perf_counter() - segment_t0
+        result["start_frame"] = start_frame
+        result["submitted_frames"] = frame_count
         return result
 
     if cap_bytes <= 0:
@@ -1629,6 +1731,7 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
     # STATS/PSNR stdout (see parse_helper_stats_line / parse_helper_psnr_line).
     agg_helper_stats: dict[str, int] = {}
     agg_helper_psnr: dict[str, dict[str, float]] = {}
+    segment_timings: list[dict] = []
 
     # --warm-start-chunks: chunk N>0 is fed the previous chunk's own closed-loop
     # reconstructed last frame as a throwaway prepended frame, so its real first
@@ -1646,6 +1749,7 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
         for future in done:
             seg_idx, seg_path, start_frame, frame_count, recon_dump_path = pending.pop(future)
             stats = future.result()
+            segment_timings.append({"segment":seg_idx,"start_frame":start_frame,"frames":frame_count,"wall_seconds":round(float(stats.get("wall_seconds",0.0)),6)})
             segment_paths[seg_idx] = seg_path
             completed_frames += frame_count
             if stats.get("capped"):
@@ -1790,6 +1894,7 @@ def build_streaming_parallel_mivf(input_path: Path, temp_video_only: Path, setti
         "elapsed_sec": time.time() - start_time,
         "helper_stats": agg_helper_stats,
         "helper_psnr": finalize_helper_psnr(agg_helper_psnr),
+        "segment_timings": sorted(segment_timings,key=lambda row:row["segment"]),
     }
 
 
@@ -2263,18 +2368,31 @@ def encode_one(
     report_packet_sizes: bool = False,
     seek_index_sidecar: Path | None = None,
 ) -> None:
-    workdir = make_temp_workdir()
+    e0_samples=e0_validate_preflight(input_path,settings)
+    workdir,e0_state=e0_prepare_job(input_path,output_path,settings)
+    e1={}
     total_t0 = time.time()
     mux_elapsed = 0.0
     m2y2_elapsed = 0.0
     seek_index_elapsed = 0.0
     try:
         temp_video_only = workdir / "temp_video_only.mivf"
+        if E0_FINALIZE_VIDEO is not None:
+            if not E0_FINALIZE_VIDEO.exists(): raise SystemExit(f"video-only intermediate missing: {E0_FINALIZE_VIDEO}")
+            shutil.copy2(E0_FINALIZE_VIDEO,temp_video_only)
+        e0_stage(workdir,e0_state,"ready",e1,samples_per_frame=e0_samples)
 
         print("============================================================")
         print("1. Streaming and Compressing Video")
         print("============================================================")
-        encode_stats = build_streaming_parallel_mivf(input_path, temp_video_only, settings, workdir)
+        video_t0=time.perf_counter()
+        if (E0_RESUME_JOB or E0_FINALIZE_VIDEO is not None) and temp_video_only.exists():
+            encode_stats={"resumed_video":True,"segments":0,"frames":collect_seek_index_data(temp_video_only).total_frames,"helper_stats":{},"helper_psnr":{}}
+            print(f"E0 RESUME: reusing {temp_video_only}")
+        else:
+            encode_stats = build_streaming_parallel_mivf(input_path, temp_video_only, settings, workdir)
+        e1["video_encode"]=time.perf_counter()-video_t0
+        e0_stage(workdir,e0_state,"video_complete",e1,video_only=str(temp_video_only),video_only_bytes=temp_video_only.stat().st_size,video_only_sha256=e0_sha256(temp_video_only))
         video_only_bytes = temp_video_only.stat().st_size
 
         print()
@@ -2284,6 +2402,8 @@ def encode_one(
         mux_t0 = time.time()
         mux_audio_into_mivf(temp_video_only, input_path, output_path, settings.audio_rate, settings.audio_channels, workdir, settings.audio_codec, settings.audio_offset_ms)
         mux_elapsed = time.time() - mux_t0
+        e1["audio_mux"]=mux_elapsed
+        e0_stage(workdir,e0_state,"mux_complete",e1,mux_output=str(output_path))
 
         if make_m2y2:
             print()
@@ -2295,6 +2415,8 @@ def encode_one(
             transcode_to_m2y2(output_path, tmp_m2y2)
             os.replace(tmp_m2y2, output_path)
             m2y2_elapsed = time.time() - m2y2_t0
+            e1["m2y2"]=m2y2_elapsed
+            e0_stage(workdir,e0_state,"m2y2_complete",e1)
 
         if make_seek_index:
             print()
@@ -2332,6 +2454,7 @@ def encode_one(
             except Exception as exc:
                 print(f"WARNING: seek index generation failed: {exc}")
             seek_index_elapsed = time.time() - seek_index_t0
+            e1["seek_index"]=seek_index_elapsed
 
         packet_stats: dict | None = None
         if report_packet_sizes:
@@ -2375,8 +2498,14 @@ def encode_one(
             helper_psnr=encode_stats.get("helper_psnr") or {},
             packet_stats=packet_stats,
         )
+        e1["total"]=time.time()-total_t0
+        e0_stage(workdir,e0_state,"complete",e1,output=str(output_path),output_bytes=output_path.stat().st_size if output_path.exists() else 0)
+        timing_path=E1_TIMING_JSON or (workdir/"encoder_stage_timings.json")
+        e1_write_report(timing_path,input_path,output_path,settings,e1,encode_stats.get("frames",0),encode_stats)
+
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        if not (E0_KEEP_INTERMEDIATES or E0_JOB_DIR is not None):
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 def encode_folder(
@@ -2439,13 +2568,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mv-range", type=int, default=DEFAULT_MV_RANGE)
     parser.add_argument(
         "--motion-search",
-        choices=["full", "diamond", "fast", "hybrid"],
+        choices=["full", "diamond", "fast", "hybrid", "hierarchical"],
         default="full",
         help="per-block motion search algorithm: full = exhaustive, slowest, best quality "
              "(default, unchanged behavior); diamond = experimental iterative search, faster, "
              "small quality/size risk; fast = experimental, more speed-biased, larger quality/size risk; "
              "hybrid = experimental, two-seed diamond plus capped local refine, aims for diamond-ish "
-             "speed with less of its quality/size cost",
+             "speed with less of its quality/size cost; hierarchical = experimental, deterministic "
+             "coarse-to-fine grid search, aims to approach full search quality much faster "
+             "(MIVF_HIERARCHICAL_MOTION_V1)",
     )
     parser.add_argument("--keep", type=int, default=DEFAULT_KEEP, choices=[4, 8, 16], help="transform coefficients kept per 4x4 quadrant: 16=HD detail (default), 4=small legacy files")
     parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel encoder workers, default {DEFAULT_JOBS}")
@@ -2476,12 +2607,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-packet-sizes", action="store_true", help="print per-video-packet size histogram after encoding")
     parser.add_argument("--profile", choices=["default", "3ds-fast"], default="default", help="encoder quality/speed preset: default for quality, 3ds-fast for smaller packets and smoother 3DS playback")
     parser.add_argument("--seek-index-sidecar", default=None, help="optional explicit path for generated .idx sidecar")
+    parser.add_argument("--job-dir", help="persistent E0 job directory")
+    parser.add_argument("--resume-job", action="store_true", help="reuse validated video-only intermediate in --job-dir")
+    parser.add_argument("--keep-intermediates", action="store_true", help="preserve E0 job/intermediate files")
+    parser.add_argument("--finalize-from-video", help="skip video encode and finalize this video-only MIVF")
+    parser.add_argument("--timing-json", help="E1 JSON timing report path; CSV is written alongside")
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    global E0_JOB_DIR,E0_KEEP_INTERMEDIATES,E0_RESUME_JOB,E0_FINALIZE_VIDEO,E1_TIMING_JSON
+    E0_JOB_DIR=Path(args.job_dir) if args.job_dir else None
+    E0_KEEP_INTERMEDIATES=bool(args.keep_intermediates or args.job_dir)
+    E0_RESUME_JOB=bool(args.resume_job)
+    E0_FINALIZE_VIDEO=Path(args.finalize_from_video).resolve() if args.finalize_from_video else None
+    E1_TIMING_JSON=Path(args.timing_json).resolve() if args.timing_json else None
+    fps=parse_frame_rate(args.fps)
+    fixed_audio_samples_per_frame(args.audio_rate,fps.numerator,fps.denominator)
+    if args.audio_codec=="ia4m" and args.audio_channels!=1: raise SystemExit("IA4M requires --audio-channels 1")
+    if args.resume_job and not args.job_dir: raise SystemExit("--resume-job requires --job-dir")
 
     settings = EncodeSettings(
         width=args.width,
