@@ -175,6 +175,7 @@ void MIVF_SettingsInit(MivfSettings *settings) {
     settings->auto_advance = false;
     settings->playback_speed_idx = 2; /* 1.0x */
     settings->sleep_timer_min = 0;    /* off */
+    settings->volume_percent = 100;
 }
 
 void MIVF_SettingsClamp(MivfSettings *settings) {
@@ -220,6 +221,10 @@ void MIVF_SettingsClamp(MivfSettings *settings) {
 
     if (settings->sleep_timer_min > 600u) {
         settings->sleep_timer_min = 600u;
+    }
+
+    if (settings->volume_percent > 300u) {
+        settings->volume_percent = 300u;
     }
 
     if (settings->subtitle_delay_ms < -5000) {
@@ -305,6 +310,7 @@ bool MIVF_SettingsLoad(MivfSettings *settings) {
         else if (!strcmp(key, "auto_advance")) settings->auto_advance = atoi(val) != 0;
         else if (!strcmp(key, "playback_speed_idx")) settings->playback_speed_idx = (u32)strtoul(val, NULL, 10);
         else if (!strcmp(key, "sleep_timer_min")) settings->sleep_timer_min = (u32)strtoul(val, NULL, 10);
+        else if (!strcmp(key, "volume_percent")) settings->volume_percent = (u32)strtoul(val, NULL, 10);
     }
 
     fclose(fp);
@@ -355,6 +361,7 @@ bool MIVF_SettingsSave(const MivfSettings *settings) {
     fprintf(fp, "auto_advance=%d\n", settings->auto_advance ? 1 : 0);
     fprintf(fp, "playback_speed_idx=%lu\n", (unsigned long)settings->playback_speed_idx);
     fprintf(fp, "sleep_timer_min=%lu\n", (unsigned long)settings->sleep_timer_min);
+    fprintf(fp, "volume_percent=%lu\n", (unsigned long)settings->volume_percent);
 
     fclose(fp);
     return true;

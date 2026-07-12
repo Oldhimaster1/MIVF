@@ -208,6 +208,9 @@ static int g_hfix62_help_scroll = 0;
 
 static MivfSettings g_mivf_settings;
 static bool g_mivf_settings_loaded = false;
+/* MIVF_PHASE6_PERSIST_VOLUME_V1: declared with the settings globals so the
+   runtime-settings synchronizer can initialize it before playback starts. */
+static int g_hfix56_volume_percent = 100;
 static int g_hfix59r3_settings_index = 0;
 static u32 g_mivf_idle_frames = 0;
 static bool g_mivf_brightness_dimmed = false;
@@ -2770,6 +2773,7 @@ static void hfix59r3_apply_screen_brightness(bool dimmed) {
 
 static void hfix59r3_sync_runtime_settings(void) {
     g_hfix56_force_stereo = g_mivf_settings.force_stereo;
+    g_hfix56_volume_percent = (int)g_mivf_settings.volume_percent;
 
     if (g_mivf_settings.autodim_brightness < 1u) {
         g_mivf_settings.autodim_brightness = 1u;
@@ -3526,18 +3530,28 @@ static void hfix58f_request_relative_seek(int delta_frames);
 static void hfix58f_draw_timeline(u8 *fb, int panel_y);
 
 static void hfix58j_touch_scrub_update(u32 down, u32 held, u32 up);
-/* HFIX_BOTTOMDIM: halves every bottom-screen pixel's RGB565 channels in
-   place. Only ever called on the bottom framebuffer -- the top video
-   screen has its own separate framebuffer and is never passed here. */
+/* MIVF_PHASE6_AUTODIM_LEVEL_V1
+   Apply the configured DIM LEVEL to the bottom framebuffer only. Level 1 is
+   exactly the historical 50% dim, preserving the old/default appearance;
+   levels 2..5 retain progressively more light (about 60, 70, 80, 90%).
+   Q8 factors avoid per-pixel division on Old 3DS. */
 static void hfix59r3_dim_bottom_framebuffer(u8 *fb, u16 fw, u16 fh) {
+    static const u16 keep_q8[5] = { 128u, 154u, 179u, 205u, 230u };
+    u32 level = g_mivf_settings.autodim_brightness;
+    u16 factor;
     u16 *px = (u16 *)fb;
     size_t count = (size_t)fw * (size_t)fh;
 
+    if (!fb) return;
+    if (level < 1u) level = 1u;
+    if (level > 5u) level = 5u;
+    factor = keep_q8[level - 1u];
+
     for (size_t i = 0; i < count; i++) {
         u16 c = px[i];
-        u16 r = (u16)((c >> 11) & 0x1Fu) >> 1;
-        u16 g = (u16)((c >> 5) & 0x3Fu) >> 1;
-        u16 b = (u16)(c & 0x1Fu) >> 1;
+        u16 r = (u16)((((u32)((c >> 11) & 0x1Fu)) * factor) >> 8);
+        u16 g = (u16)((((u32)((c >> 5) & 0x3Fu)) * factor) >> 8);
+        u16 b = (u16)((((u32)(c & 0x1Fu)) * factor) >> 8);
         px[i] = (u16)((r << 11) | (g << 5) | b);
     }
 }
@@ -5433,7 +5447,6 @@ static void blit565_scaled(const u8 *src, int w, int h) {
 /* This operates only on decoded PCM16 immediately before NDSP queueing.      */
 /* It never mutates compressed audio packets.                                 */
 /* ------------------------------------------------------------------------- */
-static int  g_hfix56_volume_percent = 100;
 static bool g_hfix56_limiter_enabled = false;
 static u8   g_hfix56_audio_src_channels = 1;
 
@@ -5517,6 +5530,8 @@ static void hfix56_audio_controls_on_input(u32 down, u32 held) {
             g_hfix56_volume_percent = 300;
         }
 
+        g_mivf_settings.volume_percent = (u32)g_hfix56_volume_percent;
+        MIVF_SettingsSave(&g_mivf_settings);
         char hfix58_tmp[64]; snprintf(hfix58_tmp, sizeof(hfix58_tmp), "VOLUME %d%%", g_hfix56_volume_percent); hfix58_alert_set(hfix58_tmp, 1);
     }
 
@@ -5527,6 +5542,8 @@ static void hfix56_audio_controls_on_input(u32 down, u32 held) {
             g_hfix56_volume_percent = 0;
         }
 
+        g_mivf_settings.volume_percent = (u32)g_hfix56_volume_percent;
+        MIVF_SettingsSave(&g_mivf_settings);
         char hfix58_tmp[64]; snprintf(hfix58_tmp, sizeof(hfix58_tmp), "VOLUME %d%%", g_hfix56_volume_percent); hfix58_alert_set(hfix58_tmp, 1);
     }
 
@@ -5557,9 +5574,16 @@ static void hfix56_audio_controls_on_input(u32 down, u32 held) {
 /* ------------------------------------------------------------------------- */
 
 #define HFIX58_MAX_BROWSER_FILES 256
-#define HFIX58_BROWSER_VISIBLE_ROWS 10
+#define HFIX58_BROWSER_VISIBLE_ROWS 7
 #define HFIX58_PREVIEW_W 88
 #define HFIX58_PREVIEW_H 50
+/* MIVF_PHASE8_1_VISUAL_POLISH_V1
+   High-quality browser preview layer. Legacy .cover files remain
+   88x50 RGB565, but the browser now caches and draws a 176x100
+   version to avoid repeated nearest-neighbor 2X enlargement. */
+#define HFIX58_PREVIEW2_W 176
+#define HFIX58_PREVIEW2_H 100
+#define MIVF8_PREVIEW_CACHE_SLOTS 4
 
 typedef struct {
     char name[256];
@@ -5588,10 +5612,24 @@ typedef struct {
     char synopsis2[24];
     u16 thumb[HFIX58_PREVIEW_W * HFIX58_PREVIEW_H];
     u32 file_size_kb; /* populated lazily when this path is previewed, zero if unknown */
+    /* MIVF_PHASE8_PREVIEW_PROGRESS_V1 */
+    u32 bookmark_frame;
+    u32 total_frames;
 } Hfix58BrowserPreview;
 
 static Hfix58FileBrowser g_hfix58_browser;
 static Hfix58BrowserPreview g_hfix58_preview;
+typedef struct {
+    bool valid;
+    char path[HFIX58_MAX_PATH];
+    u32 stamp;
+    u16 pixels[HFIX58_PREVIEW2_W * HFIX58_PREVIEW2_H];
+} Mivf8PreviewCacheEntry;
+static Mivf8PreviewCacheEntry g_mivf8_preview_cache[MIVF8_PREVIEW_CACHE_SLOTS];
+static u16 g_mivf8_preview_hi[HFIX58_PREVIEW2_W * HFIX58_PREVIEW2_H];
+static bool g_mivf8_preview_hi_valid = false;
+static u32 g_mivf8_preview_cache_tick = 1;
+static char g_mivf8_preview_hi_path[HFIX58_MAX_PATH];
 
 /* HFIX60: preview debounce deadline in system ticks (0 = disabled).
    Cursor movement sets a ~200 ms deadline; the preview is only loaded
@@ -6446,10 +6484,63 @@ static bool hfix58_is_supported_media(const char *name) {
     return hfix58_media_kind(name) != HFIX58_MEDIA_UNKNOWN;
 }
 
+/* MIVF_PHASE6_NATURAL_SORT_V1
+   Compare ASCII names case-insensitively while treating each run of decimal
+   digits as an integer. No integer conversion is used, so arbitrarily long
+   digit runs cannot overflow. A bytewise strcmp fallback makes ordering fully
+   deterministic when the natural comparison considers two names equivalent. */
+static int hfix58_natural_name_cmp(const char *a, const char *b) {
+    const unsigned char *pa = (const unsigned char *)a;
+    const unsigned char *pb = (const unsigned char *)b;
+
+    while (*pa && *pb) {
+        if (isdigit(*pa) && isdigit(*pb)) {
+            const unsigned char *za = pa;
+            const unsigned char *zb = pb;
+            const unsigned char *ea;
+            const unsigned char *eb;
+            size_t lena, lenb;
+
+            while (*za == '0') za++;
+            while (*zb == '0') zb++;
+            ea = za;
+            eb = zb;
+            while (isdigit(*ea)) ea++;
+            while (isdigit(*eb)) eb++;
+            lena = (size_t)(ea - za);
+            lenb = (size_t)(eb - zb);
+
+            /* A run containing only zeroes has numeric length zero. */
+            if (lena != lenb) return lena < lenb ? -1 : 1;
+            if (lena > 0) {
+                int digit_cmp = memcmp(za, zb, lena);
+                if (digit_cmp != 0) return digit_cmp < 0 ? -1 : 1;
+            }
+
+            /* Equal numeric values: consume the complete original runs. */
+            while (isdigit(*pa)) pa++;
+            while (isdigit(*pb)) pb++;
+            continue;
+        }
+
+        {
+            int ca = tolower(*pa);
+            int cb = tolower(*pb);
+            if (ca != cb) return ca < cb ? -1 : 1;
+        }
+        pa++;
+        pb++;
+    }
+
+    if (*pa != *pb) return *pa ? 1 : -1;
+    return 0;
+}
+
 static int hfix58_file_cmp(const void *a, const void *b) {
     const Hfix58FileEntry *fa = (const Hfix58FileEntry*)a;
     const Hfix58FileEntry *fb = (const Hfix58FileEntry*)b;
-    return strcmp(fa->name, fb->name);
+    int natural = hfix58_natural_name_cmp(fa->name, fb->name);
+    return natural != 0 ? natural : strcmp(fa->name, fb->name);
 }
 
 static bool hfix58_media_file_exists(const char *path) {
@@ -6562,6 +6653,8 @@ static void hfix58_browser_promote_quick_access(void) {
 static void hfix58_preview_clear(void) {
     memset(&g_hfix58_preview, 0, sizeof(g_hfix58_preview));
     g_hfix58_preview_deadline = 0;
+    g_mivf8_preview_hi_valid = false;
+    g_mivf8_preview_hi_path[0] = 0;
 }
 
 static const char *hfix58_preview_basename(const char *path) {
@@ -6620,6 +6713,142 @@ static void hfix58_scale_rgb565(const u16 *src, int sw, int sh, u16 *dst, int dw
             dst[y * dw + x] = src[sy * sw + sx];
         }
     }
+}
+
+
+/* MIVF_PHASE8_1_BROWSER_PREVIEW_CACHE_V1
+   176x100 browser preview cache. This is intentionally RAM-only in the
+   player: it removes repeated SD reads and repeated 2X scaling during one
+   browsing session without adding filesystem churn on hardware. Users who
+   want exact high-quality artwork can provide <movie>.preview.cover as a
+   raw 176x100 RGB565 sidecar. */
+static bool mivf8_preview_hi_matches(const char *path) {
+    return g_mivf8_preview_hi_valid && path &&
+        !strcmp(g_mivf8_preview_hi_path, path);
+}
+
+static void mivf8_preview_cache_store(const char *path, const u16 *pixels) {
+    int slot = 0;
+    u32 oldest;
+    if (!path || !*path || !pixels) return;
+    oldest = g_mivf8_preview_cache[0].stamp;
+    for (int i = 0; i < MIVF8_PREVIEW_CACHE_SLOTS; i++) {
+        if (g_mivf8_preview_cache[i].valid &&
+            !strcmp(g_mivf8_preview_cache[i].path, path)) {
+            slot = i;
+            goto found;
+        }
+        if (!g_mivf8_preview_cache[i].valid) {
+            slot = i;
+            goto found;
+        }
+        if (g_mivf8_preview_cache[i].stamp < oldest) {
+            oldest = g_mivf8_preview_cache[i].stamp;
+            slot = i;
+        }
+    }
+found:
+    memcpy(g_mivf8_preview_cache[slot].pixels, pixels,
+        sizeof(g_mivf8_preview_cache[slot].pixels));
+    snprintf(g_mivf8_preview_cache[slot].path,
+        sizeof(g_mivf8_preview_cache[slot].path), "%s", path);
+    g_mivf8_preview_cache[slot].stamp = g_mivf8_preview_cache_tick++;
+    if (g_mivf8_preview_cache_tick == 0) g_mivf8_preview_cache_tick = 1;
+    g_mivf8_preview_cache[slot].valid = true;
+}
+
+static bool mivf8_preview_cache_lookup(const char *path) {
+    if (!path || !*path) return false;
+    for (int i = 0; i < MIVF8_PREVIEW_CACHE_SLOTS; i++) {
+        if (g_mivf8_preview_cache[i].valid &&
+            !strcmp(g_mivf8_preview_cache[i].path, path)) {
+            memcpy(g_mivf8_preview_hi, g_mivf8_preview_cache[i].pixels,
+                sizeof(g_mivf8_preview_hi));
+            snprintf(g_mivf8_preview_hi_path,
+                sizeof(g_mivf8_preview_hi_path), "%s", path);
+            g_mivf8_preview_hi_valid = true;
+            g_mivf8_preview_cache[i].stamp = g_mivf8_preview_cache_tick++;
+            if (g_mivf8_preview_cache_tick == 0) g_mivf8_preview_cache_tick = 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+static u16 mivf8_rgb565_avg4(u16 a, u16 b, u16 c, u16 d) {
+    int ar,ag,ab,br,bg,bb,cr,cg,cb,dr,dg,db;
+    hfix58_unpack565(a,&ar,&ag,&ab);
+    hfix58_unpack565(b,&br,&bg,&bb);
+    hfix58_unpack565(c,&cr,&cg,&cb);
+    hfix58_unpack565(d,&dr,&dg,&db);
+    return hfix58_rgb565((ar+br+cr+dr+2)>>2,
+                         (ag+bg+cg+dg+2)>>2,
+                         (ab+bb+cb+db+2)>>2);
+}
+
+static void mivf8_preview_make_hi_from_small(const char *path) {
+    /* The legacy image is exactly half-size. Generate a softened 2X copy once
+       instead of stamping each source pixel as four identical screen pixels.
+       Odd pixels are blended with neighbors, so diagonal edges and subtitles
+       in cover art look less blocky while preserving deterministic RGB565. */
+    if (!g_hfix58_preview.has_thumb) return;
+    for (int sy = 0; sy < HFIX58_PREVIEW_H; sy++) {
+        for (int sx = 0; sx < HFIX58_PREVIEW_W; sx++) {
+            u16 c00 = g_hfix58_preview.thumb[sy * HFIX58_PREVIEW_W + sx];
+            u16 c10 = g_hfix58_preview.thumb[sy * HFIX58_PREVIEW_W +
+                (sx + 1 < HFIX58_PREVIEW_W ? sx + 1 : sx)];
+            u16 c01 = g_hfix58_preview.thumb[(sy + 1 < HFIX58_PREVIEW_H ? sy + 1 : sy) *
+                HFIX58_PREVIEW_W + sx];
+            u16 c11 = g_hfix58_preview.thumb[(sy + 1 < HFIX58_PREVIEW_H ? sy + 1 : sy) *
+                HFIX58_PREVIEW_W + (sx + 1 < HFIX58_PREVIEW_W ? sx + 1 : sx)];
+            int dx = sx * 2;
+            int dy = sy * 2;
+            g_mivf8_preview_hi[dy * HFIX58_PREVIEW2_W + dx] = c00;
+            g_mivf8_preview_hi[dy * HFIX58_PREVIEW2_W + dx + 1] =
+                mivf8_rgb565_avg4(c00, c00, c10, c10);
+            g_mivf8_preview_hi[(dy + 1) * HFIX58_PREVIEW2_W + dx] =
+                mivf8_rgb565_avg4(c00, c00, c01, c01);
+            g_mivf8_preview_hi[(dy + 1) * HFIX58_PREVIEW2_W + dx + 1] =
+                mivf8_rgb565_avg4(c00, c10, c01, c11);
+        }
+    }
+    if (path && *path) {
+        snprintf(g_mivf8_preview_hi_path, sizeof(g_mivf8_preview_hi_path),
+            "%s", path);
+        g_mivf8_preview_hi_valid = true;
+        mivf8_preview_cache_store(path, g_mivf8_preview_hi);
+    }
+}
+
+static bool hfix60_load_preview_cover(const char *video_path) {
+    char path[HFIX58_MAX_PATH];
+    FILE *cf;
+    size_t need = (size_t)HFIX58_PREVIEW2_W * (size_t)HFIX58_PREVIEW2_H * 2u;
+    size_t got;
+    hfix60_make_sidecar_path(path, sizeof(path), video_path, ".preview.cover");
+    if (!path[0]) return false;
+    cf = fopen(path, "rb");
+    if (!cf) return false;
+    got = fread(g_mivf8_preview_hi, 1, need, cf);
+    fclose(cf);
+    if (got == need) {
+        snprintf(g_mivf8_preview_hi_path, sizeof(g_mivf8_preview_hi_path),
+            "%s", video_path);
+        g_mivf8_preview_hi_valid = true;
+        mivf8_preview_cache_store(video_path, g_mivf8_preview_hi);
+        /* Keep the legacy has_thumb path true so old code/status treats this
+           selection as having artwork. Derive a small representative thumbnail
+           from the high-res image for any fallback caller. */
+        for (int y = 0; y < HFIX58_PREVIEW_H; y++) {
+            for (int x = 0; x < HFIX58_PREVIEW_W; x++) {
+                g_hfix58_preview.thumb[y * HFIX58_PREVIEW_W + x] =
+                    g_mivf8_preview_hi[(y * 2) * HFIX58_PREVIEW2_W + x * 2];
+            }
+        }
+        g_hfix58_preview.has_thumb = true;
+        return true;
+    }
+    return false;
 }
 
 static bool hfix58_decode_browser_thumb(FILE *f, const Header *h, const Stream *v) {
@@ -6782,6 +7011,9 @@ static bool hfix58_decode_browser_thumb(FILE *f, const Header *h, const Stream *
     if (m2y0_prev.base) m2y0_frame_free(&m2y0_prev);
     free(prev);
     free(frame);
+    if (g_hfix58_preview.has_thumb) {
+        mivf8_preview_make_hi_from_small(g_hfix58_preview.path);
+    }
     return g_hfix58_preview.has_thumb;
 }
 
@@ -6792,28 +7024,23 @@ static bool hfix60_load_cover(const char *video_path) {
     FILE *cf;
     size_t need = (size_t)HFIX58_PREVIEW_W * (size_t)HFIX58_PREVIEW_H * 2u;
     size_t got;
-
     hfix60_make_sidecar_path(path, sizeof(path), video_path, ".cover");
     if (!path[0]) {
         return false;
     }
-
     cf = fopen(path, "rb");
     if (!cf) {
         return false;
     }
-
     got = fread(g_hfix58_preview.thumb, 1, need, cf);
     fclose(cf);
-
     if (got == need) {
         g_hfix58_preview.has_thumb = true;
+        mivf8_preview_make_hi_from_small(video_path);
         return true;
     }
-
     return false;
 }
-
 /* HFIX60: optional ".nfo" synopsis text shown in the preview panel. */
 static void hfix60_load_nfo(const char *video_path) {
     char path[HFIX58_MAX_PATH];
@@ -6878,6 +7105,7 @@ static bool hfix58_browser_load_preview(const char *path) {
     }
 
     snprintf(g_hfix58_preview.path, sizeof(g_hfix58_preview.path), "%s", path);
+    mivf8_preview_cache_lookup(path);
 
     /* HFIX_BROWSERPERF: compute file size lazily, only for the single
        previewed entry, once selection has settled (see the debounce in
@@ -6940,7 +7168,7 @@ static bool hfix58_browser_load_preview(const char *path) {
     snprintf(g_hfix58_preview.title, sizeof(g_hfix58_preview.title), "%s", hfix58_preview_basename(path));
     hfix58_format_duration(dur, sizeof(dur), (u32)(h.duration / 30000ull));
 
-    snprintf(g_hfix58_preview.summary, sizeof(g_hfix58_preview.summary), "%s %ux%u @ %u/%u",
+    snprintf(g_hfix58_preview.summary, sizeof(g_hfix58_preview.summary), "%s  %uX%u  FPS %u/%u",
         v.codec,
         v.w,
         v.h,
@@ -6948,7 +7176,7 @@ static bool hfix58_browser_load_preview(const char *path) {
         v.fpsd ? v.fpsd : 1);
 
     if (a.type == 2) {
-        snprintf(g_hfix58_preview.detail, sizeof(g_hfix58_preview.detail), "AUDIO %s %u/%u",
+        snprintf(g_hfix58_preview.detail, sizeof(g_hfix58_preview.detail), "%s  %u HZ  %u CH",
             a.codec,
             a.w,
             a.h);
@@ -6969,8 +7197,15 @@ static bool hfix58_browser_load_preview(const char *path) {
         bookmark.video_path[0] &&
         !strcmp(bookmark.video_path, path) &&
         bookmark.frame > 0;
+    if (g_hfix58_preview.has_resume) {
+        u64 den = 30000ull * (u64)(v.fpsd ? v.fpsd : 1u);
+        u64 frames = den ? (h.duration * (u64)(v.fpsn ? v.fpsn : 30u) + den - 1u) / den : 0;
+        if (frames > 0xffffffffull) frames = 0xffffffffull;
+        g_hfix58_preview.bookmark_frame = bookmark.frame;
+        g_hfix58_preview.total_frames = (u32)frames;
+    }
 
-    snprintf(g_hfix58_preview.extra, sizeof(g_hfix58_preview.extra), "DUR %s  SUB %s  CONT %s",
+    snprintf(g_hfix58_preview.extra, sizeof(g_hfix58_preview.extra), "%s  SUB %s  CONT %s",
         dur,
         has_srt ? "YES" : "NO",
         g_hfix58_preview.has_resume ? "YES" : "NO");
@@ -6981,8 +7216,12 @@ static bool hfix58_browser_load_preview(const char *path) {
        A ".cover" poster (raw RGB565, preview-sized) overrides the auto thumbnail. */
     hfix60_load_nfo(path);
 
-    if (!hfix60_load_cover(path)) {
-        hfix58_decode_browser_thumb(f, &h, &v);
+    if (!mivf8_preview_hi_matches(path)) {
+        if (!hfix60_load_preview_cover(path)) {
+            if (!hfix60_load_cover(path)) {
+                hfix58_decode_browser_thumb(f, &h, &v);
+            }
+        }
     }
 
     fclose(f);
@@ -7014,74 +7253,176 @@ static void hfix58_browser_refresh_preview(void) {
     hfix58_browser_load_preview(g_hfix58_browser.entries[g_hfix58_browser.selected].path);
 }
 
+/* MIVF_PHASE8_GLOBAL_UI_V1
+   Shared, performance-aware library primitives. They use the existing RGB565
+   renderer and perform no file I/O. Browser pages redraw only on input or when
+   the existing 200 ms preview debounce expires. */
+static int mivf8_clampi(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void mivf8_ellipsis(char *dst, size_t dst_sz, const char *src, int max_chars) {
+    size_t n;
+    if (!dst || dst_sz == 0) return;
+    dst[0] = 0;
+    if (!src) return;
+    if (max_chars < 4) max_chars = 4;
+    n = strlen(src);
+    if ((int)n <= max_chars) {
+        snprintf(dst, dst_sz, "%s", src);
+        return;
+    }
+    if ((size_t)max_chars >= dst_sz) max_chars = (int)dst_sz - 1;
+    if (max_chars < 4) return;
+    memcpy(dst, src, (size_t)max_chars - 3u);
+    dst[max_chars - 3] = '.';
+    dst[max_chars - 2] = '.';
+    dst[max_chars - 1] = '.';
+    dst[max_chars] = 0;
+}
+
+static void mivf8_bottom_panel(u8 *fb, int x, int y, int w, int h) {
+    hfix58_blend_rect565(fb,x+2,y+3,w,h,0,0,0,90);
+    hfix58_blend_rect565(fb,x,y,w,h,9,16,29,232);
+    hfix58_rect565(fb,x,y,w,1,70,88,114);
+    hfix58_rect565(fb,x,y+h-1,w,1,18,27,42);
+}
+
+static void mivf8_top_panel(u8 *fb, int x, int y, int w, int h, int alpha) {
+    hfix58s_top_blend_rect565(fb,x+2,y+3,w,h,0,0,0,80);
+    hfix58s_top_blend_rect565(fb,x,y,w,h,5,10,20,alpha);
+    hfix58s_top_rect565(fb,x,y,w,1,70,88,114);
+    hfix58s_top_rect565(fb,x,y+h-1,w,1,18,27,42);
+}
+
+static void mivf8_bottom_footer(u8 *fb, const char *left, const char *right) {
+    int rw=right?(int)strlen(right)*6:0;
+    hfix58_rect565(fb,0,216,320,24,3,7,14);
+    hfix58_rect565(fb,0,216,320,1,34,48,68);
+    if(left) hfix58_draw_text_shadow(fb,12,226,left,1,174,194,216);
+    if(right) hfix58_draw_text_shadow(fb,308-rw,226,right,1,174,194,216);
+}
+
+static void mivf8_bottom_focus_row(u8 *fb, int x, int y, int w,
+                                   const char *title, const char *status,
+                                   bool selected) {
+    char shown[48];
+    int sw=status?(int)strlen(status)*6:0;
+    int max_chars=(w-44-sw)/6;
+    mivf8_ellipsis(shown,sizeof(shown),title,max_chars);
+    if(selected) {
+        hfix58_blend_rect565(fb,x+2,y+2,w,20,0,0,0,80);
+        hfix58_blend_rect565(fb,x,y,w,20,
+            g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b,60);
+        hfix58_rect565(fb,x,y,3,20,255,218,112);
+    }
+    hfix58_draw_text_shadow(fb,x+24,y+6,shown,1,
+        selected?255:202,selected?249:216,selected?236:232);
+    if(status && *status)
+        hfix58_draw_text_shadow(fb,x+w-8-sw,y+6,status,1,
+            selected?202:132,selected?220:154,selected?238:182);
+}
+
+static void mivf8_top_progress(u8 *fb, int x, int y, int w,
+                               u32 value, u32 maximum) {
+    int fill=0;
+    if(maximum>0) fill=(int)(((u64)value*(u64)w)/(u64)maximum);
+    fill=mivf8_clampi(fill,0,w);
+    hfix58s_top_rect565(fb,x,y,w,5,18,27,42);
+    if(fill>0) hfix58s_top_rect565(fb,x,y,fill,5,
+        g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+    if(fill>2) hfix58s_top_rect565(fb,x+fill-2,y-2,3,9,255,220,112);
+}
+
 static void hfix58_draw_browser_preview(u8 *fb) {
-    int x = 174;
-    int y = 58;
-    int w = 130;
-    int h = 160;
+    /* MIVF_PHASE8_LIBRARY_TOP_V1 */
+    const Hfix58FileEntry *entry=NULL;
+    bool ready=false;
+    char title[64];
+    char path[64];
+    char items[32];
+    char progress[40];
+    int title_x=216;
 
-    hfix58_rect565(fb, x, y, w, h, 7, 10, 18);
-    hfix58_rect565(fb, x, y, w, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-    hfix58_draw_text_shadow(fb, x + 8, y + 6, "PREVIEW", 1, 235, 245, 255);
+    if(!fb) return;
+    if(g_hfix58_browser.count>0 && g_hfix58_browser.selected>=0 &&
+       g_hfix58_browser.selected<g_hfix58_browser.count)
+        entry=&g_hfix58_browser.entries[g_hfix58_browser.selected];
+    ready=entry && g_hfix58_preview.valid &&
+        !strcmp(g_hfix58_preview.path,entry->path);
 
-    hfix58_rect565(fb, x + 8, y + 18, 114, 64, 10, 14, 24);
+    hfix58s_top_rect565(fb,0,0,TOP_W,TOP_H,2,5,11);
+    for(int y=0;y<TOP_H;y+=16)
+        hfix58s_top_rect565(fb,0,y,TOP_W,1,4,9,18);
+    mivf8_top_panel(fb,12,8,TOP_W-24,36,144);
+    hfix58s_top_draw_text_shadow(fb,24,16,"MIVF LIBRARY",1,242,248,255);
+    mivf8_ellipsis(path,sizeof(path),g_hfix58_browser.cwd,38);
+    hfix58s_top_draw_text_shadow(fb,24,30,path,1,126,150,180);
+    snprintf(items,sizeof(items),"%d ITEMS",g_hfix58_browser.count);
+    hfix58s_top_draw_text_shadow(fb,TOP_W-24-(int)strlen(items)*6,16,items,1,150,174,200);
+    hfix58s_top_rect565(fb,20,43,88,2,
+        g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
 
-    if (g_hfix58_preview.valid && g_hfix58_preview.has_thumb) {
-        int thumb_x = x + 8;
-        int thumb_y = y + 18;
+    mivf8_top_panel(fb,18,56,364,166,122);
+    hfix58s_top_rect565(fb,30,70,176,100,8,13,23);
 
-        for (int yy = 0; yy < HFIX58_PREVIEW_H && yy < 64; yy++) {
-            for (int xx = 0; xx < HFIX58_PREVIEW_W && xx < 114; xx++) {
-                u16 c = g_hfix58_preview.thumb[yy * HFIX58_PREVIEW_W + xx];
-                ((u16*)fb)[(thumb_x + xx) * 240 + (239 - (thumb_y + yy))] = c;
+    if(ready && g_hfix58_preview.has_thumb) {
+        if(!mivf8_preview_hi_matches(g_hfix58_preview.path)) {
+            mivf8_preview_make_hi_from_small(g_hfix58_preview.path);
+        }
+        if(mivf8_preview_hi_matches(g_hfix58_preview.path)) {
+            for(int yy=0;yy<HFIX58_PREVIEW2_H;yy++) {
+                for(int xx=0;xx<HFIX58_PREVIEW2_W;xx++) {
+                    hfix58s_top_px565(fb,30+xx,70+yy,
+                        g_mivf8_preview_hi[yy*HFIX58_PREVIEW2_W+xx]);
+                }
             }
         }
-    } else if (g_hfix58_preview.valid && hfix58_media_kind(g_hfix58_preview.path) == HFIX58_MEDIA_MOFLEX) {
-        hfix58_rect565(fb, x + 8, y + 18, 114, 64, 12, 18, 30);
-        hfix58_rect565(fb, x + 22, y + 35, 86, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-        hfix58_draw_text_shadow(fb, x + 36, y + 44, "MOFLEX", 1, 225, 235, 255);
     } else {
-        hfix58_draw_text_shadow(fb, x + 18, y + 42, "NO THUMB", 1, 200, 210, 220);
+        hfix58s_top_blend_rect565(fb,30,70,176,100,
+            g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b,28);
+        for(int i=0;i<5;i++)
+            hfix58s_top_rect565(fb,48+i*12,92+i*7,104-i*24,1,
+                g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+        hfix58s_top_draw_text_shadow(fb,82,128,
+            entry?(ready?"MIVF MEDIA":"LOADING PREVIEW"):"NO MEDIA",1,
+            190,208,228);
     }
 
-    if (g_hfix58_preview.has_resume) {
-        hfix58_rect565(fb, x + 78, y + 70, 44, 10, 40, 92, 48);
-        hfix58_draw_text_shadow(fb, x + 83, y + 72, "CONT", 1, 220, 255, 220);
-    }
+    if(ready) mivf8_ellipsis(title,sizeof(title),g_hfix58_preview.title,25);
+    else if(entry) mivf8_ellipsis(title,sizeof(title),entry->name,25);
+    else snprintf(title,sizeof(title),"NO PLAYABLE MEDIA");
+    hfix58s_top_draw_text_shadow(fb,title_x,72,title,1,240,247,255);
 
-    hfix58_rect565(fb, x + 8, y + 84, 114, 1, 34, 48, 72);
-    hfix58_draw_text_shadow(fb, x + 8, y + 90, g_hfix58_preview.title[0] ? g_hfix58_preview.title : "NO FILE", 1, 210, 225, 245);
-    hfix58_draw_text_shadow(fb, x + 8, y + 102, g_hfix58_preview.summary[0] ? g_hfix58_preview.summary : "", 1, 185, 205, 230);
-    hfix58_draw_text_shadow(fb, x + 8, y + 114, g_hfix58_preview.detail[0] ? g_hfix58_preview.detail : "", 1, 185, 205, 230);
-    hfix58_draw_text_shadow(fb, x + 8, y + 126, g_hfix58_preview.extra[0] ? g_hfix58_preview.extra : "", 1, 170, 190, 215);
+    if(ready) {
+        hfix58s_top_draw_text_shadow(fb,title_x,91,g_hfix58_preview.summary,1,158,184,210);
+        hfix58s_top_draw_text_shadow(fb,title_x,107,g_hfix58_preview.detail,1,142,166,194);
+        hfix58s_top_draw_text_shadow(fb,title_x,127,g_hfix58_preview.extra,1,132,156,184);
 
-    /* HFIX60: optional synopsis from a ".nfo" sidecar. */
-    if (g_hfix58_preview.synopsis1[0]) {
-        hfix58_rect565(fb, x + 8, y + 137, 114, 1, 40, 60, 90);
-        hfix58_draw_text_shadow(fb, x + 8, y + 140, g_hfix58_preview.synopsis1, 1, 200, 215, 235);
-        if (g_hfix58_preview.synopsis2[0]) {
-            hfix58_draw_text_shadow(fb, x + 8, y + 150, g_hfix58_preview.synopsis2, 1, 200, 215, 235);
+        if(g_hfix58_preview.has_resume && g_hfix58_preview.total_frames>0) {
+            u32 pct=(u32)(((u64)g_hfix58_preview.bookmark_frame*100ull)/
+                (u64)g_hfix58_preview.total_frames);
+            if(pct>100u) pct=100u;
+            snprintf(progress,sizeof(progress),"CONTINUE WATCHING   %lu PCT",
+                (unsigned long)pct);
+            hfix58s_top_draw_text_shadow(fb,title_x,150,progress,1,126,205,162);
+            mivf8_top_progress(fb,title_x,168,148,
+                g_hfix58_preview.bookmark_frame,g_hfix58_preview.total_frames);
+        } else {
+            hfix58s_top_draw_text_shadow(fb,title_x,150,"READY TO PLAY",1,154,178,204);
         }
-    }
 
-    /* HFIX60: compact file-size badge. Zero draw-time I/O here — the
-       size was already captured when the preview was (lazily) loaded
-       for this path (see hfix58_browser_load_preview). */
-    {
-        u32 kb = g_hfix58_preview.file_size_kb;
-        if (kb > 0) {
-            char sz[24];
-            if (kb >= 1024) {
-                snprintf(sz, sizeof(sz), "%lu.%lu MB",
-                    (unsigned long)(kb / 1024u),
-                    (unsigned long)((kb % 1024u) * 10u / 1024u));
-            } else {
-                snprintf(sz, sizeof(sz), "%lu KB", (unsigned long)kb);
-            }
-            int sy = g_hfix58_preview.synopsis2[0] ? y + 158 :
-                     g_hfix58_preview.synopsis1[0] ? y + 148 : y + 134;
-            hfix58_draw_text_shadow(fb, x + 8, sy, sz, 1, 155, 195, 235);
-        }
+        if(g_hfix58_preview.synopsis1[0])
+            hfix58s_top_draw_text_shadow(fb,32,187,g_hfix58_preview.synopsis1,1,188,207,226);
+        if(g_hfix58_preview.synopsis2[0])
+            hfix58s_top_draw_text_shadow(fb,32,202,g_hfix58_preview.synopsis2,1,164,184,206);
+    } else if(entry) {
+        hfix58s_top_draw_text_shadow(fb,title_x,96,"READING COVER AND METADATA",1,142,166,194);
+    } else {
+        hfix58s_top_draw_text_shadow(fb,title_x,96,"COPY MIVF OR MOFLEX FILES",1,142,166,194);
+        hfix58s_top_draw_text_shadow(fb,title_x,112,"TO THE SD CARD",1,142,166,194);
     }
 }
 
@@ -7277,152 +7618,78 @@ static MoflexResult play_moflex_selected_media(const char *path) {
 }
 
 static void hfix58_draw_browser(u8 *fb) {
-    if (!fb) {
-        return;
-    }
-
+    /* MIVF_PHASE8_LIBRARY_LIST_V1 */
+    if(!fb) return;
     hfix58_browser_refresh_preview();
+    hfix58_rect565(fb,0,0,320,240,2,5,11);
+    for(int x=0;x<320;x+=24) hfix58_rect565(fb,x,0,1,216,5,10,19);
+    mivf8_bottom_panel(fb,8,7,304,203);
 
-    hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
-
-    hfix58_blend_rect565(fb, 10, 8, 300, 224, 12, 18, 34, 230);
-    hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-    hfix58_rect565(fb, 10, 230, 300, 2, 2, 4, 8);
-
-    hfix58_draw_text_shadow(fb, 20, 18, "LIBRARY", 2, 235, 245, 255);
-    hfix58_draw_text_shadow(fb, 118, 24, "MIVF / MOFLEX", 1, 160, 195, 230);
-
-    hfix58_blend_rect565(fb, 18, 46, 150, 22, 6, 10, 22, 220);
-    hfix58_draw_text_shadow(fb, 26, 53, g_hfix58_browser.cwd, 1, 160, 200, 255);
-    hfix58_rect565(fb, 24, 68, 132, 1, 36, 58, 90);
-
-    hfix58_draw_browser_preview(fb);
-
-    if (g_hfix58_browser.count <= 0) {
-        hfix58_blend_rect565(fb, 24, 98, 138, 52, 10, 14, 26, 230);
-        hfix58_rect565(fb, 24, 98, 4, 52, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-        hfix58_draw_text_shadow(fb, 34, 108, "NO .MIVF FILES FOUND", 1, 250, 186, 86);
-        hfix58_draw_text_shadow(fb, 38, 132, "PUT FILES IN SDMC:/MIVF", 1, 216, 226, 236);
-    } else {
-        int first = g_hfix58_browser.scroll;
-        int last = first + HFIX58_BROWSER_VISIBLE_ROWS;
-
-        if (last > g_hfix58_browser.count) {
-            last = g_hfix58_browser.count;
-        }
-
-        hfix58_draw_text_shadow(fb, 28, 72,
-            (first == 0 && g_hfix58_browser.entries[0].quick) ? "QUICK ACCESS" : "FILES",
-            1, 140, 175, 210);
-
-        int y = 84;
-
-        for (int i = first; i < last; i++) {
-            bool selected = (i == g_hfix58_browser.selected);
-            Hfix58FileEntry *entry = &g_hfix58_browser.entries[i];
-            Hfix58MediaKind kind = hfix58_media_kind(entry->name);
-            const char *badge = kind == HFIX58_MEDIA_MOFLEX ? "MOF" : "MIV";
-            int br = 34;
-            int bg = 48;
-            int bb = 72;
-
-            if (entry->quick == 2) {
-                badge = "FAV";
-                br = 130; bg = 102; bb = 34;
-            } else if (entry->quick == 1 || hfix60_recent_is(entry->path)) {
-                badge = "REC";
-                br = 42; bg = 86; bb = 126;
-            }
-
-            if (selected) {
-                hfix58_blend_rect565(fb, 22, y - 4, 140, 16, 42, 100, 185, 230);
-                hfix58_rect565(fb, 22, y - 4, 4, 16, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-            }
-
-            char line[48];
-            snprintf(line, sizeof(line), "%s", entry->name);
-
-            /*
-                Clip long names visually by truncating the text buffer.
-            */
-            line[16] = '\0';
-
-            hfix58_blend_rect565(fb, 29, y - 3, 24, 12,
-                selected ? br + 20 : br,
-                selected ? bg + 20 : bg,
-                selected ? bb + 18 : bb,
-                selected ? 242 : 228);
-            hfix58_rect565(fb, 30, y - 2, 22, 1,
-                selected ? 255 : 220,
-                selected ? 255 : 235,
-                selected ? 255 : 248);
-            hfix58_rect565(fb, 30, y + 7, 22, 1,
-                br > 10 ? br - 10 : br,
-                bg > 10 ? bg - 10 : bg,
-                bb > 12 ? bb - 12 : bb);
-            hfix58_draw_text_shadow(fb, 33, y, badge, 1, 235, 245, 255);
-
-            hfix58_draw_text_shadow(
-                fb,
-                selected ? 60 : 56,
-                y,
-                line,
-                1,
-                selected ? 255 : 205,
-                selected ? 255 : 220,
-                selected ? 255 : 240
-            );
-
-            if (selected && g_hfix58_preview.has_resume) {
-                hfix58_rect565(fb, 132, y - 2, 28, 10, 40, 92, 48);
-                hfix58_draw_text_shadow(fb, 136, y, "GO", 1, 220, 255, 220);
-            }
-
-            y += 14;
-        }
-
-        /*
-            Scroll bar.
-        */
-        if (g_hfix58_browser.count > HFIX58_BROWSER_VISIBLE_ROWS) {
-            int track_y = 84;
-            int track_h = HFIX58_BROWSER_VISIBLE_ROWS * 14;
-            int knob_h = (track_h * HFIX58_BROWSER_VISIBLE_ROWS) / g_hfix58_browser.count;
-
-            if (knob_h < 12) knob_h = 12;
-
-            int max_scroll = g_hfix58_browser.count - HFIX58_BROWSER_VISIBLE_ROWS;
-            int knob_y = track_y;
-
-            if (max_scroll > 0) {
-                knob_y += ((track_h - knob_h) * g_hfix58_browser.scroll) / max_scroll;
-            }
-
-            hfix58_rect565(fb, 148, track_y, 4, track_h, 30, 35, 48);
-            hfix58_rect565(fb, 148, knob_y, 4, knob_h, 80, 170, 255);
-        }
-    }
-
-    hfix58_blend_rect565(fb, 18, 206, 284, 18, 6, 10, 22, 210);
-    hfix58_rect565(fb, 22, 205, 276, 1, 40, 62, 94);
+    hfix58_draw_text_shadow(fb,18,17,"LIBRARY",1,240,247,255);
+    hfix58_rect565(fb,18,30,44,2,
+        g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
     {
-        char footer[56];
-        snprintf(footer, sizeof(footer), "A OPEN  Y FAV  %s  B BACK  START EXIT",
-            g_hfix58_show_all_dirs ? "SEL:HIDE SYS" : "SEL:SHOW SYS");
-        hfix58_draw_text_shadow(fb, 24, 212, footer, 1, 222, 236, 252);
+        char pos[32];
+        int pw;
+        snprintf(pos,sizeof(pos),g_hfix58_browser.count>0?"%d OF %d":"0 ITEMS",
+            g_hfix58_browser.count>0?g_hfix58_browser.selected+1:0,
+            g_hfix58_browser.count);
+        pw=(int)strlen(pos)*6;
+        hfix58_draw_text_shadow(fb,302-pw,17,pos,1,138,160,188);
+    }
+    {
+        char cwd[48];
+        mivf8_ellipsis(cwd,sizeof(cwd),g_hfix58_browser.cwd,43);
+        hfix58_draw_text_shadow(fb,18,39,cwd,1,126,150,180);
     }
 
+    if(g_hfix58_browser.count<=0) {
+        hfix58_rect565(fb,28,78,3,72,
+            g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+        hfix58_draw_text_shadow(fb,42,86,"NO PLAYABLE MEDIA",1,238,244,250);
+        hfix58_draw_text_shadow(fb,42,109,"COPY MIVF OR MOFLEX FILES",1,154,178,204);
+        hfix58_draw_text_shadow(fb,42,126,"TO SDMC:/MIVF",1,154,178,204);
+    } else {
+        int first=g_hfix58_browser.scroll;
+        int last=first+HFIX58_BROWSER_VISIBLE_ROWS;
+        if(last>g_hfix58_browser.count) last=g_hfix58_browser.count;
+        int y=58;
+        for(int i=first;i<last;i++,y+=22) {
+            Hfix58FileEntry *e=&g_hfix58_browser.entries[i];
+            Hfix58MediaKind kind=hfix58_media_kind(e->name);
+            const char *status=kind==HFIX58_MEDIA_MOFLEX?"MOFLEX":"MIVF";
+            if(e->quick==2 || hfix60_fav_is(e->path)) status="FAVORITE";
+            else if(i==g_hfix58_browser.selected && g_hfix58_preview.valid &&
+                    !strcmp(g_hfix58_preview.path,e->path) && g_hfix58_preview.has_resume)
+                status="RESUME";
+            else if(e->quick==1 && i<3) status="RECENT";
+            mivf8_bottom_focus_row(fb,16,y,286,e->name,status,
+                i==g_hfix58_browser.selected);
+        }
+
+        if(g_hfix58_browser.count>HFIX58_BROWSER_VISIBLE_ROWS) {
+            int ty=58,th=HFIX58_BROWSER_VISIBLE_ROWS*22;
+            int kh=(th*HFIX58_BROWSER_VISIBLE_ROWS)/g_hfix58_browser.count;
+            int maxs=g_hfix58_browser.count-HFIX58_BROWSER_VISIBLE_ROWS;
+            if(kh<12)kh=12;
+            int ky=ty+(maxs>0?((th-kh)*g_hfix58_browser.scroll)/maxs:0);
+            hfix58_rect565(fb,305,ty,3,th,24,34,49);
+            hfix58_rect565(fb,305,ky,3,kh,
+                g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+        }
+    }
+    mivf8_bottom_footer(fb,"A OPEN  Y FAVORITE","X HELP  B BACK");
     hfix58_draw_alert(fb);
 }
 
 static void hfix58_browser_redraw(void) {
-    u16 fw = 0;
-    u16 fh = 0;
-    u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
-
-    hfix58_draw_browser(fb);
-    if (g_hfix62_help_visible) {
-        hfix62_draw_help_overlay(fb);
+    u16 fw=0,fh=0;
+    u8 *top=gfxGetFramebuffer(GFX_TOP,GFX_LEFT,&fw,&fh);
+    u8 *bot=gfxGetFramebuffer(GFX_BOTTOM,GFX_LEFT,&fw,&fh);
+    if(top) hfix58_draw_browser_preview(top);
+    if(bot) {
+        hfix58_draw_browser(bot);
+        if(g_hfix62_help_visible) hfix62_draw_help_overlay(bot);
     }
     gfxFlushBuffers();
     gfxSwapBuffers();
@@ -10826,6 +11093,93 @@ static bool mivf_menu_load_for_movie(const char *movie_path, MivfMenu *menu) {
     return true;
 }
 
+/* MIVF_PHASE7_CINEMATIC_GLASS_V1
+   Shared, integer-only visual primitives for the DVD-menu presentation.
+   These helpers wrap the existing RGB565 fill/blend/text functions; no new
+   framebuffer, image decoder, floating-point animation, or navigation state. */
+static int mivf_ui_clampi(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int mivf_ui_tri(u32 tick, u32 period, int amplitude) {
+    u32 half;
+    u32 phase;
+    if (period < 2u || amplitude <= 0) return 0;
+    half = period / 2u;
+    phase = tick % period;
+    if (phase > half) phase = period - phase;
+    return (int)(((u64)phase * (u64)amplitude) / (u64)half);
+}
+
+static void mivf_ui_top_vignette(u8 *fb) {
+    /* Eight inexpensive inset rings: strongest at the edge, transparent in
+       the content region. This reads as a cinematic lens vignette without a
+       400x240 per-pixel blend pass. */
+    for (int i = 0; i < 8; i++) {
+        int a = 42 - i * 4;
+        hfix58s_top_blend_rect565(fb, i, i, TOP_W - i * 2, 1, 0, 0, 0, a);
+        hfix58s_top_blend_rect565(fb, i, TOP_H - 1 - i, TOP_W - i * 2, 1, 0, 0, 0, a);
+        hfix58s_top_blend_rect565(fb, i, i, 1, TOP_H - i * 2, 0, 0, 0, a);
+        hfix58s_top_blend_rect565(fb, TOP_W - 1 - i, i, 1, TOP_H - i * 2, 0, 0, 0, a);
+    }
+}
+
+static void mivf_ui_top_glass(u8 *fb, int x, int y, int w, int h, int alpha) {
+    hfix58s_top_blend_rect565(fb, x + 2, y + 3, w, h, 0, 0, 0, 90);
+    hfix58s_top_blend_rect565(fb, x, y, w, h, 5, 10, 20, alpha);
+    hfix58s_top_rect565(fb, x, y, w, 1, 80, 96, 120);
+    hfix58s_top_rect565(fb, x, y + h - 1, w, 1, 18, 26, 40);
+    hfix58s_top_rect565(fb, x, y, 1, h, 54, 66, 84);
+    hfix58s_top_rect565(fb, x + w - 1, y, 1, h, 16, 24, 38);
+    hfix58s_top_blend_rect565(fb, x + 2, y + 2, w - 4, 5, 110, 135, 170, 18);
+}
+
+static void mivf_ui_bottom_glass(u8 *fb, int x, int y, int w, int h) {
+    hfix58_blend_rect565(fb, x + 2, y + 3, w, h, 0, 0, 0, 100);
+    hfix58_blend_rect565(fb, x, y, w, h, 10, 18, 32, 230);
+    hfix58_rect565(fb, x, y, w, 1, 72, 90, 116);
+    hfix58_rect565(fb, x, y + h - 1, w, 1, 18, 26, 42);
+    hfix58_rect565(fb, x, y, 1, h, 52, 66, 88);
+    hfix58_rect565(fb, x + w - 1, y, 1, h, 18, 28, 44);
+}
+
+static void mivf_ui_bottom_badge(u8 *fb, int x, int y, const char *text,
+                                 int r, int g, int b) {
+    int w = (int)strlen(text) * 6 + 10;
+    hfix58_blend_rect565(fb, x, y, w, 15, r, g, b, 100);
+    hfix58_rect565(fb, x, y, w, 1, r, g, b);
+    hfix58_draw_text_shadow(fb, x + 5, y + 4, text, 1, 226, 238, 250);
+}
+
+static void mivf_ui_bottom_footer(u8 *fb, const char *left, const char *right) {
+    int rw = right ? (int)strlen(right) * 6 : 0;
+    hfix58_rect565(fb, 0, 215, 320, 25, 3, 7, 14);
+    hfix58_rect565(fb, 0, 215, 320, 1, 34, 48, 68);
+    if (left) hfix58_draw_text_shadow(fb, 14, 225, left, 1, 170, 190, 214);
+    if (right) hfix58_draw_text_shadow(fb, 306 - rw, 225, right, 1, 170, 190, 214);
+}
+
+static void mivf_ui_format_frame_time(char *out, size_t out_sz, u32 frame,
+                                      u32 total_frames) {
+    u32 sec = 0;
+    u32 min;
+    if (!out || out_sz == 0) return;
+    if (total_frames > 0) {
+        /* The menu does not open the video clock here; this is intentionally
+           a progress percentage helper, not a fabricated wall-clock time. */
+        u32 pct = (u32)(((u64)frame * 100ull) / (u64)total_frames);
+        if (pct > 100u) pct = 100u;
+        /* MIVF_PHASE7_1_SUPPORTED_PROGRESS_TEXT_V1 */
+        snprintf(out, out_sz, "WATCHED %lu PCT", (unsigned long)pct);
+        return;
+    }
+    min = sec / 60u;
+    snprintf(out, out_sz, "%lu:%02lu", (unsigned long)min,
+             (unsigned long)(sec % 60u));
+}
+
 /* HFIX70: small diamond flourish flanking centered titles -- a cheap,
    recognizable "cinematic menu" accent that doesn't need new font glyphs. */
 static void mivf_menu_top_diamond(u8 *fb, int cx, int cy, int r, int g, int b) {
@@ -10859,196 +11213,151 @@ static void mivf_menu_top_diamond(u8 *fb, int cx, int cy, int r, int g, int b) {
    this file) rather than pulling in sin/cos for a purely cosmetic effect.
    Zoom and pan use deliberately different periods so the motion doesn't
    read as a mechanical loop. */
-#define MIVF_MENU_BG_ZOOM_PERIOD 240  /* frames for one zoom in+out cycle */
-#define MIVF_MENU_BG_PAN_PERIOD  360  /* frames for one pan cycle */
-#define MIVF_MENU_BG_ZOOM_PCT    10   /* max zoom-in, percent, each side */
+
+/* hfix82 / MIVF_PHASE8_1_KEN_BURNS_SMOOTH_V1
+   EASED / FIXED-POINT KEN BURNS: longer cycles and smoothstep easing reduce
+   visible whole-pixel stepping. Still one top-screen RGB565 pass only, still
+   integer-only, still no new images or playback-side state. */
+#undef MIVF_MENU_BG_ZOOM_PERIOD
+#undef MIVF_MENU_BG_PAN_PERIOD
+#undef MIVF_MENU_BG_ZOOM_PCT
+#define MIVF_MENU_BG_ZOOM_PERIOD 720  /* slower, cinematic in/out cycle */
+#define MIVF_MENU_BG_PAN_PERIOD  960  /* different long pan cycle */
+#define MIVF_MENU_BG_ZOOM_PCT    7    /* smaller zoom preserves sharpness */
+static u32 mivf_menu_smoothstep_q16(u32 phase, u32 period) {
+    u32 half;
+    u32 t;
+    u64 tt;
+    if (period < 2u) return 0;
+    half = period / 2u;
+    phase %= period;
+    if (phase > half) phase = period - phase;
+    t = half ? (u32)(((u64)phase << 16) / (u64)half) : 0;
+    tt = ((u64)t * (u64)t) >> 16;
+    return (u32)((tt * (3ull * 65536ull - 2ull * (u64)t)) >> 16);
+}
 
 static void mivf_menu_draw_background_animated(u8 *fb, u32 pulse) {
-    u32 zoom_phase = pulse % MIVF_MENU_BG_ZOOM_PERIOD;
-    u32 zoom_half = MIVF_MENU_BG_ZOOM_PERIOD / 2;
-    u32 zoom_tri = (zoom_phase < zoom_half) ? zoom_phase : (MIVF_MENU_BG_ZOOM_PERIOD - zoom_phase);
-    int margin_x = (int)(((u64)(MIVF_MENU_BG_W * MIVF_MENU_BG_ZOOM_PCT / 100) * zoom_tri) / zoom_half);
-    int margin_y = (int)(((u64)(MIVF_MENU_BG_H * MIVF_MENU_BG_ZOOM_PCT / 100) * zoom_tri) / zoom_half);
-
-    u32 pan_phase = pulse % MIVF_MENU_BG_PAN_PERIOD;
-    u32 pan_half = MIVF_MENU_BG_PAN_PERIOD / 2;
-    long pan_tri = (long)((pan_phase < pan_half) ? pan_phase : (MIVF_MENU_BG_PAN_PERIOD - pan_phase));
-    /* -1..+1 triangle wave (scaled by margin) so pan never exceeds the crop
-       margin the current zoom level allows. */
-    int pan_x = (margin_x > 0)
-        ? (int)(((long)margin_x * (2 * pan_tri - (long)pan_half)) / (long)pan_half)
-        : 0;
-    int pan_y = (margin_y > 0) ? -(pan_x / 2) : 0; /* cheap diagonal drift, reusing pan_x's phase */
-
+    u32 zoom_ease = mivf_menu_smoothstep_q16(pulse, MIVF_MENU_BG_ZOOM_PERIOD);
+    u32 pan_ease_x = mivf_menu_smoothstep_q16(pulse + MIVF_MENU_BG_PAN_PERIOD / 5u,
+        MIVF_MENU_BG_PAN_PERIOD);
+    u32 pan_ease_y = mivf_menu_smoothstep_q16(pulse + MIVF_MENU_BG_PAN_PERIOD / 2u,
+        MIVF_MENU_BG_PAN_PERIOD);
+    int max_margin_x = MIVF_MENU_BG_W * MIVF_MENU_BG_ZOOM_PCT / 100;
+    int max_margin_y = MIVF_MENU_BG_H * MIVF_MENU_BG_ZOOM_PCT / 100;
+    int margin_x = (int)(((u64)max_margin_x * (u64)zoom_ease) >> 16);
+    int margin_y = (int)(((u64)max_margin_y * (u64)zoom_ease) >> 16);
+    int pan_x = margin_x ? (int)(((s64)margin_x * ((s64)pan_ease_x - 32768)) / 32768) : 0;
+    int pan_y = margin_y ? (int)(((s64)margin_y * ((s64)pan_ease_y - 32768)) / 32768) : 0;
     int src_x0 = margin_x + pan_x;
     int src_y0 = margin_y + pan_y;
     int src_w = MIVF_MENU_BG_W - 2 * margin_x;
     int src_h = MIVF_MENU_BG_H - 2 * margin_y;
-
     if (src_w <= 0 || src_w > MIVF_MENU_BG_W || src_h <= 0 || src_h > MIVF_MENU_BG_H) {
-        src_x0 = 0;
-        src_y0 = 0;
-        src_w = MIVF_MENU_BG_W;
-        src_h = MIVF_MENU_BG_H;
+        src_x0 = 0; src_y0 = 0;
+        src_w = MIVF_MENU_BG_W; src_h = MIVF_MENU_BG_H;
     }
-    if (src_x0 < 0) {
-        src_x0 = 0;
-    }
-    if (src_y0 < 0) {
-        src_y0 = 0;
-    }
-    if (src_x0 + src_w > MIVF_MENU_BG_W) {
-        src_x0 = MIVF_MENU_BG_W - src_w;
-    }
-    if (src_y0 + src_h > MIVF_MENU_BG_H) {
-        src_y0 = MIVF_MENU_BG_H - src_h;
-    }
+    if (src_x0 < 0) src_x0 = 0;
+    if (src_y0 < 0) src_y0 = 0;
+    if (src_x0 + src_w > MIVF_MENU_BG_W) src_x0 = MIVF_MENU_BG_W - src_w;
+    if (src_y0 + src_h > MIVF_MENU_BG_H) src_y0 = MIVF_MENU_BG_H - src_h;
 
-    /* hfix82b: this used to compute `src_x0 + (xx * src_w) / MIVF_MENU_BG_W`
-       fresh for every one of the 400*240 pixels -- ARMv6 (this 3DS's ARM11
-       core) has no hardware integer divide, so each of those ~96,000
-       divisions per frame was a slow software (libgcc) call, and that was
-       the actual cause of the reported stutter, not the effect itself.
-       Fixed-point DDA instead: compute the per-pixel step ONCE per frame
-       (one division each for x and y, not one per pixel) and walk the
-       source position by plain integer addition, which is cheap. Same
-       math, same visual result, ~96,000x fewer divisions per frame. */
     u32 step_x = ((u32)src_w << 16) / (u32)MIVF_MENU_BG_W;
     u32 step_y = ((u32)src_h << 16) / (u32)MIVF_MENU_BG_H;
     u32 sy_acc = (u32)src_y0 << 16;
-
     for (int yy = 0; yy < MIVF_MENU_BG_H; yy++) {
         int sy = (int)(sy_acc >> 16);
         const u16 *row = &g_mivf_menu_bg[(size_t)sy * MIVF_MENU_BG_W];
         u32 sx_acc = (u32)src_x0 << 16;
-
         for (int xx = 0; xx < MIVF_MENU_BG_W; xx++) {
             hfix58s_top_px565(fb, xx, yy, row[sx_acc >> 16]);
             sx_acc += step_x;
         }
-
         sy_acc += step_y;
     }
 }
-
 static void mivf_menu_draw_top(u8 *fb, const MivfMenu *menu, u32 pulse) {
-    int title_w;
-
+    /* MIVF_PHASE7_2_TITLE_COMPOSITION_V1 */
     if (menu->has_background) {
         mivf_menu_draw_background_animated(fb, pulse);
-
-        /* Title bar with a soft drop edge, and a matching footer-safe bar so
-           any background art still leaves the top/bottom text legible. */
-        hfix58s_top_rect565(fb, 0, 0, TOP_W, 30, 4, 8, 16);
-        hfix58s_top_rect565(fb, 0, 28, TOP_W, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-        hfix58s_top_rect565(fb, 0, 30, TOP_W, 1, 8, 12, 20);
-        hfix58s_top_rect565(fb, 0, TOP_H - 14, TOP_W, 14, 4, 8, 16);
-        hfix58s_top_rect565(fb, 0, TOP_H - 14, TOP_W, 1, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-
-        hfix58s_top_draw_text_shadow(fb, 12, 9, menu->title, 1, 235, 245, 255);
-        hfix58s_top_draw_text_shadow(fb, 12, TOP_H - 11, "MIVF DISC MENU", 1, 150, 170, 195);
-        return;
-    }
-
-    /* Generated "classic_dvd" fallback: dark blue/black vertical gradient,
-       a thin widescreen frame, title flanked by small diamond flourishes
-       confined to a fixed strip near the top (not screen-centered -- that
-       zone belongs to the button stack now), thin gold/theme divider right
-       below it, small disc-menu caption at the very bottom. */
-    for (int yy = 0; yy < TOP_H; yy++) {
-        int shade = 4 + (yy * 22) / TOP_H;
-        hfix58s_top_rect565(fb, 0, yy, TOP_W, 1, shade / 3, shade / 2, shade + 8);
-    }
-
-    /* Faint widescreen frame -- a single low-key border reads as
-       "cinematic" without competing with the title. */
-    hfix58s_top_rect565(fb, 0, 0, TOP_W, 1, 30, 36, 48);
-    hfix58s_top_rect565(fb, 0, TOP_H - 1, TOP_W, 1, 30, 36, 48);
-    hfix58s_top_rect565(fb, 0, 0, 1, TOP_H, 30, 36, 48);
-    hfix58s_top_rect565(fb, TOP_W - 1, 0, 1, TOP_H, 30, 36, 48);
-
-    title_w = (int)strlen(menu->title) * 6 * 2;
-    hfix58s_top_draw_text_shadow(fb, (TOP_W - title_w) / 2, 14, menu->title, 2, 235, 245, 255);
-
-    mivf_menu_top_diamond(fb, (TOP_W - title_w) / 2 - 14, 21,
-        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-    mivf_menu_top_diamond(fb, (TOP_W + title_w) / 2 + 14, 21,
-        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-
-    hfix58s_top_rect565(fb, 0, MIVF_MENU_TOP_CONTENT_Y_FALLBACK - 10, TOP_W, 1,
-        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-
-    hfix58s_top_draw_text_shadow(fb, (TOP_W - (int)strlen("MIVF DISC MENU") * 6) / 2, TOP_H - 20,
-        "MIVF DISC MENU", 1, 130, 150, 175);
-}
-
-/* HFIX71: root menu buttons now render on the top screen (real DVD menus
-   put the interactive menu over the movie/disc art, not on a separate
-   panel) -- same visual language as before, redrawn with the hfix58s_top_*
-   family instead of the 320-wide bottom-screen helpers. */
-/* HFIX72: text-first button rendering -- a label centered at (cx, y), not a
-   full-width app-style box. Non-selected items are just shadowed text;
-   the selected item gets a highlight sized tightly to its own text (not
-   the whole row), a thin gold top/bottom rule, and a small arrow cursor to
-   its left. This is Option A from the layout fix: button rects from
-   .menu.ini are intentionally NOT used for top-screen root positioning --
-   see mivf_menu_load_for_movie's clamp comment and mivf_menu_draw_top_root
-   below. Coordinates are still parsed and clamped for possible future use
-   (a custom/explicit layout mode), just not read here. */
-static void mivf_menu_draw_button_top(u8 *fb, const char *label, int cx, int y, bool enabled, bool is_selected, u32 pulse) {
-    int text_r, text_g, text_b;
-    int w = (int)strlen(label) * 6;
-    int x = cx - w / 2;
-
-    if (!enabled) {
-        text_r = 95; text_g = 100; text_b = 108;
-    } else if (is_selected) {
-        /* Smooth triangle-wave pulse (0..30..0) instead of a hard sawtooth
-           reset, so the glow breathes rather than snapping. */
-        u32 phase = pulse % 60u;
-        u32 tri = (phase < 30u) ? phase : (60u - phase);
-        enum { PAD_X = 10, PAD_Y = 3, GLYPH_H = 7 };
-
-        text_r = 255; text_g = 250; text_b = 235;
-
-        hfix58s_top_blend_rect565(fb, x - PAD_X, y - PAD_Y, w + PAD_X * 2, GLYPH_H + PAD_Y * 2,
-            g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 60 + (int)tri);
-        hfix58s_top_rect565(fb, x - PAD_X, y - PAD_Y, w + PAD_X * 2, 1, 255, 222, 120);
-        hfix58s_top_rect565(fb, x - PAD_X, y + GLYPH_H + PAD_Y - 1, w + PAD_X * 2, 1, 255, 222, 120);
-
-        for (int i = 0; i < 4; i++) {
-            int arm = 4 - i;
-            hfix58s_top_rect565(fb, x - PAD_X - 9 + i, y + 3 - arm, 1, arm * 2 + 1, 255, 222, 120);
+        for (int i=0;i<8;i++) {
+            hfix58s_top_blend_rect565(fb,0,i*4,TOP_W,4,2,6,14,62-i*5);
+            hfix58s_top_blend_rect565(fb,0,TOP_H-1-i*3,TOP_W,3,2,6,14,42-i*4);
         }
     } else {
-        text_r = 195; text_g = 205; text_b = 220;
+        for (int yy=0;yy<TOP_H;yy++) {
+            int shade=5+(yy*24)/TOP_H;
+            hfix58s_top_rect565(fb,0,yy,TOP_W,1,shade/4,shade/2,shade+8);
+        }
+        for (int i=0;i<6;i++)
+            hfix58s_top_blend_rect565(fb,56+i*8,0,TOP_W-112-i*16,TOP_H,
+                g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b,5);
     }
+    mivf_ui_top_vignette(fb);
 
-    hfix58s_top_draw_text_shadow(fb, x, y, label, 1, text_r, text_g, text_b);
+    /* Compact two-line title card: title and disc identity are now one
+       composition rather than unrelated left/right labels. */
+    mivf_ui_top_glass(fb,12,8,TOP_W-24,34,130);
+    hfix58s_top_draw_text_shadow(fb,25,15,menu->title,1,242,248,255);
+    hfix58s_top_draw_text_shadow(fb,25,29,"MIVF DISC EXPERIENCE",1,122,146,176);
+    hfix58s_top_rect565(fb,20,41,88,2,
+        g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+    mivf_menu_top_diamond(fb,TOP_W-31,25,
+        g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
 }
 
-/* Draws the background/title (mivf_menu_draw_top above), then the root
-   menu's button stack auto-laid-out as a centered vertical list starting
-   below the fixed title zone -- this is the new top-screen root menu
-   entry point. */
-static void mivf_menu_draw_top_root(u8 *fb, const MivfMenu *menu, u32 pulse) {
-    enum { ROW_H = 28, PANEL_W = 260 };
-    int content_y = menu->has_background ? MIVF_MENU_TOP_CONTENT_Y_BG : MIVF_MENU_TOP_CONTENT_Y_FALLBACK;
-    int cx = TOP_W / 2;
+static void mivf_menu_draw_button_top(u8 *fb, const char *label, int cx, int y, bool enabled, bool is_selected, u32 pulse) {
+    /* MIVF_PHASE7_2_DEFINITIVE_UI_V1
+       Minimal focus language: a warm rail, compact diamond, restrained glass,
+       and text. Idle rows are borderless so the artwork and composition lead. */
+    enum { ROW_W = 222, ROW_H = 20 };
+    int x = cx - ROW_W / 2;
+    int text_x = x + 27;
+    int tr = enabled ? 194 : 88;
+    int tg = enabled ? 208 : 95;
+    int tb = enabled ? 225 : 105;
 
-    mivf_menu_draw_top(fb, menu, pulse);
-
-    if (menu->has_background && menu->button_count > 0) {
-        /* Arbitrary background art needs more contrast help than our own
-           designed gradient -- one soft panel behind the whole stack, not
-           per-button boxes. */
-        int panel_h = ROW_H * menu->button_count + 12;
-        hfix58s_top_blend_rect565(fb, (TOP_W - PANEL_W) / 2, content_y - 10, PANEL_W, panel_h, 6, 9, 16, 110);
+    if (is_selected && enabled) {
+        int breathe = mivf_ui_tri(pulse >> 1, 36u, 10);
+        hfix58s_top_blend_rect565(fb, x + 2, y - 4, ROW_W, ROW_H,
+            0, 0, 0, 88);
+        hfix58s_top_blend_rect565(fb, x, y - 5, ROW_W, ROW_H,
+            g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 45 + breathe);
+        hfix58s_top_rect565(fb, x, y - 5, 3, ROW_H, 255, 218, 112);
+        mivf_menu_top_diamond(fb, x + 14, y + 3, 255, 224, 128);
+        tr=255; tg=249; tb=236;
     }
+    hfix58s_top_draw_text_shadow(fb, text_x, y, label, 1, tr, tg, tb);
+}
 
-    for (int i = 0; i < menu->button_count; i++) {
-        const MivfMenuButton *b = &menu->buttons[i];
-        mivf_menu_draw_button_top(fb, b->label, cx, content_y + i * ROW_H, b->enabled, i == menu->selected, pulse);
+static void mivf_menu_draw_top_root(u8 *fb, const MivfMenu *menu, u32 pulse) {
+    /* MIVF_PHASE7_2_FLOATING_MENU_V1
+       A softer floating menu: no hard outer frame and no underline on every
+       row. The selected row carries the only strong geometry. */
+    enum { ROW_H=27, PANEL_W=252 };
+    int content_y = 61;
+    int cx = TOP_W/2;
+    int panel_h = menu->button_count*ROW_H+25;
+
+    /* Preserve prior provenance markers replaced with this renderer. */
+    /* MIVF_PHASE7_ROOT_MENU_V1 */
+    /* MIVF_PHASE7_1_ROOT_REFINEMENT_V1 */
+    mivf_menu_draw_top(fb,menu,pulse);
+    panel_h=mivf_ui_clampi(panel_h,48,TOP_H-content_y-12);
+
+    hfix58s_top_blend_rect565(fb,(TOP_W-PANEL_W)/2+3,content_y-11,
+        PANEL_W,panel_h,0,0,0,72);
+    hfix58s_top_blend_rect565(fb,(TOP_W-PANEL_W)/2,content_y-14,
+        PANEL_W,panel_h,5,10,20,82);
+    hfix58s_top_draw_text_shadow(fb,(TOP_W-PANEL_W)/2+15,content_y-7,
+        "MAIN MENU",1,132,154,184);
+    hfix58s_top_rect565(fb,(TOP_W-PANEL_W)/2+80,content_y-4,
+        PANEL_W-96,1,40,54,74);
+
+    for(int i=0;i<menu->button_count;i++) {
+        const MivfMenuButton *b=&menu->buttons[i];
+        mivf_menu_draw_button_top(fb,b->label,cx,
+            content_y+14+i*ROW_H,b->enabled,i==menu->selected,pulse);
     }
 }
 
@@ -11069,89 +11378,91 @@ static const char *mivf_menu_action_description(MivfMenuAction action) {
    "PAGE X/Y" indicator, so Scene Selection reads like a real DVD scene menu
    instead of a plain list. total_pages <= 1 draws no page indicator. */
 static void mivf_menu_draw_panel_header(u8 *fb, const char *title, int page, int total_pages) {
-    hfix58_draw_text_shadow(fb, 18, 16, title, 1, 235, 245, 255);
-    hfix58_rect565(fb, 18, 28, (int)strlen(title) * 6, 1, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-
+    hfix58_draw_text_shadow(fb, 18, 17, title, 1, 238, 246, 255);
+    hfix58_rect565(fb, 18, 29, 42, 2,
+        g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
+    hfix58_rect565(fb, 64, 30, 154, 1, 45, 60, 80);
     if (total_pages > 1) {
         char page_str[32];
         int w;
-
-        snprintf(page_str, sizeof(page_str), "PAGE %d/%d", page, total_pages);
+        snprintf(page_str, sizeof(page_str), "PAGE %d OF %d", page, total_pages);
         w = (int)strlen(page_str) * 6;
-        hfix58_draw_text_shadow(fb, 302 - w, 16, page_str, 1, 170, 195, 220);
+        hfix58_draw_text_shadow(fb, 302 - w, 17, page_str, 1,
+            132, 154, 182);
+        hfix58_rect565(fb, 302 - w, 29, w, 1,
+            g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
     }
 }
 
 /* HFIX71: bottom screen is now a helper/info panel for the root menu --
    the interactive buttons live on the top screen instead. */
 static void mivf_menu_draw_info_bottom(u8 *fb, const MivfMenu *menu) {
-    const MivfMenuButton *sel = NULL;
-    bool have_bookmark_hint = false;
+    /* MIVF_PHASE7_2_CONTEXT_DASHBOARD_V1
+       The top screen owns focus; this screen explains the selected action.
+       Information is grouped into description, context, and controls. */
+    const MivfMenuButton *sel=NULL;
+    bool have_resume=false;
+    char progress[40];
+    char meta[48];
 
-    hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
-    hfix58_blend_rect565(fb, 10, 8, 300, 210, 14, 22, 38, 225);
-    hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-    hfix58_rect565(fb, 10, 216, 300, 2, 2, 4, 8);
+    /* Preserve prior provenance marker replaced with this renderer. */
+    /* MIVF_PHASE7_DISC_DASHBOARD_V1 */
+    hfix58_rect565(fb,0,0,320,240,2,5,11);
+    for(int x=0;x<320;x+=24) hfix58_rect565(fb,x,0,1,217,5,10,19);
+    mivf_ui_bottom_glass(fb,8,7,304,204);
+    mivf_menu_draw_panel_header(fb,"DISC DASHBOARD",1,1);
 
-    mivf_menu_draw_panel_header(fb, "DISC MENU", 1, 1);
+    if(menu->selected>=0 && menu->selected<menu->button_count)
+        sel=&menu->buttons[menu->selected];
+    for(int i=0;i<menu->button_count;i++)
+        if(menu->buttons[i].action==MIVF_MENU_ACTION_RESUME &&
+           menu->buttons[i].enabled) have_resume=true;
 
-    if (menu->selected >= 0 && menu->selected < menu->button_count) {
-        sel = &menu->buttons[menu->selected];
+    if(sel) {
+        hfix58_rect565(fb,17,47,3,42,255,218,112);
+        hfix58_draw_text_shadow(fb,28,51,sel->label,1,
+            sel->enabled?241:132,sel->enabled?248:140,sel->enabled?255:150);
+        hfix58_draw_text_shadow(fb,28,69,
+            mivf_menu_action_description(sel->action),1,154,178,204);
+        if(!sel->enabled)
+            hfix58_draw_text_shadow(fb,235,52,"NOT AVAILABLE",1,192,112,118);
     }
 
-    if (sel) {
-        hfix58_draw_text_shadow(fb, 18, 50, sel->label, 1,
-            sel->enabled ? 235 : 140, sel->enabled ? 245 : 148, sel->enabled ? 255 : 158);
-        hfix58_draw_text_shadow(fb, 18, 66, mivf_menu_action_description(sel->action), 1, 170, 190, 210);
-
-        if (!sel->enabled) {
-            hfix58_draw_text_shadow(fb, 18, 82, "NOT AVAILABLE", 1, 200, 120, 120);
-        }
+    hfix58_rect565(fb,17,101,286,1,32,44,62);
+    if(sel && sel->action==MIVF_MENU_ACTION_RESUME &&
+       menu->has_resume_progress && menu->resume_total_frames>0) {
+        int fill=(int)(((u64)menu->resume_bookmark_frame*286ull)/
+            (u64)menu->resume_total_frames);
+        fill=mivf_ui_clampi(fill,0,286);
+        hfix58_draw_text_shadow(fb,17,115,"CONTINUE WATCHING",1,174,196,220);
+        hfix58_rect565(fb,17,136,286,7,14,22,35);
+        if(fill>0) hfix58_rect565(fb,17,136,fill,7,
+            g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+        if(fill>2) hfix58_rect565(fb,17+fill-2,134,3,11,255,224,125);
+        mivf_ui_format_frame_time(progress,sizeof(progress),
+            menu->resume_bookmark_frame,menu->resume_total_frames);
+        hfix58_draw_text_shadow(fb,17,153,progress,1,204,220,237);
+    } else if(sel && sel->action==MIVF_MENU_ACTION_CHAPTERS) {
+        snprintf(meta,sizeof(meta),"BROWSE %d CHAPTERS",g_mivf_chapters_count);
+        hfix58_draw_text_shadow(fb,17,115,meta,1,190,209,228);
+        hfix58_draw_text_shadow(fb,17,136,"SIX SCENES PER PAGE",1,136,158,184);
+        hfix58_rect565(fb,17,156,286,2,
+            g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+    } else if(sel && sel->action==MIVF_MENU_ACTION_BACK) {
+        hfix58_draw_text_shadow(fb,17,115,"RETURN TO THE LIBRARY",1,190,209,228);
+        hfix58_draw_text_shadow(fb,17,136,
+            have_resume?"CURRENT PROGRESS IS AVAILABLE":"NO SAVED PROGRESS",1,
+            136,158,184);
+    } else {
+        hfix58_draw_text_shadow(fb,17,115,"PLAY FROM THE BEGINNING",1,190,209,228);
+        snprintf(meta,sizeof(meta),"%d CHAPTERS   MIVF DISC",g_mivf_chapters_count);
+        hfix58_draw_text_shadow(fb,17,136,meta,1,136,158,184);
+        if(have_resume)
+            hfix58_draw_text_shadow(fb,17,157,"RESUME READY",1,126,205,162);
     }
 
-    hfix58_rect565(fb, 18, 100, 284, 1, 30, 42, 58);
-
-    for (int i = 0; i < menu->button_count; i++) {
-        if (menu->buttons[i].action == MIVF_MENU_ACTION_RESUME && menu->buttons[i].enabled) {
-            have_bookmark_hint = true;
-        }
-    }
-
-    {
-        char info[48];
-
-        snprintf(info, sizeof(info), "%s", have_bookmark_hint ? "RESUME AVAILABLE" : "NO SAVED PROGRESS");
-        hfix58_draw_text_shadow(fb, 18, 114, info, 1, 170, 190, 210);
-
-        /* hfix79: resume progress bar -- how far into the movie the saved
-           bookmark sits, instead of just a yes/no hint. */
-        if (menu->has_resume_progress && menu->resume_total_frames > 0) {
-            enum { BAR_X = 18, BAR_Y = 124, BAR_W = 200, BAR_H = 5 };
-            int fill_w = (int)(((u64)menu->resume_bookmark_frame * (u64)BAR_W) / (u64)menu->resume_total_frames);
-
-            if (fill_w < 0) {
-                fill_w = 0;
-            }
-            if (fill_w > BAR_W) {
-                fill_w = BAR_W;
-            }
-
-            hfix58_rect565(fb, BAR_X, BAR_Y, BAR_W, BAR_H, 20, 28, 42);
-            if (fill_w > 0) {
-                hfix58_rect565(fb, BAR_X, BAR_Y, fill_w, BAR_H, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-            }
-        }
-    }
-
-    if (g_mivf_chapters_count > 0) {
-        char info[32];
-
-        snprintf(info, sizeof(info), "%d SCENES", g_mivf_chapters_count);
-        hfix58_draw_text_shadow(fb, 18, 138, info, 1, 170, 190, 210);
-    }
-
-    hfix58_draw_text_shadow(fb, 18, 190, "D-PAD MOVE", 1, 150, 170, 195);
-    hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
+    hfix58_draw_text_shadow(fb,17,190,"D-PAD NAVIGATE",1,126,148,176);
+    mivf_ui_bottom_footer(fb,"A SELECT","B LIBRARY");
 }
 
 /* hfix84: blits one chapter's pre-rendered thumbnail (see
@@ -11167,83 +11478,95 @@ static void mivf_menu_blit_chapthumb(u8 *fb, int x0, int y0, int chapter_idx) {
 }
 
 static void mivf_menu_draw_chapters_bottom(u8 *fb, int selected) {
-    enum { ROW_H = 22 };
-    bool have_thumbs = (g_mivf_chapthumbs_count > 0) && (g_mivf_chapthumbs_count == g_mivf_chapters_count);
-    int start = 0;
-    int page;
-    int total_pages;
+    /* Preserve the Phase 7 provenance marker because Phase 7.1 replaces the
+       complete Scene Selection renderer that originally contained it. */
+    /* MIVF_PHASE7_SCENE_BROWSER_V1 */
+    /* MIVF_PHASE7_1_CHAPTER_REFINEMENT_V1
+       Compact 112px cards fit the native 96px thumbnails without the large
+       unused right-side block visible in the first Phase 7 screenshots. */
+    bool have_thumbs = (g_mivf_chapthumbs_count > 0) &&
+        (g_mivf_chapthumbs_count == g_mivf_chapters_count);
+    int start = (selected / MIVF_MENU_CHAPTERS_VISIBLE_ROWS) *
+        MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+    int page = (start / MIVF_MENU_CHAPTERS_VISIBLE_ROWS) + 1;
+    int total = (g_mivf_chapters_count +
+        MIVF_MENU_CHAPTERS_VISIBLE_ROWS - 1) /
+        MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+    if (total < 1) total = 1;
 
-    if (selected >= MIVF_MENU_CHAPTERS_VISIBLE_ROWS) {
-        start = selected - MIVF_MENU_CHAPTERS_VISIBLE_ROWS + 1;
-    }
-
-    page = (g_mivf_chapters_count > 0) ? (start / MIVF_MENU_CHAPTERS_VISIBLE_ROWS) + 1 : 1;
-    total_pages = (g_mivf_chapters_count + MIVF_MENU_CHAPTERS_VISIBLE_ROWS - 1) / MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
-    if (total_pages < 1) {
-        total_pages = 1;
-    }
-
-    hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
-    hfix58_blend_rect565(fb, 10, 8, 300, 210, 14, 22, 38, 225);
-    hfix58_rect565(fb, 10, 8, 300, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-
-    mivf_menu_draw_panel_header(fb, "SCENE SELECTION", page, total_pages);
+    hfix58_rect565(fb, 0, 0, 320, 240, 2, 5, 11);
+    mivf_ui_bottom_glass(fb, 8, 7, 304, 202);
+    mivf_menu_draw_panel_header(fb, "SCENE SELECTION", page, total);
 
     if (have_thumbs) {
-        enum { COLS = 2, ITEM_W = 134, ITEM_H = 56, GAP_X = 8, GAP_Y = 4, GRID_X0 = 18, GRID_Y0 = 38 };
-
-        for (int slot = 0; slot < MIVF_MENU_CHAPTERS_VISIBLE_ROWS && (start + slot) < g_mivf_chapters_count; slot++) {
+        enum {
+            COLS = 2, ITEM_W = 112, ITEM_H = 58,
+            GAP_X = 24, GAP_Y = 2, X0 = 36, Y0 = 37
+        };
+        for (int slot = 0; slot < MIVF_MENU_CHAPTERS_VISIBLE_ROWS &&
+             start + slot < g_mivf_chapters_count; slot++) {
             int idx = start + slot;
             int col = slot % COLS;
             int row = slot / COLS;
-            int item_x = GRID_X0 + col * (ITEM_W + GAP_X);
-            int item_y = GRID_Y0 + row * (ITEM_H + GAP_Y);
-            int thumb_x = item_x + (ITEM_W - MIVF_CHAPTHUMB_W) / 2;
-            int thumb_y = item_y + (ITEM_H - MIVF_CHAPTHUMB_H) / 2;
-            bool sel = (idx == selected);
-            char label[24];
+            int x = X0 + col * (ITEM_W + GAP_X);
+            int y = Y0 + row * (ITEM_H + GAP_Y);
+            int tx = x + (ITEM_W - MIVF_CHAPTHUMB_W) / 2;
+            int ty = y + 2;
+            bool sel = idx == selected;
+            char number[16];
 
-            hfix58_rect565(fb, item_x, item_y, ITEM_W, ITEM_H, 8, 12, 20);
-            mivf_menu_blit_chapthumb(fb, thumb_x, thumb_y, idx);
+            hfix58_blend_rect565(fb, x + 2, y + 3, ITEM_W, ITEM_H,
+                0, 0, 0, 100);
+            hfix58_rect565(fb, x, y, ITEM_W, ITEM_H, 7, 12, 21);
+            mivf_menu_blit_chapthumb(fb, tx, ty, idx);
 
-            /* Translucent label strip across the thumbnail's own bottom
-               edge -- chapter number + short title, like real DVD
-               scene-select grids, instead of a separate text row. */
-            hfix58_blend_rect565(fb, thumb_x, thumb_y + MIVF_CHAPTHUMB_H - 14,
-                MIVF_CHAPTHUMB_W, 14, 0, 0, 0, 170);
-            snprintf(label, sizeof(label), "%d. %.16s", idx + 1, g_mivf_chapters[idx].label);
-            hfix58_draw_text_shadow(fb, thumb_x + 3, thumb_y + MIVF_CHAPTHUMB_H - 11, label, 1, 230, 235, 245);
+            /* Keep almost the entire picture visible; only a small number
+               badge overlays the lower-left corner. The full selected label
+               is shown contextually on the top screen. */
+            snprintf(number, sizeof(number), "%02d", idx + 1);
+            hfix58_blend_rect565(fb, tx + 3, ty + MIVF_CHAPTHUMB_H - 15,
+                24, 13, 0, 0, 0, 190);
+            hfix58_draw_text_shadow(fb, tx + 7,
+                ty + MIVF_CHAPTHUMB_H - 12, number, 1,
+                238, 243, 250);
 
             if (sel) {
-                hfix58_rect565(fb, thumb_x - 2, thumb_y - 2, MIVF_CHAPTHUMB_W + 4, 2, 255, 222, 120);
-                hfix58_rect565(fb, thumb_x - 2, thumb_y + MIVF_CHAPTHUMB_H, MIVF_CHAPTHUMB_W + 4, 2, 255, 222, 120);
-                hfix58_rect565(fb, thumb_x - 2, thumb_y - 2, 2, MIVF_CHAPTHUMB_H + 4, 255, 222, 120);
-                hfix58_rect565(fb, thumb_x + MIVF_CHAPTHUMB_W, thumb_y - 2, 2, MIVF_CHAPTHUMB_H + 4, 255, 222, 120);
+                hfix58_rect565(fb, x - 2, y - 2, ITEM_W + 4, 2,
+                    255, 220, 112);
+                hfix58_rect565(fb, x - 2, y + ITEM_H, ITEM_W + 4, 2,
+                    255, 220, 112);
+                hfix58_rect565(fb, x - 2, y - 2, 2, ITEM_H + 4,
+                    255, 220, 112);
+                hfix58_rect565(fb, x + ITEM_W, y - 2, 2, ITEM_H + 4,
+                    255, 220, 112);
+            } else {
+                hfix58_blend_rect565(fb, tx, ty,
+                    MIVF_CHAPTHUMB_W, MIVF_CHAPTHUMB_H,
+                    0, 0, 0, 18);
             }
         }
     } else {
-        for (int row = 0; row < MIVF_MENU_CHAPTERS_VISIBLE_ROWS && (start + row) < g_mivf_chapters_count; row++) {
-            int idx = start + row;
-            int y = 38 + row * ROW_H;
-            bool sel = (idx == selected);
+        for (int slot = 0; slot < 6 &&
+             start + slot < g_mivf_chapters_count; slot++) {
+            int idx = start + slot;
+            int y = 43 + slot * 27;
+            bool sel = idx == selected;
             char line[64];
-
-            if (sel) {
-                hfix58_blend_rect565(fb, 18, y - 2, 284, 20, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b, 170);
-                hfix58_rect565(fb, 18, y - 2, 2, 20, 255, 222, 120);
-            }
-
-            snprintf(line, sizeof(line), "%d. %.36s", idx + 1, g_mivf_chapters[idx].label);
-            hfix58_draw_text_shadow(fb, 26, y, line, 1,
-                sel ? 255 : 200, sel ? 250 : 210, sel ? 235 : 220);
+            hfix58_blend_rect565(fb, 16, y - 3, 288, 22,
+                sel ? g_mivf_theme_r : 8,
+                sel ? g_mivf_theme_g : 14,
+                sel ? g_mivf_theme_b : 24, sel ? 84 : 150);
+            hfix58_rect565(fb, 16, y - 3, sel ? 3 : 1, 22,
+                sel ? 255 : 40, sel ? 220 : 52, sel ? 112 : 70);
+            snprintf(line, sizeof(line), "%02d   %.38s",
+                idx + 1, g_mivf_chapters[idx].label);
+            hfix58_draw_text_shadow(fb, 27, y, line, 1,
+                sel ? 255 : 198, sel ? 248 : 211,
+                sel ? 232 : 228);
         }
     }
-
-    if (total_pages > 1) {
-        hfix58_draw_text_shadow(fb, 18, 224, "A SELECT  B BACK  L/R PAGE", 1, 150, 170, 195);
-    } else {
-        hfix58_draw_text_shadow(fb, 18, 224, "A SELECT   B BACK", 1, 150, 170, 195);
-    }
+    mivf_ui_bottom_footer(fb, "A PLAY   B BACK",
+        total > 1 ? "L/R PAGE" : "");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -11436,113 +11759,194 @@ static void mivf_menu_screensaver_reset(void) {
    the bouncing mark/image on black; bottom screen goes dark with a plain
    wake hint, matching a real screensaver minimizing what's lit up. */
 static void mivf_menu_draw_screensaver(u8 *fb_top, u8 *fb_bot, const MivfMenu *menu) {
-    enum { BOX_W = MIVF_SCREENSAVER_W, BOX_H = MIVF_SCREENSAVER_H };
-    bool bounced = false;
-    int cr, cg, cb;
-
-    g_mivf_screensaver_x += g_mivf_screensaver_vx;
-    g_mivf_screensaver_y += g_mivf_screensaver_vy;
-
-    if (g_mivf_screensaver_x <= 0) {
-        g_mivf_screensaver_x = 0;
-        g_mivf_screensaver_vx = -g_mivf_screensaver_vx;
-        bounced = true;
-    } else if (g_mivf_screensaver_x + BOX_W >= TOP_W) {
-        g_mivf_screensaver_x = TOP_W - BOX_W;
-        g_mivf_screensaver_vx = -g_mivf_screensaver_vx;
-        bounced = true;
-    }
-
-    if (g_mivf_screensaver_y <= 0) {
-        g_mivf_screensaver_y = 0;
-        g_mivf_screensaver_vy = -g_mivf_screensaver_vy;
-        bounced = true;
-    } else if (g_mivf_screensaver_y + BOX_H >= TOP_H) {
-        g_mivf_screensaver_y = TOP_H - BOX_H;
-        g_mivf_screensaver_vy = -g_mivf_screensaver_vy;
-        bounced = true;
-    }
-
-    if (bounced) {
-        g_mivf_screensaver_color_idx = (g_mivf_screensaver_color_idx + 1) % MIVF_SCREENSAVER_PALETTE_COUNT;
-    }
-
-    cr = g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][0];
-    cg = g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][1];
-    cb = g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][2];
-
-    if (fb_top) {
-        hfix58s_top_rect565(fb_top, 0, 0, TOP_W, TOP_H, 0, 0, 0);
-
-        if (menu->has_screensaver_image) {
-            for (int yy = 0; yy < BOX_H; yy++) {
-                for (int xx = 0; xx < BOX_W; xx++) {
-                    hfix58s_top_px565(fb_top, g_mivf_screensaver_x + xx, g_mivf_screensaver_y + yy,
-                        g_mivf_screensaver_img[(size_t)yy * BOX_W + xx]);
-                }
-            }
-            /* A custom image keeps its own colors -- cycle a border ring
-               instead of re-tinting pixel content, so it still visibly
-               "changes color on bounce" like the classic effect. */
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x - 2, g_mivf_screensaver_y - 2, BOX_W + 4, 2, cr, cg, cb);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x - 2, g_mivf_screensaver_y + BOX_H, BOX_W + 4, 2, cr, cg, cb);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x - 2, g_mivf_screensaver_y - 2, 2, BOX_H + 4, cr, cg, cb);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x + BOX_W, g_mivf_screensaver_y - 2, 2, BOX_H + 4, cr, cg, cb);
+    enum { BOX_W=MIVF_SCREENSAVER_W, BOX_H=MIVF_SCREENSAVER_H };
+    bool bounced=false; int cr,cg,cb;
+    /* MIVF_PHASE7_SCREENSAVER_V1 */
+    g_mivf_screensaver_x+=g_mivf_screensaver_vx; g_mivf_screensaver_y+=g_mivf_screensaver_vy;
+    if(g_mivf_screensaver_x<=4){g_mivf_screensaver_x=4;g_mivf_screensaver_vx=-g_mivf_screensaver_vx;bounced=true;}
+    else if(g_mivf_screensaver_x+BOX_W>=TOP_W-4){g_mivf_screensaver_x=TOP_W-4-BOX_W;g_mivf_screensaver_vx=-g_mivf_screensaver_vx;bounced=true;}
+    if(g_mivf_screensaver_y<=4){g_mivf_screensaver_y=4;g_mivf_screensaver_vy=-g_mivf_screensaver_vy;bounced=true;}
+    else if(g_mivf_screensaver_y+BOX_H>=TOP_H-4){g_mivf_screensaver_y=TOP_H-4-BOX_H;g_mivf_screensaver_vy=-g_mivf_screensaver_vy;bounced=true;}
+    if(bounced)g_mivf_screensaver_color_idx=(g_mivf_screensaver_color_idx+1)%MIVF_SCREENSAVER_PALETTE_COUNT;
+    cr=g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][0];
+    cg=g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][1];
+    cb=g_mivf_screensaver_palette[g_mivf_screensaver_color_idx][2];
+    if(fb_top){
+        /* Deep theatre background with a faint horizon and star-like points. */
+        hfix58s_top_rect565(fb_top,0,0,TOP_W,TOP_H,0,1,5);
+        for(int y=0;y<TOP_H;y+=12)hfix58s_top_rect565(fb_top,0,y,TOP_W,1,1,4,10);
+        for(int i=0;i<12;i++){
+            int sx=(i*73+29)%TOP_W,sy=(i*41+17)%TOP_H;
+            hfix58s_top_rect565(fb_top,sx,sy,1,1,34,48,70);
+        }
+        /* Soft shadow/reflection under the traveling card. */
+        hfix58s_top_blend_rect565(fb_top,g_mivf_screensaver_x+7,g_mivf_screensaver_y+BOX_H+4,BOX_W-14,5,cr,cg,cb,26);
+        if(menu->has_screensaver_image){
+            for(int yy=0;yy<BOX_H;yy++)for(int xx=0;xx<BOX_W;xx++)
+                hfix58s_top_px565(fb_top,g_mivf_screensaver_x+xx,g_mivf_screensaver_y+yy,g_mivf_screensaver_img[(size_t)yy*BOX_W+xx]);
         } else {
-            /* Default: an original MIVF mark drawn with existing shape/text
-               primitives -- no bitmap asset at all, just a themed card that
-               fully re-tints with the bounce color. */
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y, BOX_W, BOX_H, cr / 5, cg / 5, cb / 5);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y, BOX_W, 2, cr, cg, cb);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y + BOX_H - 2, BOX_W, 2, cr, cg, cb);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x, g_mivf_screensaver_y, 2, BOX_H, cr, cg, cb);
-            hfix58s_top_rect565(fb_top, g_mivf_screensaver_x + BOX_W - 2, g_mivf_screensaver_y, 2, BOX_H, cr, cg, cb);
-
-            mivf_menu_top_diamond(fb_top, g_mivf_screensaver_x + BOX_W / 2, g_mivf_screensaver_y + 16, cr, cg, cb);
-            hfix58s_top_draw_text_shadow(fb_top, g_mivf_screensaver_x + BOX_W / 2 - 12,
-                g_mivf_screensaver_y + 26, "MIVF", 1, cr, cg, cb);
+            hfix58s_top_blend_rect565(fb_top,g_mivf_screensaver_x,g_mivf_screensaver_y,BOX_W,BOX_H,cr/4,cg/4,cb/4,230);
+            mivf_menu_top_diamond(fb_top,g_mivf_screensaver_x+BOX_W/2,g_mivf_screensaver_y+16,cr,cg,cb);
+            hfix58s_top_draw_text_shadow(fb_top,g_mivf_screensaver_x+BOX_W/2-12,g_mivf_screensaver_y+28,"MIVF",1,cr,cg,cb);
+        }
+        hfix58s_top_rect565(fb_top,g_mivf_screensaver_x-2,g_mivf_screensaver_y-2,BOX_W+4,2,cr,cg,cb);
+        hfix58s_top_rect565(fb_top,g_mivf_screensaver_x-2,g_mivf_screensaver_y+BOX_H,BOX_W+4,2,cr,cg,cb);
+        hfix58s_top_rect565(fb_top,g_mivf_screensaver_x-2,g_mivf_screensaver_y-2,2,BOX_H+4,cr,cg,cb);
+        hfix58s_top_rect565(fb_top,g_mivf_screensaver_x+BOX_W,g_mivf_screensaver_y-2,2,BOX_H+4,cr,cg,cb);
+        if(bounced){
+            for(int i=0;i<4;i++){
+                hfix58s_top_rect565(fb_top,g_mivf_screensaver_x-5-i*2,g_mivf_screensaver_y+BOX_H/2,1,1,cr,cg,cb);
+                hfix58s_top_rect565(fb_top,g_mivf_screensaver_x+BOX_W+5+i*2,g_mivf_screensaver_y+BOX_H/2,1,1,cr,cg,cb);
+            }
         }
     }
-
-    if (fb_bot) {
-        hfix58_rect565(fb_bot, 0, 0, 320, 240, 0, 0, 0);
-        hfix58_draw_text_shadow(fb_bot, 96, 220, "PRESS ANY BUTTON", 1, 120, 130, 145);
+    if(fb_bot){
+        hfix58_rect565(fb_bot,0,0,320,240,0,1,5);
+        hfix58_draw_text_shadow(fb_bot,112,178,"MIVF IDLE",1,64,82,108);
+        hfix58_draw_text_shadow(fb_bot,95,220,"PRESS ANY BUTTON",1,125,145,172);
+        hfix58_rect565(fb_bot,95,233,130,1,24,36,54);
     }
 }
 
-/* hfix83: fade transitions. Redraws the CURRENT menu state fresh each step
-   (not just darkening whatever's already in the framebuffer), so this makes
-   no assumption about double/triple buffering -- same principle as the
-   existing autodim overlay (hfix59r3_dim_bottom_framebuffer), just animated
-   instead of a single fixed dim level. fade_alpha follows that same
-   function's blend convention: 255 = fully black, 0 = no effect. */
+/* MIVF_PHASE7_1_NATIVE_FRAME_CACHE_V1
+   Cache complete frames in the framebuffer's native layout. A cache hit is
+   a single memcpy, avoiding repeated 400x240 background sampling, text, and
+   blend work. Input is still scanned every VBlank and buffers are still
+   swapped every loop. The top image advances one visual bucket every eight
+   loops, while page/selection changes invalidate immediately. */
+#define MIVF_MENU_TOP_CACHE_BYTES ((size_t)TOP_W * (size_t)TOP_H * 2u)
+#define MIVF_MENU_BOTTOM_CACHE_BYTES ((size_t)320u * (size_t)240u * 2u)
+static u8 g_mivf_menu_top_frame_cache[MIVF_MENU_TOP_CACHE_BYTES];
+static u8 g_mivf_menu_bottom_frame_cache[MIVF_MENU_BOTTOM_CACHE_BYTES];
+static bool g_mivf_menu_top_frame_valid = false;
+static bool g_mivf_menu_bottom_frame_valid = false;
+static bool g_mivf_menu_cache_chapters = false;
+static int g_mivf_menu_cache_top_selection = -999;
+static int g_mivf_menu_cache_bottom_selection = -999;
+static u32 g_mivf_menu_cache_anim_bucket = 0xffffffffu;
+
+static void mivf_menu_perf_cache_reset(void) {
+    g_mivf_menu_top_frame_valid = false;
+    g_mivf_menu_bottom_frame_valid = false;
+    g_mivf_menu_cache_chapters = false;
+    g_mivf_menu_cache_top_selection = -999;
+    g_mivf_menu_cache_bottom_selection = -999;
+    g_mivf_menu_cache_anim_bucket = 0xffffffffu;
+}
+
+static void mivf_menu_draw_chapter_context_top(u8 *fb, int selected,
+                                                int page, int total_pages) {
+    /* Preserve Phase 7.1 scene provenance because this definitive renderer
+       replaces the complete chapter-context function. */
+    /* MIVF_PHASE7_1_CHAPTER_REFINEMENT_V1 */
+    /* MIVF_PHASE7_2_SCENE_COMPOSITION_V1 */
+    char number[24];
+    char label[48];
+    char progress[32];
+    int progress_w;
+    if(!fb || selected<0 || selected>=g_mivf_chapters_count) return;
+    snprintf(number,sizeof(number),"CHAPTER %02u",(unsigned)(selected+1));
+    snprintf(label,sizeof(label),"%.36s",g_mivf_chapters[selected].label);
+    snprintf(progress,sizeof(progress),"%d OF %d",selected+1,g_mivf_chapters_count);
+    progress_w=(int)strlen(progress)*6;
+
+    hfix58s_top_blend_rect565(fb,58,174,284,40,3,8,17,132);
+    hfix58s_top_rect565(fb,58,174,3,40,
+        g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+    hfix58s_top_draw_text_shadow(fb,72,181,number,1,255,226,132);
+    /* Avoid repeating generic labels such as "Chapter 1" at equal weight. */
+    if(strncmp(label,"Chapter ",8)!=0 && strncmp(label,"CHAPTER ",8)!=0)
+        hfix58s_top_draw_text_shadow(fb,72,197,label,1,235,243,252);
+    hfix58s_top_draw_text_shadow(fb,326-progress_w,197,progress,1,132,154,182);
+
+    /* Cheap chapter progression rail. */
+    hfix58s_top_rect565(fb,72,211,246,2,30,43,60);
+    if(g_mivf_chapters_count>1) {
+        int px=(246*selected)/(g_mivf_chapters_count-1);
+        hfix58s_top_rect565(fb,72,211,px+1,2,
+            g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+        hfix58s_top_rect565(fb,72+px,209,3,6,255,220,112);
+    }
+    (void)page; (void)total_pages;
+}
+
 static void mivf_menu_render_frame(const MivfMenu *menu, bool in_chapters, int chapter_selected, u32 pulse, int fade_alpha) {
     u16 fw = 0, fh = 0;
     u8 *fb_top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fw, &fh);
     u8 *fb_bot = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
+    int top_selection = in_chapters ? chapter_selected : menu->selected;
+    int bottom_selection = top_selection;
+    u32 anim_bucket = pulse >> 2; /* MIVF_PHASE8_1 smoother menu background cadence */
+    bool page_changed = !g_mivf_menu_top_frame_valid ||
+        g_mivf_menu_cache_chapters != in_chapters;
+    bool top_dirty = fade_alpha > 0 || page_changed ||
+        g_mivf_menu_cache_top_selection != top_selection ||
+        g_mivf_menu_cache_anim_bucket != anim_bucket;
+    bool bottom_dirty = fade_alpha > 0 ||
+        !g_mivf_menu_bottom_frame_valid ||
+        g_mivf_menu_cache_chapters != in_chapters ||
+        g_mivf_menu_cache_bottom_selection != bottom_selection;
 
     if (fb_top) {
-        if (in_chapters) {
-            mivf_menu_draw_top(fb_top, menu, pulse);
+        if (top_dirty) {
+            if (in_chapters) {
+                int start = (chapter_selected /
+                    MIVF_MENU_CHAPTERS_VISIBLE_ROWS) *
+                    MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+                int page = start / MIVF_MENU_CHAPTERS_VISIBLE_ROWS + 1;
+                int total = (g_mivf_chapters_count +
+                    MIVF_MENU_CHAPTERS_VISIBLE_ROWS - 1) /
+                    MIVF_MENU_CHAPTERS_VISIBLE_ROWS;
+                if (total < 1) total = 1;
+                mivf_menu_draw_top(fb_top, menu, pulse);
+                mivf_menu_draw_chapter_context_top(fb_top,
+                    chapter_selected, page, total);
+            } else {
+                mivf_menu_draw_top_root(fb_top, menu, pulse);
+            }
+            if (fade_alpha > 0) {
+                hfix58s_top_blend_rect565(fb_top, 0, 0,
+                    TOP_W, TOP_H, 0, 0, 0, fade_alpha);
+            }
+            if (fade_alpha == 0) {
+                memcpy(g_mivf_menu_top_frame_cache, fb_top,
+                    MIVF_MENU_TOP_CACHE_BYTES);
+                g_mivf_menu_top_frame_valid = true;
+                g_mivf_menu_cache_top_selection = top_selection;
+                g_mivf_menu_cache_anim_bucket = anim_bucket;
+            }
         } else {
-            mivf_menu_draw_top_root(fb_top, menu, pulse);
-        }
-        if (fade_alpha > 0) {
-            hfix58s_top_blend_rect565(fb_top, 0, 0, TOP_W, TOP_H, 0, 0, 0, fade_alpha);
+            memcpy(fb_top, g_mivf_menu_top_frame_cache,
+                MIVF_MENU_TOP_CACHE_BYTES);
         }
     }
 
     if (fb_bot) {
-        if (in_chapters) {
-            mivf_menu_draw_chapters_bottom(fb_bot, chapter_selected);
+        if (bottom_dirty) {
+            if (in_chapters) {
+                mivf_menu_draw_chapters_bottom(fb_bot, chapter_selected);
+            } else {
+                mivf_menu_draw_info_bottom(fb_bot, menu);
+            }
+            if (fade_alpha > 0) {
+                hfix58_blend_rect565(fb_bot, 0, 0, 320, 240,
+                    0, 0, 0, fade_alpha);
+            }
+            if (fade_alpha == 0) {
+                memcpy(g_mivf_menu_bottom_frame_cache, fb_bot,
+                    MIVF_MENU_BOTTOM_CACHE_BYTES);
+                g_mivf_menu_bottom_frame_valid = true;
+                g_mivf_menu_cache_bottom_selection = bottom_selection;
+            }
         } else {
-            mivf_menu_draw_info_bottom(fb_bot, menu);
-        }
-        if (fade_alpha > 0) {
-            hfix58_blend_rect565(fb_bot, 0, 0, 320, 240, 0, 0, 0, fade_alpha);
+            memcpy(fb_bot, g_mivf_menu_bottom_frame_cache,
+                MIVF_MENU_BOTTOM_CACHE_BYTES);
         }
     }
 
+    if (fade_alpha == 0 && (top_dirty || bottom_dirty)) {
+        g_mivf_menu_cache_chapters = in_chapters;
+    }
     gfxFlushBuffers();
     gfxSwapBuffers();
     gspWaitForVBlank();
@@ -11571,6 +11975,7 @@ static MivfMenuResult mivf_menu_run(MivfMenu *menu) {
     u32 idle_frames = 0;
 
     menu_sfx_init();
+    mivf_menu_perf_cache_reset();
 
     /* hfix81: restore the last-highlighted button/chapter for this exact
        movie, if its menu was shown earlier this session. */
@@ -13334,69 +13739,69 @@ static void print_ring_telemetry(MivfStream *stream, u32 shown) {
    This reuses the existing bookmark/seek pipeline. A resumes from the saved
    frame; B/START starts from the beginning and clears the bookmark. */
 static bool hfix64_resume_prompt(u32 saved_frame, u32 fpsn, u32 fpsd) {
+    /* MIVF_PHASE8_RESUME_MODAL_V1
+       Polished two-choice modal preserving the original bool contract:
+       true=resume, false=start over. B/START retain start-over behavior. */
     char time_line[48];
-    char frame_line[48];
-    u32 fps_num = fpsn ? fpsn : 30u;
-    u32 fps_den = fpsd ? fpsd : 1u;
-    u64 seconds = ((u64)saved_frame * (u64)fps_den) / (u64)fps_num;
-    u32 hh = (u32)(seconds / 3600u);
-    u32 mm = (u32)((seconds / 60u) % 60u);
-    u32 ss = (u32)(seconds % 60u);
+    char title[64];
+    u32 fps_num=fpsn?fpsn:30u;
+    u32 fps_den=fpsd?fpsd:1u;
+    u64 seconds=((u64)saved_frame*(u64)fps_den)/(u64)fps_num;
+    u32 hh=(u32)(seconds/3600u),mm=(u32)((seconds/60u)%60u),ss=(u32)(seconds%60u);
+    int selected=0;
+    menu_sfx_init();
+    mivf8_ellipsis(title,sizeof(title),hfix58_preview_basename(MIVF_PATH),34);
+    if(hh>0) snprintf(time_line,sizeof(time_line),"SAVED AT %lu:%02lu:%02lu",
+        (unsigned long)hh,(unsigned long)mm,(unsigned long)ss);
+    else snprintf(time_line,sizeof(time_line),"SAVED AT %lu:%02lu",
+        (unsigned long)mm,(unsigned long)ss);
 
-    if (hh > 0) {
-        snprintf(time_line, sizeof(time_line), "CONTINUE FROM %lu:%02lu:%02lu?",
-            (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
-    } else {
-        snprintf(time_line, sizeof(time_line), "CONTINUE FROM %lu:%02lu?",
-            (unsigned long)mm, (unsigned long)ss);
-    }
-
-    snprintf(frame_line, sizeof(frame_line), "SAVED FRAME %lu", (unsigned long)saved_frame);
-
-    while (aptMainLoop()) {
+    while(aptMainLoop()) {
         hidScanInput();
-        u32 down = hidKeysDown();
-
-        if (down & KEY_A) {
-            return true;
+        u32 down=hidKeysDown();
+        if(down&(KEY_DUP|KEY_DDOWN|KEY_DLEFT|KEY_DRIGHT)) {
+            selected=1-selected; menu_sfx_move();
+        }
+        if(down&KEY_A) {
+            menu_sfx_select(); return selected==0;
+        }
+        if(down&(KEY_B|KEY_START)) {
+            menu_sfx_back(); return false;
         }
 
-        if (down & (KEY_B | KEY_START)) {
-            return false;
+        u16 fw=0,fh=0;
+        u8 *top=gfxGetFramebuffer(GFX_TOP,GFX_LEFT,&fw,&fh);
+        u8 *bot=gfxGetFramebuffer(GFX_BOTTOM,GFX_LEFT,&fw,&fh);
+        if(top) {
+            hfix58s_top_rect565(top,0,0,TOP_W,TOP_H,2,5,11);
+            for(int y=0;y<TOP_H;y+=16) hfix58s_top_rect565(top,0,y,TOP_W,1,4,9,18);
+            mivf8_top_panel(top,28,34,344,170,182);
+            hfix58s_top_draw_text_shadow(top,48,52,"CONTINUE WATCHING?",2,242,248,255);
+            hfix58s_top_rect565(top,48,78,86,2,
+                g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+            hfix58s_top_draw_text_shadow(top,48,96,title,1,220,234,248);
+            hfix58s_top_draw_text_shadow(top,48,119,time_line,1,158,184,210);
+            hfix58s_top_draw_text_shadow(top,48,141,"YOUR BOOKMARK IS READY",1,126,205,162);
+            mivf8_top_progress(top,48,164,286,saved_frame,
+                g_hfix59r2_duration_ticks?
+                (u32)((g_hfix59r2_duration_ticks*(u64)fps_num)/
+                (30000ull*(u64)fps_den)):saved_frame+1u);
         }
-
-        u16 fw = 0;
-        u16 fh = 0;
-        u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fw, &fh);
-
-        if (fb) {
-            hfix58_rect565(fb, 0, 0, 320, 240, 4, 8, 18);
-            hfix58_blend_rect565(fb, 18, 28, 284, 184, 14, 22, 38, 238);
-            hfix58_rect565(fb, 18, 28, 284, 2, g_mivf_theme_r, g_mivf_theme_g, g_mivf_theme_b);
-            hfix58_rect565(fb, 18, 210, 284, 2, 2, 4, 8);
-
-            hfix58_draw_text_shadow(fb, 54, 48, "RESUME VIDEO", 2, 235, 245, 255);
-            hfix58_rect565(fb, 42, 76, 236, 1, 40, 62, 94);
-
-            hfix58_draw_text_shadow(fb, 40, 96, time_line, 1, 220, 238, 255);
-            hfix58_draw_text_shadow(fb, 40, 116, frame_line, 1, 170, 195, 220);
-
-            hfix58_blend_rect565(fb, 40, 148, 104, 28, 8, 70, 42, 235);
-            hfix58_rect565(fb, 40, 148, 104, 2, 80, 230, 130);
-            hfix58_draw_text_shadow(fb, 58, 158, "A RESUME", 1, 230, 255, 230);
-
-            hfix58_blend_rect565(fb, 176, 148, 104, 28, 72, 38, 18, 235);
-            hfix58_rect565(fb, 176, 148, 104, 2, 245, 170, 90);
-            hfix58_draw_text_shadow(fb, 192, 158, "B START", 1, 255, 230, 205);
-
-            hfix58_draw_text_shadow(fb, 44, 190, "START ALSO STARTS OVER", 1, 150, 170, 195);
+        if(bot) {
+            hfix58_rect565(bot,0,0,320,240,2,5,11);
+            mivf8_bottom_panel(bot,18,24,284,176);
+            hfix58_draw_text_shadow(bot,36,42,"PLAYBACK CHOICE",1,238,246,255);
+            hfix58_rect565(bot,36,56,64,2,
+                g_mivf_theme_r,g_mivf_theme_g,g_mivf_theme_b);
+            mivf8_bottom_focus_row(bot,36,80,248,"RESUME","SAVED POSITION",selected==0);
+            mivf8_bottom_focus_row(bot,36,112,248,"START OVER","FROM BEGINNING",selected==1);
+            hfix58_draw_text_shadow(bot,36,158,
+                selected==0?"CONTINUE FROM YOUR BOOKMARK":"KEEP BOOKMARK AND PLAY FROM START",
+                1,142,166,194);
+            mivf8_bottom_footer(bot,"A SELECT","B START OVER");
         }
-
-        gfxFlushBuffers();
-        gfxSwapBuffers();
-        gspWaitForVBlank();
+        gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank();
     }
-
     return false;
 }
 
@@ -14367,6 +14772,12 @@ int main(void) {
     /* HFIX58D: scrubbed full bottom-console printf statement. */
     /* HFIX58D: scrubbed full bottom-console printf statement. */
 
+    /* MIVF_PHASE2_RETURN_TO_MENU_V1
+       This flag is deliberately local to the outer application loop: it is
+       launch-origin policy, not playback state. play() and all of its decode,
+       seek, NDSP, and timing behavior remain unchanged. */
+    bool playback_launched_from_menu = false;
+
     while (aptMainLoop()) {
         /*
             HFIX58A_R5_BROWSER_BEFORE_PLAY:
@@ -14383,6 +14794,8 @@ int main(void) {
             }
 
             g_hfix58_has_selected_media = true;
+            /* A fresh browser selection has no DVD-menu return origin. */
+            playback_launched_from_menu = false;
         }
 
         if (hfix58_media_kind(MIVF_PATH) == HFIX58_MEDIA_MOFLEX) {
@@ -14410,11 +14823,15 @@ int main(void) {
                 printf("lifecycle: dvd-style menu returned (%d)\n", (int)mr);
 
                 if (mr == MIVF_MENU_RESULT_BACK) {
+                    playback_launched_from_menu = false;
                     g_hfix58_has_selected_media = false;
                     continue;
                 }
                 /* MIVF_MENU_RESULT_PLAY: g_mivf_launch_mode is already set
-                   (START_OVER / RESUME / CHAPTER); fall through to play(). */
+                   (START_OVER / RESUME / CHAPTER). Remember the origin so
+                   normal playback cleanup returns to this movie's menu. The
+                   existing hfix81 globals restore root/chapter selection. */
+                playback_launched_from_menu = true;
             } else {
                 printf("lifecycle: invalid/unreadable menu.ini, falling back to normal playback: %s\n", MIVF_PATH);
             }
@@ -14426,6 +14843,18 @@ int main(void) {
 
         if (r == 1) {
             break;
+        }
+
+        /* Menu-origin playback returns to the same title's DVD menu after
+           either manual exit or natural EOF. Consume the flag before looping
+           so a later browser/direct launch cannot inherit the return policy.
+           This check intentionally precedes auto-advance: a disc menu owns its
+           post-playback navigation, while browser-origin playback retains the
+           existing playlist behavior below. */
+        if (playback_launched_from_menu) {
+            playback_launched_from_menu = false;
+            g_hfix58_has_selected_media = true;
+            continue;
         }
 
         /*

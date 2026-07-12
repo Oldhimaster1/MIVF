@@ -155,7 +155,7 @@ typedef struct {
    still look unreliable, a small capped local refine -- see
    find_best_mv_64_hybrid(). None of these change the packed MVCOPY token
    format; the decoder only ever sees the final chosen (mx,my). */
-enum { MS_FULL = 0, MS_DIAMOND = 1, MS_FAST = 2, MS_HYBRID = 3 };
+enum { MS_FULL = 0, MS_DIAMOND = 1, MS_FAST = 2, MS_HYBRID = 3, MS_HIERARCHICAL = 4 };
 
 typedef struct {
     int w;
@@ -362,9 +362,10 @@ static void usage(void) {
         "  --c-solid N          default 32\n"
         "  --c-qres N           default 300\n"
         "  --mv-range N         default 8\n"
-        "  --motion-search MODE full (exhaustive, default) | diamond | fast | hybrid "
+        "  --motion-search MODE full (exhaustive, default) | diamond | fast | hybrid | hierarchical "
         "(all experimental, faster but may cost quality/size; hybrid recovers some "
-        "of that cost with a second seeded search plus capped local refine)\n"
+        "of that cost with a second seeded search plus capped local refine; hierarchical "
+        "is a deterministic coarse-to-fine grid aiming to approach full search quality)\n"
         "  --y-mv-thresh N      default 768\n"
         "  --c-mv-thresh N      default 1024\n"
         "  --lambda N          RDO lambda, default 4.0; higher = smaller/lossier\n"
@@ -1307,6 +1308,482 @@ static bool find_best_mv_64_local_refine(
         return false;
     }
 
+    for (int yy = 0; yy < 8; yy++) {
+        memcpy(
+            out_pred + yy * 8,
+            prev_plane + (dst_y0 + best_my + yy) * w + (dst_x0 + best_mx),
+            8
+        );
+    }
+
+    *out_mx = best_mx;
+    *out_my = best_my;
+    *out_sad = best_sad;
+
+    return true;
+}
+
+/* MIVF_HIERARCHICAL_MOTION_V1
+   --motion-search hierarchical: deterministic coarse-to-fine integer search.
+
+   Goal: approach find_best_mv_64's exhaustive quality across +-mv_range while
+   testing only a small, bounded number of candidates per block (tens, not
+   O(mv_range^2)).
+
+   Stage 1 (seeds): (0,0) and the frame's global MV estimate (g_mx,g_my) --
+   the same two seeds find_best_mv_64_hybrid uses.
+   Stage 2 (coarse grid): axis values are 0, +-4, +-8, ... out to +-mv_range,
+   always also including the exact +-mv_range extremes even if not a multiple
+   of 4 (e.g. mv_range=12 -> -12,-8,-4,0,4,8,12 -> at most 7x7=49 candidates;
+   mv_range=8 -> -8,-4,0,4,8 -> at most 5x5=25), crossed on both axes.
+   Stage 3: +-4 window, step 2, around the coarse-stage winner (<=24 candidates).
+   Stage 4: +-2 window, step 1, around the step-2 winner (<=24 candidates).
+
+   Every (mx,my) actually considered is recorded in a small fixed-size stack
+   array (mivf_hier_try's seen_mx/seen_my) and never evaluated twice for the
+   same block -- the same vector commonly recurs across stages, after
+   +-mv_range clamping, or after independently landing on the same clamped
+   point from different raw offsets.
+
+   Conventions matched exactly to the rest of this file's motion search:
+     - clamp_int() bounds every raw candidate to +-mv_range, exactly like
+       find_best_mv_64_diamond/seeded/local_refine.
+     - Any candidate whose 8x8 window would read outside the reference plane
+       is skipped outright (never clamped further), exactly like every other
+       search function in this file.
+     - sad8x8_capped() is reused for every SAD evaluation -- same early-abort
+       formula and cutoff convention as find_best_mv_64/diamond/seeded.
+     - Only a STRICTLY lower SAD replaces the incumbent best (a tie never
+       replaces it) -- matches find_best_mv_64's "sad < best_sad" and
+       find_best_mv_64_diamond/seeded's identical rule.
+     - An exact SAD==0 match stops the ENTIRE search immediately (no further
+       stage or candidate is evaluated) -- matches find_best_mv_64's
+       "if (sad == 0) break;" and diamond/seeded's "best_sad != 0" loop guard.
+
+   Bounded candidate count (documented, not just asserted): seeds <= 2, coarse
+   grid <= MIVF_HIER_MAX_AXIS^2 = 256, stage-3 refine <= 24, stage-4 refine
+   <= 24. MIVF_HIER_MAX_AXIS is sized generously (16) so the coarse-grid cap
+   safely dominates any --mv-range this encoder is realistically run with
+   (mv_range=12 only ever produces a 7x7=49 coarse grid; mv_range=16 produces
+   9x9=81); MIVF_HIER_MAX_CANDIDATES (306) is the sum of all four stages'
+   worst cases and sizes the fixed dedup array below -- if an unrealistically
+   large --mv-range ever produced more distinct axis values than
+   MIVF_HIER_MAX_AXIS allows, mivf_hier_try's coarse-grid loop simply stops
+   adding further axis values rather than overflowing any buffer; this can
+   only ever make the coarse grid coarser, never incorrect or unsafe. */
+#define MIVF_HIER_MAX_AXIS 16
+#define MIVF_HIER_MAX_CANDIDATES (2 + (MIVF_HIER_MAX_AXIS * MIVF_HIER_MAX_AXIS) + 24 + 24)
+
+/* MIVF_OPT1_CANDIDATE_BITMAP_V1: O(1) dedup, replacing the O(n) linear scan
+   this function used to be (mivf_hier_seen + seen_mx[]/seen_my[]/seen_count).
+   A candidate's clamped (mx,my) maps to exactly one cell of a fixed stack
+   bitmap via (my+mv_range)*side + (mx+mv_range), side = 2*mv_range+1 -- the
+   same indexing scheme used elsewhere for small dense integer-vector lookup
+   tables. Two calls with the same clamped (mx,my) always produce the same
+   index, so "already seen" is exact, not approximate -- this changes only
+   HOW a repeat is detected, never WHICH candidates count as repeats or the
+   order they're proposed in, so it cannot change the final selected vector
+   (see this file's own commit history / opt1_candidate_bitmap_patch.py for
+   the full argument). Only valid while mv_range <= MIVF_HIER_BITMAP_MAX_RANGE
+   (32 -- far above the mv_range<=16 used anywhere in this project); beyond
+   that, bitmap_side is 0 and dedup is silently skipped rather than sized
+   dynamically, which can only forgo some of the speedup, never correctness
+   (mivf_hier_try's SAD-update rule already tolerates being called twice on
+   the same candidate). */
+#define MIVF_HIER_BITMAP_MAX_RANGE 32
+#define MIVF_HIER_BITMAP_MAX_SIDE (2 * MIVF_HIER_BITMAP_MAX_RANGE + 1)
+#define MIVF_HIER_BITMAP_MAX_CELLS (MIVF_HIER_BITMAP_MAX_SIDE * MIVF_HIER_BITMAP_MAX_SIDE)
+
+static void mivf_hier_try(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int dst_x0,
+    int dst_y0,
+    int mv_range,
+    int search_cutoff,
+    int raw_mx,
+    int raw_my,
+    u8 seen_bitmap[],
+    int bitmap_side,
+    int *best_mx,
+    int *best_my,
+    int *best_sad
+) {
+    int mx = clamp_int(raw_mx, -mv_range, mv_range);
+    int my = clamp_int(raw_my, -mv_range, mv_range);
+
+    if (bitmap_side > 0) {
+        int idx = (my + mv_range) * bitmap_side + (mx + mv_range);
+
+        if (seen_bitmap[idx]) {
+            return;
+        }
+
+        seen_bitmap[idx] = 1;
+    }
+
+    int sx = dst_x0 + mx;
+    int sy = dst_y0 + my;
+
+    if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
+        return;
+    }
+
+    int limit = (*best_sad >= 0) ? *best_sad : search_cutoff;
+    int sad = sad8x8_capped(cur, prev_plane, w, sx, sy, limit);
+
+    if (sad < 0) {
+        return;
+    }
+
+    if (*best_sad < 0 || sad < *best_sad) {
+        *best_sad = sad;
+        *best_mx = mx;
+        *best_my = my;
+    }
+}
+
+/* MIVF_HIERARCHICAL_MOTION_V2 diagnostic counters -- purely additive
+   instrumentation. Only find_best_mv_64_hierarchical ever touches these, so
+   they cannot affect full/diamond/fast/hybrid in any way; they do not
+   participate in any RDO decision or token output, only end-of-run STATS
+   reporting. */
+static long long g_hier2_blocks_searched = 0;
+static long long g_hier2_candidates_total = 0;
+static int g_hier2_candidates_max_block = 0;
+static long long g_hier2_zero_exits = 0;
+static long long g_hier2_second_basin_refined = 0;
+static long long g_hier2_second_basin_won = 0;
+static long long g_hier2_coarse_stage_had_second_basin = 0;
+static long long g_hier2_step2_changes = 0;
+static long long g_hier2_step1_changes = 0;
+
+typedef struct {
+    s16 mx;
+    s16 my;
+    int sad;
+} MivfHierV2Record;
+
+/* Stage 1 (2 seeds) + stage 2 (<=9x9=81, local exhaustive +-4 center) +
+   stage 3 (<=MIVF_HIER_MAX_AXIS^2=256, step-4 wide grid). */
+#define MIVF_HIER_V2_MAX_RECORDS (2 + 81 + (MIVF_HIER_MAX_AXIS * MIVF_HIER_MAX_AXIS))
+
+/* Used only for stages 1-3 (the scan that stage 4 later picks two distinct
+   basins from). Deliberately uses the fixed, generous search_cutoff (not a
+   tightening best-so-far cap) for every candidate, unlike mivf_hier_try --
+   this is what makes every recorded SAD directly, fairly comparable to
+   every other recorded SAD, which stage 4's basin selection depends on. A
+   tightening cap here would let candidates abort at different, inconsistent
+   limits depending on scan order, making cross-basin comparisons unsound.
+   Same clamp/dedup/bounds/tie conventions as mivf_hier_try otherwise. */
+static void mivf_hier_v2_scan_try(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int dst_x0,
+    int dst_y0,
+    int mv_range,
+    int search_cutoff,
+    int raw_mx,
+    int raw_my,
+    u8 seen_bitmap[],
+    int bitmap_side,
+    MivfHierV2Record records[],
+    int *record_count,
+    int *scan_best_sad
+) {
+    int mx = clamp_int(raw_mx, -mv_range, mv_range);
+    int my = clamp_int(raw_my, -mv_range, mv_range);
+
+    if (bitmap_side > 0) {
+        int idx = (my + mv_range) * bitmap_side + (mx + mv_range);
+
+        if (seen_bitmap[idx]) {
+            return;
+        }
+
+        seen_bitmap[idx] = 1;
+    }
+
+    int sx = dst_x0 + mx;
+    int sy = dst_y0 + my;
+
+    if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
+        return;
+    }
+
+    int sad = sad8x8_capped(cur, prev_plane, w, sx, sy, search_cutoff);
+
+    if (sad < 0) {
+        return;
+    }
+
+    if (*record_count < MIVF_HIER_V2_MAX_RECORDS) {
+        records[*record_count].mx = (s16)mx;
+        records[*record_count].my = (s16)my;
+        records[*record_count].sad = sad;
+        (*record_count)++;
+    }
+
+    if (*scan_best_sad < 0 || sad < *scan_best_sad) {
+        *scan_best_sad = sad;
+    }
+}
+
+/* MIVF_HIERARCHICAL_MOTION_V2: addresses v1's diagnosed wrong-basin problem
+   (see mivf_hierarchical_motion_patch.py / the v1 matrix report: hierarchical
+   v1 missed both the primary target vs full range-12 and the minimum bar vs
+   full range-8) without making the whole grid drastically denser.
+
+   Stage 1 (seeds): zero vector, global MV estimate.
+   Stage 2 (local exhaustive center): every legal (mx,my) in [-4,+4]x[-4,+4]
+   (clamped to +-mv_range for small ranges) -- guarantees full coverage of
+   common low-motion vectors, the exact region v1's step-4-only coarse grid
+   could skip between grid points.
+   Stage 3 (step-4 wide grid): same wide grid v1 used across the full
+   configured +-mv_range, always including zero and both range extremes.
+   Stage 4: from every candidate recorded in stages 1-3, pick the single
+   best (best1) and the best candidate from a DISTINCT basin (best2 --
+   distinct meaning abs(mx-best1.mx)>=4 or abs(my-best1.my)>=4), so
+   refinement isn't wasted re-polishing the same neighborhood twice.
+   Stage 5: +-4 step-2 refine around best1, and independently around best2.
+   Stage 6: keep whichever refined candidate has the strictly lower SAD.
+   Stage 7: +-2 step-1 refine around the stage-6 winner.
+   Stage 8: any SAD==0 found at any point stops the whole search immediately
+   (matches v1 and every other search function in this file).
+
+   Bounded candidate count: stages 1-3 record at most
+   MIVF_HIER_V2_MAX_RECORDS (339) candidates; stage 5 evaluates at most 24
+   per basin (48 total); stage 7 at most 24. All dedup uses the same O(1)
+   bitmap as opt1_candidate_bitmap, shared across the whole function call, so
+   no stage ever re-evaluates a point any earlier stage already tried. */
+static bool find_best_mv_64_hierarchical(
+    const u8 cur[64],
+    const u8 *prev_plane,
+    int w,
+    int h,
+    int bx,
+    int by,
+    int mv_range,
+    int search_cutoff,
+    int g_mx,
+    int g_my,
+    int *out_mx,
+    int *out_my,
+    u8 out_pred[64],
+    int *out_sad
+) {
+    if (!prev_plane) {
+        return false;
+    }
+
+    if (mv_range < 0) {
+        mv_range = 0;
+    }
+
+    if (search_cutoff <= 0) {
+        search_cutoff = 4096;
+    }
+
+    int dst_x0 = bx * 8;
+    int dst_y0 = by * 8;
+
+    u8 seen_bitmap[MIVF_HIER_BITMAP_MAX_CELLS];
+    int bitmap_side = 0;
+
+    if (mv_range >= 0 && mv_range <= MIVF_HIER_BITMAP_MAX_RANGE) {
+        bitmap_side = 2 * mv_range + 1;
+        memset(seen_bitmap, 0, (size_t)bitmap_side * (size_t)bitmap_side);
+    }
+
+    g_hier2_blocks_searched++;
+
+    MivfHierV2Record records[MIVF_HIER_V2_MAX_RECORDS];
+    int record_count = 0;
+    int scan_best_sad = -1;
+
+    /* Stage 1: seeds. */
+    mivf_hier_v2_scan_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+        0, 0, seen_bitmap, bitmap_side, records, &record_count, &scan_best_sad);
+
+    if (scan_best_sad != 0 && (g_mx != 0 || g_my != 0)) {
+        mivf_hier_v2_scan_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+            g_mx, g_my, seen_bitmap, bitmap_side, records, &record_count, &scan_best_sad);
+    }
+
+    /* Stage 2: local exhaustive center, +-4 on both axes. */
+    if (scan_best_sad != 0) {
+        int center_range = (mv_range < 4) ? mv_range : 4;
+
+        for (int dy = -center_range; dy <= center_range && scan_best_sad != 0; dy++) {
+            for (int dx = -center_range; dx <= center_range && scan_best_sad != 0; dx++) {
+                mivf_hier_v2_scan_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+                    dx, dy, seen_bitmap, bitmap_side, records, &record_count, &scan_best_sad);
+            }
+        }
+    }
+
+    /* Stage 3: step-4 wide grid, always including zero and both legal
+       extremes on each axis. */
+    if (scan_best_sad != 0) {
+        int axis[MIVF_HIER_MAX_AXIS];
+        int axis_count = 0;
+
+        axis[axis_count++] = 0;
+
+        for (int r = 4; r <= mv_range && axis_count + 2 <= MIVF_HIER_MAX_AXIS; r += 4) {
+            axis[axis_count++] = r;
+            axis[axis_count++] = -r;
+        }
+
+        if (mv_range > 0 && axis_count + 2 <= MIVF_HIER_MAX_AXIS) {
+            bool have_pos = false;
+            bool have_neg = false;
+
+            for (int i = 0; i < axis_count; i++) {
+                if (axis[i] == mv_range) have_pos = true;
+                if (axis[i] == -mv_range) have_neg = true;
+            }
+
+            if (!have_pos) axis[axis_count++] = mv_range;
+            if (!have_neg) axis[axis_count++] = -mv_range;
+        }
+
+        for (int ay = 0; ay < axis_count && scan_best_sad != 0; ay++) {
+            for (int ax = 0; ax < axis_count && scan_best_sad != 0; ax++) {
+                mivf_hier_v2_scan_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+                    axis[ax], axis[ay], seen_bitmap, bitmap_side, records, &record_count, &scan_best_sad);
+            }
+        }
+    }
+
+    if (record_count == 0) {
+        return false;
+    }
+
+    g_hier2_candidates_total += record_count;
+    if (record_count > g_hier2_candidates_max_block) {
+        g_hier2_candidates_max_block = record_count;
+    }
+
+    /* Stage 4: best1 = global min (first on tie); best2 = min among records
+       in a distinct basin from best1 (first on tie). */
+    int best1_idx = 0;
+
+    for (int i = 1; i < record_count; i++) {
+        if (records[i].sad < records[best1_idx].sad) {
+            best1_idx = i;
+        }
+    }
+
+    int best2_idx = -1;
+
+    for (int i = 0; i < record_count; i++) {
+        if (i == best1_idx) {
+            continue;
+        }
+
+        int dmx = records[i].mx - records[best1_idx].mx;
+        int dmy = records[i].my - records[best1_idx].my;
+
+        if (dmx < 0) dmx = -dmx;
+        if (dmy < 0) dmy = -dmy;
+
+        if (dmx < 4 && dmy < 4) {
+            continue;
+        }
+
+        if (best2_idx < 0 || records[i].sad < records[best2_idx].sad) {
+            best2_idx = i;
+        }
+    }
+
+    if (best2_idx >= 0) {
+        g_hier2_coarse_stage_had_second_basin++;
+    }
+
+    int best_mx = records[best1_idx].mx;
+    int best_my = records[best1_idx].my;
+    int best_sad = records[best1_idx].sad;
+
+    if (best_sad == 0) {
+        g_hier2_zero_exits++;
+        goto hier_v2_done;
+    }
+
+    /* Stage 5+6: +-4 step-2 refine around best1, and independently around
+       best2 (if distinct), then keep whichever has the strictly lower SAD.
+       Reuses mivf_hier_try (opt1's O(1)-deduped, tightening-cap search) --
+       cross-basin comparison is already settled by stage 4, so refinement
+       only needs the single best answer within each basin's neighborhood. */
+    {
+        int refined1_mx = best_mx, refined1_my = best_my, refined1_sad = best_sad;
+
+        for (int dy = -4; dy <= 4 && refined1_sad != 0; dy += 2) {
+            for (int dx = -4; dx <= 4 && refined1_sad != 0; dx += 2) {
+                if (dx == 0 && dy == 0) continue;
+                mivf_hier_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+                    best_mx + dx, best_my + dy, seen_bitmap, bitmap_side, &refined1_mx, &refined1_my, &refined1_sad);
+            }
+        }
+
+        if (refined1_mx != best_mx || refined1_my != best_my) {
+            g_hier2_step2_changes++;
+        }
+
+        if (best2_idx >= 0 && refined1_sad != 0) {
+            int base2_mx = records[best2_idx].mx;
+            int base2_my = records[best2_idx].my;
+            int refined2_mx = base2_mx, refined2_my = base2_my, refined2_sad = records[best2_idx].sad;
+
+            g_hier2_second_basin_refined++;
+
+            for (int dy = -4; dy <= 4 && refined2_sad != 0; dy += 2) {
+                for (int dx = -4; dx <= 4 && refined2_sad != 0; dx += 2) {
+                    if (dx == 0 && dy == 0) continue;
+                    mivf_hier_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+                        base2_mx + dx, base2_my + dy, seen_bitmap, bitmap_side, &refined2_mx, &refined2_my, &refined2_sad);
+                }
+            }
+
+            if (refined2_sad < refined1_sad) {
+                best_mx = refined2_mx;
+                best_my = refined2_my;
+                best_sad = refined2_sad;
+                g_hier2_second_basin_won++;
+            } else {
+                best_mx = refined1_mx;
+                best_my = refined1_my;
+                best_sad = refined1_sad;
+            }
+        } else {
+            best_mx = refined1_mx;
+            best_my = refined1_my;
+            best_sad = refined1_sad;
+        }
+    }
+
+    /* Stage 7: +-2 step-1 refine around the stage-6 winner. */
+    if (best_sad != 0) {
+        int pre_step1_mx = best_mx, pre_step1_my = best_my;
+
+        for (int dy = -2; dy <= 2 && best_sad != 0; dy++) {
+            for (int dx = -2; dx <= 2 && best_sad != 0; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                mivf_hier_try(cur, prev_plane, w, h, dst_x0, dst_y0, mv_range, search_cutoff,
+                    best_mx + dx, best_my + dy, seen_bitmap, bitmap_side, &best_mx, &best_my, &best_sad);
+            }
+        }
+
+        if (best_mx != pre_step1_mx || best_my != pre_step1_my) {
+            g_hier2_step1_changes++;
+        }
+    }
+
+hier_v2_done:
     for (int yy = 0; yy < 8; yy++) {
         memcpy(
             out_pred + yy * 8,
@@ -2326,6 +2803,26 @@ static void encode_plane(
                                 memcpy(pred, refined_pred, 64);
                             }
                         }
+                    } else if (motion_search_mode == MS_HIERARCHICAL) {
+                        /* MIVF_HIERARCHICAL_MOTION_V1: deterministic
+                           coarse-to-fine search. See find_best_mv_64_hierarchical
+                           for the stage breakdown and bounded candidate count. */
+                        found_mv = find_best_mv_64_hierarchical(
+                            b,
+                            prev,
+                            w,
+                            h,
+                            bx,
+                            by,
+                            mv_range,
+                            mv_search_cutoff,
+                            g_mx,
+                            g_my,
+                            &best_mx,
+                            &best_my,
+                            pred,
+                            &best_mv_sad
+                        );
                     } else {
                         int start_step = (motion_search_mode == MS_FAST) ? 2 : 4;
                         bool recenter = (motion_search_mode != MS_FAST);
@@ -2760,8 +3257,11 @@ int main(int argc, char **argv) {
             ep.motion_search_mode = MS_FAST;
         } else if (!strcmp(ms_str, "hybrid")) {
             ep.motion_search_mode = MS_HYBRID;
+        } else if (!strcmp(ms_str, "hierarchical")) {
+            /* MIVF_HIERARCHICAL_MOTION_V1 */
+            ep.motion_search_mode = MS_HIERARCHICAL;
         } else {
-            die("--motion-search must be full, diamond, fast, or hybrid");
+            die("--motion-search must be full, diamond, fast, hybrid, or hierarchical");
         }
     }
 
@@ -3167,6 +3667,32 @@ if (frames <= 0) {
         iframes,
         pframes
     );
+
+    /* MIVF_HIERARCHICAL_MOTION_V2 diagnostics -- only ever printed when
+       hierarchical mode was actually selected, since the counters are only
+       ever incremented from inside find_best_mv_64_hierarchical. Purely
+       informational: does not affect encode output. */
+    if (ep.motion_search_mode == MS_HIERARCHICAL) {
+        double avg_candidates = (g_hier2_blocks_searched > 0)
+            ? (double)g_hier2_candidates_total / (double)g_hier2_blocks_searched
+            : 0.0;
+
+        printf(
+            "HIER2_STATS blocks=%lld candidates_total=%lld candidates_avg=%.2f candidates_max=%d "
+            "zero_exits=%lld second_basin_found=%lld second_basin_refined=%lld second_basin_won=%lld "
+            "step2_changes=%lld step1_changes=%lld\n",
+            g_hier2_blocks_searched,
+            g_hier2_candidates_total,
+            avg_candidates,
+            g_hier2_candidates_max_block,
+            g_hier2_zero_exits,
+            g_hier2_coarse_stage_had_second_basin,
+            g_hier2_second_basin_refined,
+            g_hier2_second_basin_won,
+            g_hier2_step2_changes,
+            g_hier2_step1_changes
+        );
+    }
 
     return 0;
 }
