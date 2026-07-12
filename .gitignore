@@ -55,6 +55,11 @@ meta/banner.bnr
 !screenshots/*.jpg
 !screenshots/*.jpeg
 
+# --- Benchmark charts and their audited source data (override *.png / *.csv / *.txt above) ---
+!docs/assets/benchmarks/*.png
+!docs/benchmark-data/*.csv
+!docs/benchmark-data/SHA256SUMS.txt
+
 # --- Source / tool backups and scratch (never ship these) ---
 *BACKUP
 *.bak
@@ -163,3 +168,10 @@ Desktop.ini
 .vscode/
 .idea/
 # --- end MIVF generated artifacts / scratch ---
+
+# Phase 8 UI screenshot provenance
+!screenshots/PHASE8_SCREENSHOTS_SHA256SUMS.txt
+
+# MkDocs copies of current UI screenshots
+!docs/assets/screenshots/
+!docs/assets/screenshots/*.png

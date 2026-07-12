@@ -12,6 +12,9 @@ Is M2Y2 lossless?
 Why use 48000 Hz with 24 fps?
 - 48000 / 24 = 2000 samples per frame, which yields an exact integer samples-per-frame value and avoids timing drift for 24 fps sources.
 
+What about film-rate (23.976 fps) sources?
+- Use `--fps 24000/1001 --audio-rate 48000` — that's exactly 2002 samples per frame, computed with exact fraction math rather than a rounded float. `--audio-rate 44100` does **not** divide evenly against `24000/1001`, so the encoder rejects that combination outright rather than producing audio that slowly drifts out of sync. See [encoding.md](encoding.md#frame-rate).
+
 Why is the file larger or smaller than expected?
 - Size depends on settings (QP/keep/lambda) and source complexity. Use the recommended presets for predictable sizes.
 

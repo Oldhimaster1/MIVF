@@ -18,6 +18,11 @@ Run Python tests
    pip install -U pip pytest
    pytest -q tests/
 
+   Note: one existing test (`test_count_mivf_frames_and_first_page_offset`) currently
+   fails — it calls a `read_mivf_first_page_offset` function that doesn't exist in
+   `encode_mivf.py`. This is a pre-existing gap, not something your change introduced;
+   the other tests passing is what matters.
+
 Build the encoder EXE on Windows
 
 1. Install Python 3.8+ and ensure FFmpeg is available.
@@ -34,6 +39,12 @@ Build native tools
   gcc -O2 -o tools/m2y2_verify tools/m2y2_verify.c
 
 - Windows (MSYS2/MinGW or Visual Studio): use equivalent build commands or an MSVC project.
+
+- **Important:** `encode_mivf.py` loads `miv2y_moflex_tier` from the **repository root**,
+  not from `tools/`. After rebuilding it, also copy the new binary to the repo root (or
+  run `bash tools/build_miv2y_helper.sh`, which does this for you and verifies both
+  copies are byte-identical) — otherwise the pipeline will silently keep running a stale
+  copy. See [docs/encoder-recovery-and-profiling.md](docs/encoder-recovery-and-profiling.md#native-helper-binary--a-real-gotcha).
 
 - 3DS player: install devkitPro/devkitARM + libctru and run:
   make

@@ -1,5 +1,15 @@
 # Testing & CI
 
+`pytest` is not installed by default in every environment — if `pytest -q` fails with
+`ModuleNotFoundError`, use the `unittest discover` form below, which has no extra
+dependency. Also note: the current test suite has one known-broken test,
+`test_count_mivf_frames_and_first_page_offset`, which calls a
+`read_mivf_first_page_offset` function that doesn't exist in `encode_mivf.py` — a
+pre-existing gap in the test file, not something introduced by recent changes. The other
+three tests (`test_parse_rational_frame_rate`, `test_rational_ticks_and_audio_packet_size`,
+`test_patch_video_timing_metadata`) pass and cover the exact-rational-FPS/audio-packet-
+sizing behavior described in [encoding.md](encoding.md#frame-rate).
+
 Local checks
 
 - Basic Python compile check:

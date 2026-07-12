@@ -1,6 +1,9 @@
 # Player Usage
 
-This section documents controls, settings, and sidecar files.
+This section documents controls, settings, and sidecar files. It's a condensed summary —
+[CONTROLS.md](CONTROLS.md) has the full context-by-context control reference (including
+the DVD-style menu and Resume modal, where button meaning changes by screen), and
+[FILES_AND_SIDECARS.md](FILES_AND_SIDECARS.md) has the full sidecar/asset reference.
 
 File Browser Controls
 
@@ -25,7 +28,7 @@ Playback Controls
 
 Settings Menu
 
-Use D‑Pad ↑/↓ to move, A / ← / → to change, and B or SELECT to close and save. Settings persist to `sdmc:/mivf_settings.ini`. Bookmarks and favorites live next to it on the SD card.
+Use D‑Pad ↑/↓ to move, A / ← / → to change, and B or SELECT to close and save. Settings persist to `sdmc:/3ds/mivf_player_3ds/appdata/settings.ini` (legacy root-level `sdmc:/mivf_settings.ini` is still read for migration only). Bookmarks and favorites live alongside it under the same `appdata/` folder — see [FILES_AND_SIDECARS.md](FILES_AND_SIDECARS.md#app-data-layout).
 
 Sidecar files
 
