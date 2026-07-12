@@ -4,7 +4,9 @@
 
 MIVF includes a built-in MoFlex (MobiClip 3D video) playback backend under `source/moflex/`. This is compiled into the player and is **enabled by default**.
 
-- `.moflex` files are recognized in the file browser and show a "MOF" badge.
+- `.moflex` files are recognized in the file browser and show a "MOFLEX" text badge (this
+  is a plain text label, not an icon/color system, and can be overridden by the
+  Favorite/Resume/Recent badges — see [player-ui.md](player-ui.md)).
 - Opening a `.moflex` file dispatches to `moflex_play()`, which handles demux, video decode, audio decode (via NDSP channel 0), and 3D rendering.
 - MoFlex playback returns control to the browser when the file ends or the user presses B/START.
 - Resume bookmarks are supported for `.moflex` files.

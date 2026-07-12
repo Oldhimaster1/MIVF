@@ -2,7 +2,7 @@
 
 ## Quick Install
 
-1. Download the latest release from the [Releases page](../../releases).
+1. Download the latest release from the [Releases page](https://github.com/Oldhimaster1/MIVF/releases).
 2. Choose your install method below.
 3. Put `.mivf` video files in `sdmc:/mivf/`.
 

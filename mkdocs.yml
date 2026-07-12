@@ -3,15 +3,29 @@ site_name: MIVF Player
 nav:
   - Home: index.md
   - Quickstart: quickstart.md
+  - Installing: INSTALLING.md
   - Encoding: encoding.md
   - CLI Reference: cli-reference.md
-  - Player Usage: player-usage.md
-  - Building: building.md
-  - MIVF Format: mivf-format.md
   - Encoder Internals: encoder-internals.md
+  - Encoder Recovery & Profiling (E0/E1/E2): encoder-recovery-and-profiling.md
+  - Performance Tuning: PERFORMANCE_TUNING.md
+  - Benchmark Data Audit: benchmark-data/mivf_benchmark_data_audit.md
+  - Controls: CONTROLS.md
+  - Player UI (Library & DVD Menu): player-ui.md
+  - Menu & Scene Selection Authoring: menu-authoring.md
+  - Files & Sidecars: FILES_AND_SIDECARS.md
+  - Player Usage: player-usage.md
+  - Seek Index: SEEK_INDEX.md
+  - MoFlex Status: MOFLEX_STATUS.md
+  - Validation Status: validation-status.md
+  - Architecture: ARCHITECTURE.md
+  - Building: building.md
+  - Developer Build: DEVELOPING.md
+  - MIVF Format: mivf-format.md
   - Tools: tools.md
   - Testing & CI: testing-ci.md
   - Releases: releases.md
+  - Release Checklist: RELEASE_CHECKLIST.md
   - Troubleshooting: troubleshooting.md
   - FAQ: faq.md
   - Contributing: contributing.md
@@ -19,8 +33,25 @@ nav:
 
 theme:
   name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
 
 markdown_extensions:
   - admonition
   - toc:
       permalink: true
+extra_css:
+  - stylesheets/extra.css

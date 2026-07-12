@@ -440,19 +440,61 @@ static u32 hfix_isqrt64(u64 v) {
 static u32 g_last_audio_bytes = 0;
 static u32 g_last_audio_samples = 0;
 
-/* hfix78: real audio-playback clock. Every submitted wavebuf gets an
-   auto-assigned sequence_id (see ndspWaveBuf); ndspChnGetWaveBufSeq(0) reports
-   which sequence is *audible right now*. We map sequence_id -> the audio frame
-   that buffer carries, so we can read back the frame currently being heard --
-   as opposed to the frame most recently submitted. The difference between the
-   video frame on screen and that audible frame is the true A/V error, which
-   submit-side diagnostics (delta_frames, drift_ms) structurally cannot see. */
-#define AUDIO_SEQ_MAP 256   /* power of two >> the ~48 buffers ever in flight */
-static u32  g_audio_seq_to_frame[AUDIO_SEQ_MAP];
-static u32  g_audio_seq_to_nsamples[AUDIO_SEQ_MAP]; /* buffer length, for sub-buffer precision */
-static u32  g_audio_pending_submit_frame = 0; /* frame of the packet being submitted now */
+/* ------------------------------------------------------------------------- */
+/* HFIX88_GENERATION_SAFE_AUDIO_CLOCK                                         */
+/*                                                                           */
+/* Foundation only: this does not alter pacing. It makes the NDSP cursor safe */
+/* enough to become a future master clock by rejecting stale modulo-map hits, */
+/* reset-generation collisions, and seq/sample reads that straddle a buffer. */
+/* ------------------------------------------------------------------------- */
+#define AUDIO_SEQ_MAP 256   /* power of two; > maximum simultaneously in flight */
+
+typedef struct {
+    bool valid;
+    u16 sequence_id;       /* exact ID, not merely sequence_id % AUDIO_SEQ_MAP */
+    u32 generation;        /* incremented whenever channel 0 is reset */
+    u32 media_frame;       /* MIVF frame carried by this wavebuf */
+    u32 nsamples;          /* PCM sample frames in this wavebuf */
+    u64 media_sample_start;/* nominal media sample timestamp of media_frame */
+} AudioClockMapEntry;
+
+typedef struct {
+    u16 sequence_id;
+    u32 generation;
+    u32 media_frame;
+    u32 nsamples;
+    u32 sample_pos;
+    u64 media_sample;
+} AudioClockSnapshot;
+
+static AudioClockMapEntry g_audio_clock_map[AUDIO_SEQ_MAP];
+static u32  g_audio_clock_generation = 1;
+static u32  g_audio_pending_submit_frame = 0; /* packet being submitted now */
 static u16  g_audio_last_submitted_seq = 0;
 static bool g_audio_have_submitted_seq = false;
+
+static u64 audio_clock_frame_to_sample(u32 frame) {
+    u32 fpsn = g_hfix59r2_video_fps_num ? g_hfix59r2_video_fps_num : 0u;
+    u32 fpsd = g_hfix59r2_video_fps_den ? g_hfix59r2_video_fps_den : 1u;
+
+    if (audio.rate > 0 && fpsn > 0) {
+        return ((u64)frame * (u64)audio.rate * (u64)fpsd) / (u64)fpsn;
+    }
+    return (u64)frame * (u64)audio.samples_per_frame;
+}
+
+static void audio_clock_new_generation(const char *reason) {
+    g_audio_clock_generation++;
+    if (g_audio_clock_generation == 0) {
+        g_audio_clock_generation = 1;
+    }
+    memset(g_audio_clock_map, 0, sizeof(g_audio_clock_map));
+    g_audio_have_submitted_seq = false;
+    g_audio_last_submitted_seq = 0;
+    printf("audio_clock: generation=%lu reset=%s\n",
+        (unsigned long)g_audio_clock_generation,
+        reason ? reason : "unknown");
+}
 static bool g_ndsp_ready = false;
 static bool g_ndsp_init_attempted = false;
 
@@ -474,6 +516,7 @@ static bool audio_configure_ndsp_channel(void) {
     }
 
     ndspChnReset(0);
+    audio_clock_new_generation("channel_configure");
     ndspSetOutputMode(audio.channels == 1 ? NDSP_OUTPUT_MONO : NDSP_OUTPUT_STEREO);
     ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
     ndspChnSetRate(0, (float)audio.rate * (float)mivf_speed_pct() / 100.0f);
@@ -8631,6 +8674,11 @@ static void audio_shutdown(void) {
 
     if (audio_can_use_ndsp()) {
         ndspChnReset(0);
+        audio_clock_new_generation("audio_shutdown");
+    } else {
+        /* Even if NDSP is unavailable, invalidate software-side metadata so a
+           later session can never resolve an entry from this AudioState. */
+        audio_clock_new_generation("audio_shutdown_no_channel");
     }
 
     for (int i = 0; i < AUDIO_BUFS; i++) {
@@ -9076,15 +9124,20 @@ static void audio_queue_raw_ndsp(const u8 *data, u32 size) {
             DSP_FlushDataCache(audio.buf[i], n);
             ndspChnWaveBufAdd(0, &audio.wb[i]);
 
-            /* hfix78: sequence_id is assigned by ndspChnWaveBufAdd itself, so
-               it's only readable *after* the call. Record which video frame
-               this buffer carries so the playback-clock reader below can map
-               "sequence currently audible" back to a frame number. */
+            /* HFIX88: sequence_id is assigned by ndspChnWaveBufAdd, so map it
+               only after submission. Store the exact ID and reset generation;
+               a matching modulo slot alone is never considered authoritative. */
             {
                 u16 seq = audio.wb[i].sequence_id;
                 u32 map_idx = (u32)seq % AUDIO_SEQ_MAP;
-                g_audio_seq_to_frame[map_idx] = g_audio_pending_submit_frame;
-                g_audio_seq_to_nsamples[map_idx] = nsamples;
+                AudioClockMapEntry *entry = &g_audio_clock_map[map_idx];
+                entry->valid = true;
+                entry->sequence_id = seq;
+                entry->generation = g_audio_clock_generation;
+                entry->media_frame = g_audio_pending_submit_frame;
+                entry->nsamples = nsamples;
+                entry->media_sample_start =
+                    audio_clock_frame_to_sample(g_audio_pending_submit_frame);
                 g_audio_last_submitted_seq = seq;
                 g_audio_have_submitted_seq = true;
             }
@@ -9468,52 +9521,93 @@ static void av_sync_offset_apply(int offset_ms) {
 }
 
 /*
-    hfix78: the actual audio-playback clock, not a submit-side proxy.
+    HFIX88: trustworthy audio-playback clock.
 
-    ndspChnGetWaveBufSeq(0) returns the sequence_id of the wavebuf that's
-    playing *right now* on the DSP -- libctru auto-assigns sequence_id inside
-    ndspChnWaveBufAdd, and audio_queue_raw_ndsp records seq -> video_frame at
-    submit time. Looking that seq up here gives the video frame whose audio is
-    audible at this instant, independent of how deep the queue is or how far
-    ahead submission has gotten. ndspChnGetSamplePos(0) adds the sample offset
-    within that buffer for sub-frame precision. This is the missing
-    measurement: audio_submit proves decode/queue timing; this proves what's
-    actually coming out of the DSP.
+    Reading seq then sample_pos once is racy: NDSP can advance to the next
+    wavebuf between those calls. Read seq/sample/seq and accept only a stable
+    sequence. Then require an exact sequence_id and current generation match.
 */
+static bool audio_clock_snapshot(AudioClockSnapshot *out) {
+    if (!out || !audio_can_use_ndsp() || !g_audio_have_submitted_seq ||
+        !ndspChnIsPlaying(0)) {
+        return false;
+    }
+
+    for (int tries = 0; tries < 4; tries++) {
+        u16 seq_before = ndspChnGetWaveBufSeq(0);
+        u32 sample_pos = ndspChnGetSamplePos(0);
+        u16 seq_after = ndspChnGetWaveBufSeq(0);
+
+        if (seq_before != seq_after) {
+            continue;
+        }
+
+        u32 map_idx = (u32)seq_before % AUDIO_SEQ_MAP;
+        const AudioClockMapEntry *entry = &g_audio_clock_map[map_idx];
+
+        if (!entry->valid ||
+            entry->sequence_id != seq_before ||
+            entry->generation != g_audio_clock_generation ||
+            entry->nsamples == 0) {
+            return false;
+        }
+
+        /* A stable sequence with a position beyond this buffer is not a valid
+           pair for our media-clock purposes. Retry in case NDSP is crossing a
+           boundary; never clamp mismatched metadata into a believable value. */
+        if (sample_pos > entry->nsamples) {
+            continue;
+        }
+
+        out->sequence_id = seq_before;
+        out->generation = entry->generation;
+        out->media_frame = entry->media_frame;
+        out->nsamples = entry->nsamples;
+        out->sample_pos = sample_pos;
+        out->media_sample = entry->media_sample_start + (u64)sample_pos;
+        return true;
+    }
+
+    return false;
+}
+
+/* Compatibility wrapper for existing callers. */
 static bool audio_get_playing_frame(u32 *out_frame, u32 *out_sample_pos) {
-    if (!audio_can_use_ndsp() || !g_audio_have_submitted_seq) {
+    AudioClockSnapshot snap;
+    if (!audio_clock_snapshot(&snap)) {
         return false;
     }
-    if (!ndspChnIsPlaying(0)) {
-        return false;
-    }
-
-    u16 seq = ndspChnGetWaveBufSeq(0);
-    u32 map_idx = (u32)seq % AUDIO_SEQ_MAP;
-
     if (out_frame) {
-        *out_frame = g_audio_seq_to_frame[map_idx];
+        *out_frame = snap.media_frame;
     }
     if (out_sample_pos) {
-        *out_sample_pos = ndspChnGetSamplePos(0);
+        *out_sample_pos = snap.sample_pos;
     }
     return true;
 }
 
-/* Highest video frame among wavebufs currently in NDSP_WBUF_DONE state --
-   "audio has definitely finished playing through at least this frame." A
-   second, cross-check estimate independent of ndspChnGetWaveBufSeq. */
+/* Highest current-generation frame among wavebuf headers marked DONE. */
 static u32 audio_last_done_frame(void) {
     u32 last_done = 0;
     bool have = false;
 
     for (int i = 0; i < AUDIO_BUFS; i++) {
-        if (audio.buf[i] && audio.wb[i].status == NDSP_WBUF_DONE) {
-            u32 mapped = g_audio_seq_to_frame[(u32)audio.wb[i].sequence_id % AUDIO_SEQ_MAP];
-            if (!have || mapped > last_done) {
-                last_done = mapped;
-                have = true;
-            }
+        if (!audio.buf[i] || audio.wb[i].status != NDSP_WBUF_DONE) {
+            continue;
+        }
+
+        u16 seq = audio.wb[i].sequence_id;
+        const AudioClockMapEntry *entry =
+            &g_audio_clock_map[(u32)seq % AUDIO_SEQ_MAP];
+
+        if (!entry->valid || entry->sequence_id != seq ||
+            entry->generation != g_audio_clock_generation) {
+            continue;
+        }
+
+        if (!have || entry->media_frame > last_done) {
+            last_done = entry->media_frame;
+            have = true;
         }
     }
 
@@ -9521,30 +9615,42 @@ static u32 audio_last_done_frame(void) {
 }
 
 static void avsync_played_report(u32 video_frame) {
-    u32 playing_frame = 0;
-    u32 sample_pos = 0;
-    bool have_playing = audio_get_playing_frame(&playing_frame, &sample_pos);
+    AudioClockSnapshot snap;
+    bool have_playing = audio_clock_snapshot(&snap);
     u32 last_done = audio_last_done_frame();
-    long audible_lag_frames = have_playing ? (long)video_frame - (long)playing_frame : 0;
+    long audible_lag_frames = have_playing
+        ? (long)video_frame - (long)snap.media_frame : 0;
+    long long audible_lag_samples = 0;
+    long long audible_lag_us = 0;
     long long audible_lag_ms = 0;
 
-    if (have_playing && audio.rate > 0 && audio.samples_per_frame > 0) {
-        audible_lag_ms = ((long long)audible_lag_frames * (long long)audio.samples_per_frame * 1000ll)
-            / (long long)audio.rate;
+    if (have_playing && audio.rate > 0) {
+        u64 video_sample = audio_clock_frame_to_sample(video_frame);
+        audible_lag_samples = (long long)video_sample -
+                              (long long)snap.media_sample;
+        audible_lag_us = (audible_lag_samples * 1000000ll) /
+                         (long long)audio.rate;
+        audible_lag_ms = audible_lag_us / 1000ll;
     }
 
     printf(
         "avsync_played: video_frame=%lu last_submitted_audio_frame=%lu last_done_audio_frame=%lu "
         "estimated_playing_audio_frame=%lu sample_pos=%lu playing_known=%d audible_lag_frames=%ld "
-        "audible_lag_ms=%lld\n",
+        "audible_lag_samples=%lld audible_lag_us=%lld audible_lag_ms=%lld playing_seq=%u "
+        "clock_generation=%lu mapped_nsamples=%lu\n",
         (unsigned long)video_frame,
         (unsigned long)g_audio_pending_submit_frame,
         (unsigned long)last_done,
-        (unsigned long)playing_frame,
-        (unsigned long)sample_pos,
+        (unsigned long)(have_playing ? snap.media_frame : 0u),
+        (unsigned long)(have_playing ? snap.sample_pos : 0u),
         have_playing ? 1 : 0,
         audible_lag_frames,
-        audible_lag_ms);
+        audible_lag_samples,
+        audible_lag_us,
+        audible_lag_ms,
+        (unsigned int)(have_playing ? snap.sequence_id : 0u),
+        (unsigned long)(have_playing ? snap.generation : g_audio_clock_generation),
+        (unsigned long)(have_playing ? snap.nsamples : 0u));
 }
 
 static void avsync_audioq_report(u32 video_frame) {
@@ -9560,9 +9666,22 @@ static void avsync_audioq_report(u32 video_frame) {
        queued_audio_ms bounded instead of climbing. */
     u32 rate_corr_ppt = (u32)(g_audio_rate_corr * 1000.0f + 0.5f);
 
+    /* hfix76d/e: g_perf_late_count tracks hfix59r3_present_video_frame's
+       "late" branch (video presentation more than 2 frame durations behind
+       schedule), which permanently re-anchors the video pacing clock to
+       "now" instead of catching up -- see the HFIX72 comment near the top
+       of this file for the mechanism. That branch was only ever suspected
+       from a scrubbing-specific stall pattern and has never been checked
+       during ordinary continuous playback, because the counter existed but
+       was never surfaced in any diagnostic output. Surfacing it here (as a
+       cumulative count since session start) turns "could this be causing
+       the reported hour-long drift" into something an actual long,
+       uninterrupted playback log can confirm or rule out, instead of more
+       speculation. */
     printf(
         "avsync_audioq: video_frame=%lu submit_frame=%lu pending_wavebufs=%lu free_wavebufs=%lu "
-        "queued_audio_ms=%lu audio_submit=%lu audio_drop=%lu audio_wait_events=%lu rate_corr_ppt=%lu\n",
+        "queued_audio_ms=%lu audio_submit=%lu audio_drop=%lu audio_wait_events=%lu rate_corr_ppt=%lu "
+        "late_count=%lu\n",
         (unsigned long)video_frame,
         (unsigned long)g_avsync_first_audio_frame,
         (unsigned long)pending,
@@ -9571,7 +9690,8 @@ static void avsync_audioq_report(u32 video_frame) {
         (unsigned long)g_audio_submit,
         (unsigned long)g_audio_drop,
         (unsigned long)g_audio_wait_events,
-        (unsigned long)rate_corr_ppt);
+        (unsigned long)rate_corr_ppt,
+        (unsigned long)g_perf_late_count);
 
     avsync_played_report(video_frame);
 }
@@ -12835,14 +12955,9 @@ static void hfix58f_audio_flush_for_seek(void) {
     g_last_audio_bytes = 0;
     g_last_audio_samples = 0;
 
-    /* hfix78: ndspChnReset (called via audio_configure_ndsp_channel above)
-       restarts the DSP's own sequence_id counter, so post-seek sequence IDs
-       can collide with stale pre-seek entries still sitting in
-       g_audio_seq_to_frame at the same modulo slot. Drop the "have a
-       submitted seq" flag so audio_get_playing_frame() reports unknown
-       (playing_known=0) until a genuinely new post-seek buffer is submitted,
-       rather than briefly reporting a stale frame number. */
-    g_audio_have_submitted_seq = false;
+    /* HFIX88: audio_configure_ndsp_channel() already advanced the clock
+       generation and cleared every map entry immediately after ndspChnReset.
+       The clock remains unknown until the first new post-seek submission. */
 
     /* Queue was just emptied -- restart the sync controller neutral so it
        re-converges for the new position instead of holding a stale rate.
