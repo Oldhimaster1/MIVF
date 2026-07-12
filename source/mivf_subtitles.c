@@ -166,12 +166,20 @@ static void mivf_append_subtitle_text(char *dst, const char *src) {
     sl = strlen(src);
 
     if (dl > 0) {
-        if (dl + 3 >= MIVF_SUBTITLE_MAX_TEXT) {
+        /* MIVF_PHASE6_MULTILINE_SUBTITLES_V1
+           Preserve a real line break between the first two SRT text lines.
+           If an unusual cue contains three or more lines, fold the extras
+           into line two with spaces because the current renderer safely
+           presents at most two centered lines. */
+        const char *separator = strchr(dst, '\n') ? " " : "\n";
+        size_t separator_len = 1;
+
+        if (dl + separator_len >= MIVF_SUBTITLE_MAX_TEXT) {
             return;
         }
 
-        strcat(dst, " | ");
-        dl += 3;
+        strcat(dst, separator);
+        dl += separator_len;
     }
 
     if (dl + sl >= MIVF_SUBTITLE_MAX_TEXT) {

@@ -53,6 +53,7 @@ typedef struct {
     bool auto_advance;        /* play the next file in the folder when one ends */
     u32 playback_speed_idx;   /* index into the playback-speed table (default 1.0x) */
     u32 sleep_timer_min;      /* 0 = off, otherwise minutes before auto-pause */
+    u32 volume_percent;       /* MIVF_PHASE6_PERSIST_VOLUME_V1: 0..300, default 100 */
 } MivfSettings;
 
 typedef struct {
