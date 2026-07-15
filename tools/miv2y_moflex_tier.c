@@ -54,6 +54,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -689,6 +692,30 @@ static MVList build_mv_list(int range) {
     return m;
 }
 
+/* E2_EXACT_SSE2_SAD_V1: exact row-vectorized SAD with strict cap. */
+static inline int sad8x8_capped_exact(
+    const u8 cur[64], const u8 *prev_plane, int w,
+    int sx, int sy, int limit
+) {
+    int sad = 0;
+    for (int yy = 0; yy < 8; yy++) {
+        const u8 *c = cur + yy * 8;
+        const u8 *p = prev_plane + (sy + yy) * w + sx;
+#if defined(__SSE2__)
+        __m128i cv = _mm_loadl_epi64((const __m128i*)c);
+        __m128i pv = _mm_loadl_epi64((const __m128i*)p);
+        sad += _mm_cvtsi128_si32(_mm_sad_epu8(cv, pv));
+#else
+        for (int x = 0; x < 8; x++) {
+            int d = (int)c[x] - (int)p[x];
+            sad += d < 0 ? -d : d;
+        }
+#endif
+        if (sad > limit) return -1;
+    }
+    return sad;
+}
+
 static bool try_mvcopy_64(
     const u8 cur[64],
     const u8 *prev_plane,
@@ -724,30 +751,8 @@ static bool try_mvcopy_64(
         }
 
         int limit = (best_sad >= 0) ? best_sad : mv_thresh;
-        int sad = 0;
-        bool aborted = false;
-
-        for (int yy = 0; yy < 8; yy++) {
-            const u8 *p = prev_plane + (sy + yy) * w + sx;
-            const u8 *c = cur + yy * 8;
-
-            for (int x = 0; x < 8; x++) {
-                int d = (int)c[x] - (int)p[x];
-                if (d < 0) d = -d;
-                sad += d;
-
-                if (sad > limit) {
-                    aborted = true;
-                    break;
-                }
-            }
-
-            if (aborted) break;
-        }
-
-        if (aborted) {
-            continue;
-        }
+        int sad = sad8x8_capped_exact(cur, prev_plane, w, sx, sy, limit);
+        if (sad < 0) continue;
 
         if (sad > mv_thresh) {
             continue;
@@ -825,33 +830,8 @@ static bool find_best_mv_64(
         }
 
         int limit = best_sad >= 0 ? best_sad : search_cutoff;
-        int sad = 0;
-        bool aborted = false;
-
-        for (int yy = 0; yy < 8; yy++) {
-            const u8 *p = prev_plane + (sy + yy) * w + sx;
-            const u8 *c = cur + yy * 8;
-
-            for (int x = 0; x < 8; x++) {
-                int d = (int)c[x] - (int)p[x];
-                if (d < 0) d = -d;
-
-                sad += d;
-
-                if (sad > limit) {
-                    aborted = true;
-                    break;
-                }
-            }
-
-            if (aborted) {
-                break;
-            }
-        }
-
-        if (aborted) {
-            continue;
-        }
+        int sad = sad8x8_capped_exact(cur, prev_plane, w, sx, sy, limit);
+        if (sad < 0) continue;
 
         if (best_sad < 0 || sad < best_sad) {
             best_sad = sad;
@@ -899,25 +879,7 @@ static int sad8x8_capped(
     int sy,
     int limit
 ) {
-    int sad = 0;
-
-    for (int yy = 0; yy < 8; yy++) {
-        const u8 *p = prev_plane + (sy + yy) * w + sx;
-        const u8 *c = cur + yy * 8;
-
-        for (int x = 0; x < 8; x++) {
-            int d = (int)c[x] - (int)p[x];
-            if (d < 0) d = -d;
-
-            sad += d;
-
-            if (sad > limit) {
-                return -1;
-            }
-        }
-    }
-
-    return sad;
+    return sad8x8_capped_exact(cur, prev_plane, w, sx, sy, limit);
 }
 
 /* --motion-search diamond/fast: iterative cross/diamond step search.
@@ -2439,13 +2401,28 @@ static void estimate_global_mv_luma(
     /*
         Search only integer-pel vectors. Sample every other 8x8 block to keep
         encoder cost reasonable while still capturing camera pans.
+
+        MIVF_GLOBAL_MV_SAD_CAP_V1: early-abort once this candidate's partial
+        sad already exceeds best_sad. Safe because every term added to `sad`
+        (both the per-pixel abs-difference and the 4096 out-of-bounds
+        penalty) is nonnegative, so the partial sum is monotonically
+        non-decreasing -- once it strictly exceeds best_sad, the eventual
+        full sad can only be >= that partial value, so it can never satisfy
+        the unchanged final "sad < best_sad" comparison below. No term is
+        ever added, subtracted, or otherwise adjusted after this loop (no
+        lambda, no MV penalty, nothing), so this is the complete score, not
+        a partial one requiring a derived cap. Candidate order (my/mx loops)
+        and the strict "<" tie-break (first candidate keeps ties) are both
+        untouched, so the chosen (best_mx, best_my) -- and therefore this
+        function's only output -- is bit-for-bit identical to before.
     */
     for (int my = -mv_range; my <= mv_range; my++) {
         for (int mx = -mv_range; mx <= mv_range; mx++) {
             long long sad = 0;
+            bool over_budget = false;
 
-            for (int by = 1; by < (h / 8) - 1; by += 2) {
-                for (int bx = 1; bx < (w / 8) - 1; bx += 2) {
+            for (int by = 1; by < (h / 8) - 1 && !over_budget; by += 2) {
+                for (int bx = 1; bx < (w / 8) - 1 && !over_budget; bx += 2) {
                     int x0 = bx * 8;
                     int y0 = by * 8;
 
@@ -2454,22 +2431,25 @@ static void estimate_global_mv_luma(
 
                     if (sx < 0 || sy < 0 || sx + 8 > w || sy + 8 > h) {
                         sad += 4096;
-                        continue;
+                    } else {
+                        for (int yy = 0; yy < 8; yy++) {
+                            const u8 *c = cur  + (y0 + yy) * w + x0;
+                            const u8 *p = prev + (sy + yy) * w + sx;
+
+                            for (int xx = 0; xx < 8; xx++) {
+                                int d = (int)c[xx] - (int)p[xx];
+                                sad += d < 0 ? -d : d;
+                            }
+                        }
                     }
 
-                    for (int yy = 0; yy < 8; yy++) {
-                        const u8 *c = cur  + (y0 + yy) * w + x0;
-                        const u8 *p = prev + (sy + yy) * w + sx;
-
-                        for (int xx = 0; xx < 8; xx++) {
-                            int d = (int)c[xx] - (int)p[xx];
-                            sad += d < 0 ? -d : d;
-                        }
+                    if (sad > best_sad) {
+                        over_budget = true;
                     }
                 }
             }
 
-            if (sad < best_sad) {
+            if (!over_budget && sad < best_sad) {
                 best_sad = sad;
                 best_mx = mx;
                 best_my = my;
