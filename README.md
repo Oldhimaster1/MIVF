@@ -59,7 +59,7 @@ The authored Play, Resume, Scene Selection, and Back experience on physical hard
 
 <p align="center"><img src="docs/images/hardware/hardware_04_movie_menu.jpg" alt="DVD-style Movie Menu" width="880"></p>
 
-#### Scene Selection — Chapter 11
+#### Scene Selection
 
 A real chapter-navigation state on physical hardware, with Chapter 11 selected.
 
