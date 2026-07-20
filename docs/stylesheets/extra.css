@@ -1,0 +1,14 @@
+/* Current 3DS and benchmark captures */
+.md-content img {
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+
+/* More appropriate framing against Material's slate background */
+[data-md-color-scheme="slate"] .md-content img {
+  border-color: rgba(255, 255, 255, 0.20);
+  box-shadow:
+    0 5px 18px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(255, 255, 255, 0.04);
+}

@@ -1,0 +1,21 @@
+[project]
+name = "mivf-gui"
+version = "0.1.0"
+description = "MIVF Toolkit GUI (Phase C vertical slice) -- orchestrates the real encode_mivf.py CLI; never a dependency of it."
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

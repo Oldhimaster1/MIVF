@@ -1,0 +1,123 @@
+BasicInfo:
+  Title                   : "MIVF Player"
+  CompanyCode             : "00"
+  ProductCode             : "CTR-P-MIVF"
+  ContentType             : Application
+  Logo                    : Nintendo
+
+TitleInfo:
+  UniqueId                : 0xF8002
+  Category                : Application
+
+Option:
+  UseOnSD                 : true
+  EnableCompress          : true
+  FreeProductCode         : true
+  EnableCrypt             : false
+  MediaFootPadding        : false
+
+AccessControlInfo:
+  SystemSaveDataId1       : 0x00000000
+  SystemSaveDataId2       : 0x00000000
+  OtherUserSaveDataId1    : 0x00000
+  OtherUserSaveDataId2    : 0x00000
+  OtherUserSaveDataId3    : 0x00000
+
+  FileSystemAccess:
+    - DirectSdmc
+
+  IdealProcessor          : 0
+  AffinityMask            : 1
+  Priority                : 16
+  MaxCpu                  : 0x9E
+
+  DisableDebug            : false
+  EnableForceDebug        : false
+  CanWriteSharedPage      : true
+  CanUsePrivilegedPriority: false
+  CanUseNonAlphabetAndNumber: false
+  PermitMainFunctionArgument: false
+  CanShareDeviceMemory    : true
+  RunnableOnSleep         : false
+  SpecialMemoryArrange    : true
+  UseOtherVariationSaveData: false
+
+  CoreVersion             : 2
+  DescVersion             : 2
+  MemoryType              : Application
+  SystemMode              : 64MB
+  HandleTableSize         : 512
+
+  ServiceAccessControl:
+    - fs:USER
+    - apt:u
+    - hid:USER
+    - gsp::Gpu
+    - dsp::DSP
+    - ndm:u
+    - cfg:u
+    - soc:U
+    - srv:pm
+
+  IORegisterMapping:
+    - 1ff00000-1ff7ffff
+
+  MemoryMapping:
+    - 1f000000-1f5fffff:r
+
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    GetProcessAffinityMask: 4
+    SetProcessAffinityMask: 5
+    SetProcessIdealProcessor: 6
+    GetProcessIdealProcessor: 7
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    GetThreadAffinityMask: 13
+    SetThreadAffinityMask: 14
+    GetThreadIdealProcessor: 15
+    SetThreadIdealProcessor: 16
+    GetCurrentProcessorNumber: 17
+    Run: 18
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CreateAddressArbiter: 33
+    ArbitrateAddress: 34
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    SignalAndWait: 38
+    DuplicateHandle: 39
+    GetSystemTick: 40
+    GetHandleInfo: 41
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+    ConnectToPort: 45
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+
+SystemControlInfo:
+  SaveDataSize            : "0M"
+  RemasterVersion         : 1
+  StackSize               : 0x40000

@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Builds
+build/
+dist/
+site/
+*.o
+*.a
+*.elf
+*.3dsx
+*.cia
+*.lst
+*.map
+
+# Packaged binaries
+*.exe
+*.dll
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Local media and authored projects
+*.mivf
+*.moflex
+*.mkv
+*.mp4
+*.idx
+*.mivfproj
+*.mivftheme
+*.mivfasset
+
+# Development records
+*.patch
+*.diff
+*.log
+*.bak
+*.orig
+*.rej
+*backup*
+*context*bundle*
+*handoff*
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Private assistant/tool state
+.claude/

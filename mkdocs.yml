@@ -1,0 +1,86 @@
+site_name: MIVF
+
+nav:
+  - Home: index.md
+  - Project Status: status.md
+  - The Showcase: showcase.md
+  - Getting Started:
+      - Installing: getting-started/installing.md
+      - Quickstart: getting-started/quickstart.md
+      - Troubleshooting: getting-started/troubleshooting.md
+      - FAQ: getting-started/faq.md
+  - MIVF Player:
+      - Library: player/library.md
+      - Movie Menus: player/movie-menus.md
+      - Scene Selection: player/scene-selection.md
+      - Playback: player/playback.md
+      - Subtitles: player/subtitles.md
+      - Resume: player/resume.md
+      - Screensaver: player/screensaver.md
+      - Personalization: player/personalization.md
+      - Controls: player/controls.md
+  - Creating a MIVF Project:
+      - Overview: authoring/overview.md
+      - Artwork: authoring/artwork.md
+      - Chapters: authoring/chapters.md
+      - Subtitles: authoring/subtitles.md
+      - Menu Authoring: authoring/menu-authoring.md
+      - Files and Sidecars: authoring/files-and-sidecars.md
+  - Compatibility and Testing:
+      - Hardware Matrix: compatibility/hardware-matrix.md
+      - Validation Method: compatibility/validation-method.md
+      - Known Issues: compatibility/known-issues.md
+      - Report Results: compatibility/reporting-results.md
+  - Technical Reference:
+      - Architecture: technical/architecture.md
+      - .mivf Container: technical/format.md
+      - Exact Timing: technical/exact-timing.md
+      - Audio: technical/audio.md
+      - Seek Index: technical/seek-index.md
+      - MoFlex: technical/moflex.md
+      - Encoder Internals: technical/encoder-internals.md
+      - Encoder Recovery & Profiling: technical/encoder-recovery-and-profiling.md
+      - CLI Reference: technical/cli-reference.md
+      - Tools: technical/tools.md
+      - Performance Tuning: technical/performance-tuning.md
+      - Benchmark Methodology: technical/benchmark-methodology.md
+  - Development:
+      - Building MIVF Player: development/building-player.md
+      - Building MIVF Toolkit: development/building-toolkit.md
+      - Testing: development/testing.md
+      - Release Process: development/release-process.md
+      - Contributing: development/contributing.md
+  - Project:
+      - Roadmap: project/roadmap.md
+      - Changelog: project/changelog.md
+      - License: project/license.md
+      - Third-Party Notices: project/third-party-notices.md
+      - Media and Legal: project/media-and-legal.md
+      - Security: project/security.md
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+extra_css:
+  - stylesheets/extra.css
