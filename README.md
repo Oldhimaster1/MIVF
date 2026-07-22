@@ -273,7 +273,7 @@ list and [Known Issues](docs/compatibility/known-issues.md) for exact scope limi
 | Layer | Status |
 | :--- | :--- |
 | Core playback foundation (audio clock, timing, decode, seek), MoFlex | **Hardware-verified**, last tagged release |
-| Library, DVD-style menu, Scene Selection, Personalization | **Build-verified, Emulator-tested**; one **preliminary physical-hardware run reported**, not yet a documented model-specific validation |
+| Library, DVD-style menu, Scene Selection, Personalization | **Build-verified, Emulator-tested**; physical-hardware install and launch reconfirmed for this release's exact artifacts; menu/playback/Scene Selection validation on physical hardware still not yet separately documented |
 | Encoder motion-search experiments (`diamond`/`fast`/`hybrid`/`hierarchical`) | **Experimental**, tracked separately from the player |
 
 No claim of universal 3DS compatibility or Old-3DS-family support is made until that's
